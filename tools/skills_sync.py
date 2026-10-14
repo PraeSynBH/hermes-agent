@@ -80,6 +80,36 @@ def _get_optional_dir() -> Path:
     return get_optional_skills_dir(Path(__file__).parent.parent / "optional-skills")
 
 
+def _sync_lock_path() -> Path:
+    return _skills_dir() / ".locks" / "bundled_sync.lock"
+
+
+def _sync_lock():
+    """Exclusive cross-process lock held across one whole sync_skills() run.
+
+    RBR-1895: every ``hermes`` CLI start calls sync_skills() against the ACTIVE
+    profile's shared skills dir (hermes_cli/main.py, main_tui_launch.py,
+    gateway/run.py, ...). Multiple agent processes sharing one Paperclip-managed
+    profile (e.g. several company agents on one Hermes profile) can start within
+    the same second, so their sync_skills() calls raced: one process's
+    _replace_skill_dir()/_move_dir() mid-mutates a skill directory (shutil.move
+    to .bak, copytree, rmtree) while another process's unguarded Path.rglob()
+    walk over that same tree (_iter_active_skill_mds, _build_external_skill_index,
+    _discover_bundled_skills) is in flight. CPython's scandir-based rglob raises
+    FileNotFoundError/OSError when an entry it is listing disappears mid-walk,
+    and that exception was never caught here (unlike every sibling skill-mutation
+    path in this codebase: skill_ledger._ledger_lock, skill_manager_tool.
+    _skill_mutation_lock) — it propagated out of sync_skills(), out of the CLI
+    startup call, and surfaced to Paperclip as a hard agent status:error with a
+    raw Python traceback. Same locking idiom as those siblings: one lock file
+    under ``<skills>/.locks/``, acquired via tools.skill_usage.skill_file_lock
+    (flock/msvcrt, cross-process, thread-re-entrant), so concurrent starts
+    serialize onto one sync at a time instead of racing the filesystem.
+    """
+    from tools.skill_usage import skill_file_lock
+    return skill_file_lock(_sync_lock_path())
+
+
 def _rel_skills_posix(path: Path) -> str:
     return path.relative_to(_skills_dir()).as_posix()
 
@@ -396,7 +426,18 @@ def _seed_category_descriptions(bundled_dir: Path, only_dirs: Optional[set[Path]
 def sync_skills(quiet: bool = False) -> dict:
     """Sync bundled skills into ~/.hermes/skills/ using the manifest; returns the per-category
     result dict. Opted-out profiles seed ONLY ESSENTIAL_SKILLS (the system prompt always
-    points at ``hermes-agent``)."""
+    points at ``hermes-agent``).
+
+    Held under ``_sync_lock()`` end to end (RBR-1895): every concurrent caller on the same
+    profile — e.g. several Paperclip-managed agents sharing one Hermes profile, each starting
+    their own ``hermes`` process within the same tick — serializes onto one sync at a time
+    instead of racing each other's directory moves/copies and unguarded rglob() walks of the
+    same skills tree."""
+    with _sync_lock():
+        return _sync_skills_locked(quiet)
+
+
+def _sync_skills_locked(quiet: bool) -> dict:
     essential_only = (_hermes_home() / NO_BUNDLED_SKILLS_MARKER).exists()
     if essential_only and not quiet:
         print("  (profile opted out of bundled skills via .no-bundled-skills — seeding essential skills only)")

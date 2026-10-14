@@ -1035,3 +1035,80 @@ class TestCallTimeDirResolution:
                 ss._rmtree_writable(foreign)
         finally:
             reset_hermes_home_override(token)
+
+
+class TestConcurrentSyncSerializes:
+    """RBR-1895 regression: Paperclip runs several agents on one shared Hermes profile, and
+    each agent's ``hermes`` process calls sync_skills() against that profile's skills/ dir at
+    startup. Nothing serialized those calls: one call's unguarded rglob() walks
+    (_iter_active_skill_mds / _build_external_skill_index) could run while another call's
+    shutil.move()/copytree() (_replace_skill_dir, _recover_renamed_skill) was mid-mutating the
+    very same tree, and scandir-based rglob raises FileNotFoundError/OSError when an entry it
+    is listing disappears underneath it — uncaught here (every sibling skill-mutation path in
+    this codebase guards with tools.skill_usage.skill_file_lock), so it propagated out of the
+    CLI startup call and surfaced to Paperclip as a hard agent status:error with a raw
+    traceback. The fix wraps the whole sync in one cross-process lock (_sync_lock); this test
+    proves two concurrent sync_skills() calls now serialize instead of racing."""
+
+    def test_two_concurrent_calls_never_overlap(self, tmp_path, monkeypatch):
+        """Forced, not hoped-for: thread A is paused INSIDE the locked critical section (after
+        acquiring _sync_lock, before doing any work) until thread B has had a full chance to
+        start and finish its own call. If the lock did not serialize them, B would complete
+        while A's window is still open and the recorded windows would overlap."""
+        import threading
+        import time as _time
+
+        import tools.skills_sync as ss
+
+        bundled = tmp_path / "bundled"
+        (bundled / "demo").mkdir(parents=True)
+        (bundled / "demo" / "SKILL.md").write_text("---\nname: demo\n---\n# Demo\n", encoding="utf-8")
+        skills_dir = tmp_path / "skills"
+        monkeypatch.setattr(ss, "_get_bundled_dir", lambda: bundled)
+        monkeypatch.setattr(ss, "_get_optional_dir", lambda: bundled.parent / "optional-skills")
+        monkeypatch.setattr(ss, "SKILLS_DIR", skills_dir)
+        monkeypatch.setattr(ss, "MANIFEST_FILE", skills_dir / ".bundled_manifest")
+
+        a_in_critical_section, b_finished = threading.Event(), threading.Event()
+        windows: list[tuple[str, float, float]] = []
+        real_locked = ss._sync_skills_locked
+
+        def traced_locked(quiet):
+            name = threading.current_thread().name
+            start = _time.monotonic()
+            if name == "A":
+                a_in_critical_section.set()
+                # Give B every opportunity to run (and finish) concurrently if the
+                # lock failed to exclude it — a generous bound so green never
+                # depends on scheduler timing, only on correctness.
+                b_finished.wait(0.3)
+            result = real_locked(quiet)
+            windows.append((name, start, _time.monotonic()))
+            return result
+
+        monkeypatch.setattr(ss, "_sync_skills_locked", traced_locked)
+
+        def run(name: str) -> None:
+            threading.current_thread().name = name
+            if name == "B":
+                assert a_in_critical_section.wait(2.0), "A never entered its critical section"
+            ss.sync_skills(quiet=True)
+            if name == "B":
+                b_finished.set()
+
+        threads = [threading.Thread(target=run, args=(name,)) for name in ("A", "B")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        assert not any(t.is_alive() for t in threads), "a sync_skills() call deadlocked"
+
+        assert len(windows) == 2, "both concurrent calls must complete"
+        windows.sort(key=lambda w: w[1])
+        (_, a_start, a_end), (_, b_start, b_end) = windows
+        assert b_start >= a_end, (
+            "sync_skills() calls overlapped — the cross-process lock did not serialize "
+            "concurrent reconcile ticks (RBR-1895 regression)"
+        )
+        # Both still produced a normal, successful result (no uncaught traceback mid-walk).
+        assert (skills_dir / "demo" / "SKILL.md").exists()
