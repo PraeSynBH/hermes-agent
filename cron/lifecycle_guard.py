@@ -732,25 +732,118 @@ LAUNCHCTL_HOST_JOB_REJECTION = (
     "shell outside the gateway."
 )
 
+# Shell spellings of a COMMAND WORD that name the program through a variable: `$VAR`, `${VAR}`,
+# `${VAR:-default}`, `${VAR-default}`. shlex leaves `$` and braces intact (the shell expands them
+# after tokenizing), so the guard sees the reference, never the value — that is the indirection.
+_SHELL_EXPANSION = re.compile(r"^\$(?:\{(?P<braced>[^{}]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))$")
+# `${VAR:-default}` / `${VAR:=default}` / `${VAR-default}`: the default states the program in its
+# own spelling, which is all the guard needs. `${#VAR}`, `${VAR%%:*}` and `${VAR:+x}` are
+# substitutions, not program spellings, so they stay unresolved.
+_EXPANSION_BODY = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?::?[-=](?P<default>.*))?$")
+# A variable whose NAME is launchd's CLI. `${ARM_LAUNCHCTL:-launchctl}` indirection (SOU-1842) is
+# the shipped instance: the value may come from the caller's environment, so the name is the signal.
+_LAUNCHCTL_VARIABLE_NAME = re.compile(r"(?i)(?:^|_)(?:launchctl|lctl)$")
+# argv that can only be a launchd job target, whatever the program word is: a domain target
+# (`gui/501`, `user/501/label`) or a job plist. This is what a neutral variable name cannot hide.
+_LAUNCHD_TARGET_ARG = re.compile(r"^(?:gui|user|system|loginwindow|pid)/\S+$")
+_LAUNCHD_PLIST_ARG = re.compile(r"(?i)\.plist$")
+
+
+def _expansion_parts(token: str) -> Optional[tuple[str, str]]:
+    """``(variable name, literal default)`` when *token* is a command-word shell expansion."""
+    match = _SHELL_EXPANSION.match(token)
+    if not match:
+        return None
+    braced = match.group("braced")
+    if braced is None:
+        return match.group("plain"), ""
+    body = _EXPANSION_BODY.match(braced)
+    if body is None:
+        return None
+    return body.group("name"), (body.group("default") or "").strip().strip("\"'")
+
+
+def _assigned_launchctl_variables(command: str) -> frozenset[str]:
+    """Variables the command's own text assigns a launchctl spelling to.
+
+    ``LAUNCHCTL=launchctl``, ``export LAUNCHCTL=/bin/launchctl`` and ``env L=launchctl …`` all state
+    the program in the text; only the *reference* later in the line is indirect.
+    """
+    names = set()
+    for segment in _iter_command_segments(command):
+        for token in segment:
+            if not _ENV_ASSIGNMENT.match(token):
+                continue
+            name, _, value = token.partition("=")
+            if _executable_name(value.strip().strip("\"'")) == "launchctl":
+                names.add(name)
+    return frozenset(names)
+
+
+def _command_word_reaches_launchctl(word: str, assigned: frozenset[str]) -> bool:
+    """True when the executed command *word* is launchctl — literally or through a variable."""
+    if _executable_name(word) == "launchctl":
+        return True
+    parts = _expansion_parts(word)
+    if parts is None:
+        return False
+    name, default = parts
+    if default and _executable_name(default) == "launchctl":
+        return True
+    return bool(_LAUNCHCTL_VARIABLE_NAME.search(name)) or name in assigned
+
+
+def _argv_reads_as_launchd(verb: str, arguments: list[str]) -> bool:
+    """argv that can only be a launchd job write, so an opaque program word does not help."""
+    if any(_LAUNCHD_TARGET_ARG.match(arg) or _LAUNCHD_PLIST_ARG.search(arg) for arg in arguments):
+        return True
+    # `submit -l <label> -- <helper>`: `-l` plus a submit verb is launchd's one submission form.
+    return verb == "submit" and "-l" in arguments
+
+
+def _segment_writes_launchd_job_set(
+    segment: list[str], index: int, verbs: frozenset[str], assigned: frozenset[str]
+) -> bool:
+    """An executed ``<launchctl> <verb>`` in *segment*, resolving variable indirection.
+
+    A static scan cannot follow `$(printf …)`, a value read from a file, or a payload built at
+    runtime; this closes the resolvable half — the program word stated by the command itself
+    (assignment, `${VAR:-launchctl}` default, a launchctl-shaped variable name) and the argv shape
+    that is unmistakable whatever the program word (SOU-1900). *assigned* is command-wide, because
+    `LAUNCHCTL=launchctl; "$LAUNCHCTL" bootstrap …` states the program in an earlier segment.
+    """
+    arguments = segment[index + 1 :]
+    if not arguments:
+        return False
+    verb = arguments[0].lower()
+    if verb not in verbs:
+        return False
+    if _command_word_reaches_launchctl(segment[index], assigned):
+        return True
+    return _expansion_parts(segment[index]) is not None and _argv_reads_as_launchd(verb, arguments[1:])
+
 
 def _contains_launchctl_verb(command: str, verbs: frozenset[str]) -> bool:
     """Detect an *executed* ``launchctl <verb>`` for one of *verbs* — never quoted text, never a
-    mention handed to a data sink (``grep "launchctl bootout"`` reads ``grep`` as the command)."""
+    mention handed to a data sink (``grep "launchctl bootout"`` reads ``grep`` as the command).
+
+    One resolver for both directions: registration and removal differ only in *verbs*, so the
+    indirection resolution (SOU-1900) cannot land in one spelling table and miss the other.
+    """
+    assigned = _assigned_launchctl_variables(command)
     for segment in _iter_command_segments(command):
         index = _executed_command_index(segment)
-        if index is not None and _executable_name(segment[index]) == "launchctl":
-            arguments = segment[index + 1 :]
-            if arguments and arguments[0].lower() in verbs:
-                return True
+        if index is not None and _segment_writes_launchd_job_set(segment, index, verbs, assigned):
+            return True
         # Python argv lists separate the words with brackets and commas, so the token walk above
         # reads `subprocess.run(["launchctl", "bootout", …])` as one opaque token. Flatten that
-        # punctuation and look for the program word followed by a verb, the same re-read the
-        # lifecycle token pass does for the gateway label (#68289). Only a segment that actually
-        # carries argv-list punctuation is re-read, so `grep launchctl bootout x` stays a read.
+        # punctuation and re-read it through the same resolver, the same re-read the lifecycle
+        # token pass does for the gateway label (#68289). Only a segment that actually carries
+        # argv-list punctuation is re-read, so `grep launchctl bootout x` stays a read.
         if any("[" in token or "," in token for token in segment):
             words = _ARGV_LIST_PUNCTUATION.sub(" ", " ".join(segment)).split()
-            for position, word in enumerate(words[:-1]):
-                if _executable_name(word) == "launchctl" and words[position + 1].lower() in verbs:
+            for position in range(len(words) - 1):
+                if _segment_writes_launchd_job_set(words, position, verbs, assigned):
                     return True
     return False
 
