@@ -5,7 +5,7 @@ import logging
 import sys
 import uuid
 
-from hermes_cli.gateway_client import GatewayClientError
+from hermes_cli.gateway_client import GATEWAY_STARTUP_RPC_DEADLINE_S, GatewayClientError
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +231,12 @@ class GatewayChatView:
 
     async def submit(self, text):
         self.mutations.retire(self.session_id)
-        return await self.client.rpc("prompt.submit", session_id=self.session_id,
+        # The turn's admission answers on the same owner loop that just took 12-25 s to answer
+        # ``session.create``; a 30 s budget here killed runs *after* a session already existed
+        # (2026-10-18T09:39:53Z, elapsed 84.2 s, session_id present, no output). Same startup
+        # deadline as the create: a late admission is recoverable, a dropped one is a lost run.
+        return await self.client.rpc("prompt.submit", _timeout=GATEWAY_STARTUP_RPC_DEADLINE_S,
+                                     session_id=self.session_id,
                                      input_id=uuid.uuid4().hex, text=text,
                                      **({"finite": True} if self.finite else {}),
                                      **({"unattended": True} if self.finite and self.unattended else {}))
