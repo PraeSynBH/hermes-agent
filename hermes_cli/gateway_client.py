@@ -15,6 +15,26 @@ GATEWAY_WS_TICKET_PREFIX = "hermes-gateway-ticket."
 # Per-request answer budget. Owner verbs are admissions/reads that answer promptly; the one that
 # legitimately runs long passes its own budget (``rpc(..., _timeout=...)``).
 DEFAULT_RPC_TIMEOUT = 30
+# Transport keepalive for the run socket. Explicit, NOT websockets' defaults, because the default
+# 20 s pong deadline is inside this host's measured stall distribution: with the gateway under load
+# 127 (1-min) a control-socket ``identify`` round trip ran p50 5.7 s / p90 19.4 s / max 24.5 s, and
+# 11 attached runs dropped with "Gateway disconnected; turn outcome is unknown" in the same minute
+# (2026-10-18T03:45:10Z, gateway pid 38118 alive throughout, no restart). A ping deadline that
+# fires on a *slow* owner tears down a turn the owner is still serving. 60 s keeps 2.4x margin over
+# the observed max; a genuinely dead owner still fails fast because the socket closes (close frame
+# or FIN) rather than going silent, which is the case the ping deadline exists for.
+GATEWAY_WS_PING_INTERVAL_S = 20.0
+GATEWAY_WS_PING_TIMEOUT_S = 60.0
+# Admission deadline for the session-ticket mint (``_session_ticket``). The owner answers this
+# control-socket verb from its event loop, so the budget is really "how long may the loop stall
+# before this run dies at admission". 5 s was measured against a healthy host; on this one the
+# verb's own latency under live load (43 active agents, gateway pid 38118) is p50 4.0 s, and
+# 5 of 12 mints expired at exactly 5.001 s while the owner went on to answer the same verb in
+# 7.6 s / 12.8 s (probe_ticket_latency.py, 2026-10-18T05:27Z). That converts a slow owner into
+# a dead run: 43 of the 75 fleet deaths in the 30 min to 05:13Z were this class. 30 s matches
+# DEFAULT_RPC_TIMEOUT and keeps margin over the widest observed answer (12.8 s) without
+# inventing a new number; a truly dead owner still fails, just 25 s later.
+GATEWAY_SESSION_TICKET_DEADLINE_S = 30.0
 # Canonical ``/compress`` answers only after the summary call(s) and the commit: a long session's
 # summary routinely takes more than 30 s (``auxiliary.compression.timeout`` defaults to 120 s per
 # request, ``compression.context_total_ceiling_seconds`` to 600 s). Same budget as Desktop's
@@ -162,10 +182,10 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, 
     }}).encode() + b"\n"
     if os.name == "nt":
         from gateway.runtime_bootstrap_windows import query_runtime_control
-        data = query_runtime_control(home, request, 5)
+        data = query_runtime_control(home, request, int(GATEWAY_SESSION_TICKET_DEADLINE_S))
     else:
-        deadline = time.monotonic() + 5
-        with connect_private(home, 5) as peer:
+        deadline = time.monotonic() + GATEWAY_SESSION_TICKET_DEADLINE_S
+        with connect_private(home, GATEWAY_SESSION_TICKET_DEADLINE_S) as peer:
             peer.sendall(request)
             data = bytearray()
             while b"\n" not in data:
@@ -229,7 +249,11 @@ async def connect_gateway(endpoint=None, subject=None):
         # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
         # cannot reach 127.0.0.1 turns every launch into a 10 s open timeout.
         async with connect(url, subprotocols=protocols, open_timeout=10, max_size=8 * 1024 * 1024,
-                           proxy=None) as ws:
+                           proxy=None,
+                           # Explicit keepalive: the default 20 s pong deadline is inside this
+                           # host's measured stall distribution (see GATEWAY_WS_PING_TIMEOUT_S).
+                           ping_interval=GATEWAY_WS_PING_INTERVAL_S,
+                           ping_timeout=GATEWAY_WS_PING_TIMEOUT_S) as ws:
             if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError("Gateway protocol mismatch; update/restart required")
             async with GatewayClient(ws) as client:
