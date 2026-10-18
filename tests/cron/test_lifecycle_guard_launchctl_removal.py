@@ -47,7 +47,7 @@ def test_removal_inside_a_referenced_script_is_refused(tmp_path):
     """The arm script's shape: the agent runs a file, not the command line."""
     arm = tmp_path / "arm-host-detectors.sh"
     arm.write_text(
-        "#!/bin/bash\n"
+        "#!/usr/bin/env bash\n"
         "launchctl bootout gui/$(id -u)/com.praesyn.canary-deadman 2>/dev/null\n"
         "launchctl bootstrap gui/$(id -u) ./canary-deadman.plist\n"
     )
