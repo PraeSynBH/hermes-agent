@@ -429,6 +429,50 @@ def mark_exited(exit_code: Optional[int] = None, reason: str = "graceful_shutdow
         logger.debug("Failed to mark lifecycle sentinel exited", exc_info=True)
 
 
+def mark_planned_stop(target_pid: Optional[int], reason: str = "gateway_stop", home: Optional[Path] = None,
+                      *, expected_create_time: Any = None) -> bool:
+    """Close the sentinel for a stop that was REQUESTED on purpose, from outside the gateway.
+
+    A deliberate stop can outlive the gateway's own teardown: the supervisor (launchd
+    ``ExitTimeOut``) or an impatient stopper SIGKILLs a gateway that is still draining
+    in-flight turns, so :func:`mark_exited` — the single funnel inside the process — never
+    runs.  The sentinel then stays ``phase=running`` and the next boot reports
+    ``gateway.previous_unclean_exit`` for a stop that was asked for: a phantom death that
+    buries the real one (PRA-6427, and the forensics of PRA-6426).
+
+    The stopper calls this once its target is gone.  Ownership-guarded twice, so a race can
+    never invent a clean exit: the sentinel must still name ``target_pid`` (a replacement
+    that already claimed it is left alone), and when both ``expected_create_time`` values
+    are known they must agree (a recycled PID's stop cannot vouch for another life).
+    A sentinel already marked ``exited`` is left as the process wrote it.  Idempotent,
+    never raises; returns True when it wrote the record.
+    """
+    try:
+        sentinel = _read_json(get_lifecycle_sentinel_path(home))
+        if sentinel is None or target_pid is None or sentinel.get("pid") != target_pid:
+            return False
+        if sentinel.get("phase") != "running":  # mark_exited (or an earlier planned stop) got there first
+            return False
+        stamped = sentinel.get("create_time")
+        if isinstance(stamped, (int, float)) and isinstance(expected_create_time, (int, float)):
+            if abs(float(stamped) - float(expected_create_time)) > 2.0:
+                return False
+        exited: dict[str, Any] = {
+            "phase": "exited", "pid": target_pid, "exit_code": None, "exit_reason": reason,
+            "exited_at": _now_iso(), "recorded_by": "planned_stop", "stopper_pid": os.getpid(),
+        }
+        for key in ("start_time", "create_time", "started_at"):
+            if sentinel.get(key) is not None:
+                exited[key] = sentinel[key]
+        _write_sentinel(exited, home)
+        _append_exit_diag({"ts": _now_iso(), "tag": "gateway.planned_stop", "pid": os.getpid(),
+                           "target_pid": target_pid, "exit_reason": reason}, home)
+        return True
+    except Exception:
+        logger.debug("Failed to record a planned stop in the lifecycle sentinel", exc_info=True)
+        return False
+
+
 def read_prior_exit_label(profile_home: Path) -> str:
     """``clean``/``unclean``/``unknown`` for the profile's last gateway life; annotates
     ``container-boot.log``.  ``running`` is unclean: the old PID namespace is gone at container boot."""

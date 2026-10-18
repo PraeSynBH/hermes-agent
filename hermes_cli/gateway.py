@@ -3966,35 +3966,14 @@ _resolved_launchd_domain: str | None = None
 
 
 def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float | None = 5.0) -> bool:
-    """Wait up to ``timeout`` s for the gateway (by gateway.pid, not launchd labels, so multiple
-    HERMES_HOMEs work) to exit; SIGKILL it after ``force_after`` s of graceful waiting."""
-    from gateway.status import get_process_start_time, get_running_pid
-    deadline = time.monotonic() + timeout
-    force_deadline = (time.monotonic() + force_after) if force_after is not None else None
-    force_sent = False
+    """Wait for the gateway to exit; SIGKILL after ``force_after`` s and record a planned stop.
 
-    while time.monotonic() < deadline:
-        pid = get_running_pid()
-        if pid is None:
-            return True  # Process exited cleanly.
+    Body in ``hermes_cli.gateway_stop`` (this facade is at its line cap); the name stays here
+    because callers and ``tests/compat/old_updater_surface.json`` import it from the facade.
+    """
+    from hermes_cli.gateway_stop import wait_for_gateway_exit
 
-        if force_after is not None and not force_sent and time.monotonic() >= force_deadline:
-            # Grace period expired — force-kill the specific PID.
-            try:
-                terminate_pid(pid, force=True, expected_start_time=get_process_start_time(pid))
-                print(f"⚠ Gateway PID {pid} did not exit gracefully; sent SIGKILL")
-            except (ProcessLookupError, PermissionError, OSError):
-                return True  # Already gone or we can't touch it.
-            force_sent = True
-
-        time.sleep(0.3)
-
-    # Timed out even after force-kill.
-    remaining_pid = get_running_pid()
-    if remaining_pid is not None:
-        print(f"⚠ Gateway PID {remaining_pid} still running after {timeout}s — restart may fail")
-        return False
-    return True
+    return wait_for_gateway_exit(timeout, force_after)
 
 
 def _wait_for_tcp_port_free(host: str, port: int, *, timeout: float = 10.0) -> bool:
