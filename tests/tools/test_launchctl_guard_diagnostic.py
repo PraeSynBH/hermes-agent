@@ -28,6 +28,25 @@ def test_bootstrap_rejection_does_not_invent_keepalive(tmp_path, monkeypatch):
     assert result["error"]
 
 
+def test_bootout_rejection_names_the_one_way_asymmetry(tmp_path, monkeypatch):
+    """SOU-1850: the refusal must say WHY a label nobody asked about is refused — the session
+    cannot register the job back — and must not pretend to have inspected the job."""
+    from tools import process_registry
+
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    blocked = gateway_lifecycle_block(
+        command="launchctl bootout gui/501/com.praesyn.canary-deadman",
+        env=None, env_type="local", cwd=str(tmp_path), workdir=None,
+        session_key="diagnostic-test",
+    )
+    assert blocked is not None
+    result = json.loads(blocked)
+    assert result["exit_code"] == 1
+    assert "may not remove a launchd job" in result["error"]
+    assert "bootstrap one back" in result["error"]
+    assert "KeepAlive" not in result["error"]
+
+
 def test_interpreter_kill_rejection_names_the_owned_process_route(tmp_path, monkeypatch):
     """Scheduled-Task topology (#113667): only ``HERMES_SUPERVISED_CHILD`` marks the launch, and an
     image-name kill of the interpreter is refused with the ``proc_*`` / explicit-PID route named.

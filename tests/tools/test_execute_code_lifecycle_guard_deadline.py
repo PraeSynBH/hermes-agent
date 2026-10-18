@@ -43,3 +43,15 @@ def test_interpreter_kill_in_execute_code_names_the_owned_process_route(monkeypa
     assert "proc_" in result["error"] and "explicit PID" in result["error"]
     generic = json.loads(cet.execute_code('import os; os.system("hermes gateway restart")'))
     assert "proc_" not in generic["error"] and "cannot restart or stop the gateway" in generic["error"]
+
+
+def test_launchd_job_removal_in_execute_code_is_refused_whatever_the_label(monkeypatch):
+    """SOU-1850 sibling surface: the kernel used to be able to boot out a job the shell surface
+    already refuses to bootstrap back."""
+    from tools import process_registry
+
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    result = json.loads(cet.execute_code(
+        'import subprocess; subprocess.run(["launchctl", "bootout", "gui/501/com.praesyn.canary-deadman"])'
+    ))
+    assert "may not remove a launchd job" in result["error"]

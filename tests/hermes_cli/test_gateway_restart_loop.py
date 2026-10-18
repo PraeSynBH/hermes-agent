@@ -202,7 +202,7 @@ class TestGatewayLifecyclePattern:
         "launchctl restart ai.hermes.daemon",
         # `submit` on an unrelated launchd label must not match the text
         # pattern (a cron PROMPT is prose fed to an LLM). The execution-aware
-        # `contains_launchctl_submit_command` handles neutral-label submits
+        # `contains_launchctl_registration_command` handles neutral-label submits
         # at the terminal/cron-script chokepoints instead.
         "launchctl submit -l com.example.backup -- /bin/sh backup.sh",
         "systemctl restart hermes-meta.service",
@@ -1418,9 +1418,9 @@ class TestTransparentWrapperPrefixes:
 
     @pytest.mark.parametrize("prefix", ["sudo", "env", "nohup", "setsid"])
     def test_wrapped_launchctl_submit_is_blocked(self, prefix):
-        from cron.lifecycle_guard import contains_launchctl_submit_command
+        from cron.lifecycle_guard import contains_launchctl_registration_command
 
-        assert contains_launchctl_submit_command(
+        assert contains_launchctl_registration_command(
             f"{prefix} launchctl submit -l com.example.helper -- /usr/bin/true"
         ) is True
 

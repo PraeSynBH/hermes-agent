@@ -751,12 +751,23 @@ def execute_code(
     if _probe.value:
         from cron.lifecycle_guard import (
             HOST_INTERPRETER_KILL_REJECTION,
+            LAUNCHCTL_HOST_JOB_REJECTION,
             contains_gateway_lifecycle_command,
             contains_host_interpreter_kill,
+            contains_launchctl_host_job_mutation,
         )
-        if contains_gateway_lifecycle_command(code):
+        # The launchd half is label-independent, so `subprocess.run(["launchctl", "bootout", ...])`
+        # here is refused exactly like the same command through terminal() would be — otherwise the
+        # in-gateway policy is one-way from the kernel too (SOU-1850). Detection stays
+        # execution-shaped on purpose: code that only WRITES a maintenance script naming
+        # `launchctl bootout` is not blocked here.
+        lifecycle = contains_gateway_lifecycle_command(code)
+        launchd_write = contains_launchctl_host_job_mutation(code)
+        if lifecycle or launchd_write:
             if contains_host_interpreter_kill(code):
                 return tool_error(HOST_INTERPRETER_KILL_REJECTION)
+            if launchd_write and not lifecycle:
+                return tool_error(LAUNCHCTL_HOST_JOB_REJECTION)
             return tool_error(
                 "Blocked: cannot restart or stop the gateway from inside the "
                 "gateway process. The gateway would kill this script before "

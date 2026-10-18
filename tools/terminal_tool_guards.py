@@ -282,15 +282,17 @@ def gateway_lifecycle_block(
     from cron.lifecycle_guard import (
         _MAX_REFERENCED_SCRIPT_BYTES,
         HOST_INTERPRETER_KILL_REJECTION,
+        LAUNCHCTL_HOST_JOB_REJECTION,
         contains_host_interpreter_kill,
-        contains_launchctl_submit_command,
+        contains_launchctl_registration_command,
+        contains_launchctl_removal_command,
         lifecycle_scan_root_within_budget,
         scan_gateway_lifecycle,
     )
     # Keep the specific launchctl diagnostic when this optional pre-scan fits the
     # budget. The full fail-closed guard below still runs when it does not, so
     # oversized roots never reach shlex here.
-    if lifecycle_scan_root_within_budget(command) and contains_launchctl_submit_command(command):
+    if lifecycle_scan_root_within_budget(command) and contains_launchctl_registration_command(command):
         return _blocked_json(
             "Blocked: launchctl submit/bootstrap is restricted inside a supervised "
             "gateway regardless of the job label, to prevent indirect gateway "
@@ -300,6 +302,11 @@ def gateway_lifecycle_block(
             "not by switching launchctl verbs to bypass this rejection.",
             "error",
         )
+    # The same policy read backwards: a session that may not register a launchd job may not
+    # remove one either (SOU-1850 — a session booted out two human-armed host detectors it
+    # could not bootstrap back).
+    if lifecycle_scan_root_within_budget(command) and contains_launchctl_removal_command(command):
+        return _blocked_json(LAUNCHCTL_HOST_JOB_REJECTION, "error")
     guard_cwd_base = get_session_cwd(session_key)
     if guard_cwd_base is None:
         guard_cwd_base = getattr(env, "cwd", None) or cwd
@@ -331,7 +338,8 @@ def gateway_lifecycle_block(
             return _blocked_json(HOST_INTERPRETER_KILL_REJECTION, "error")
         return _blocked_json(
             "Blocked: command or referenced script cannot restart, stop, or "
-            "uninstall the gateway from inside the gateway process. The gateway would "
+            "uninstall the gateway from inside the gateway process, nor register or remove a "
+            "launchd job the session does not own. The gateway would "
             "kill this command before it could complete (SIGTERM propagates "
             "to child processes). Run `hermes gateway restart` from a "
             "separate shell outside the running gateway.",
