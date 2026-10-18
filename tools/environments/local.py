@@ -31,6 +31,19 @@ from tools.environments.local_pythonpath import (
 
 
 _IS_WINDOWS = platform.system() == "Windows"
+_IS_MACOS = platform.system() == "Darwin"
+
+# Action-side launchd backstop (SOU-1932): the sh directory put first on a supervised
+# gateway child's PATH, and the env var carrying the gateway pid the shim walks ancestry
+# for. Both are set together by :func:`_launchd_shim_env` and nowhere else.
+LAUNCHD_SHIM_DIR = Path(__file__).resolve().parent / "launchd_shim"
+LAUNCHD_SHIM_GATEWAY_ENV = "HERMES_LAUNCHD_SHIM_GATEWAY"
+# One-way latch: once this PROCESS has proven it is the supervised gateway, stop re-proving
+# it on every spawn (the probe reads the pid file and a start time; ~10 ms a call). Only a
+# positive verdict is latched — a negative is never cached, so a gateway that spawns before
+# its pid file exists still gets shimmed on the next spawn. Latched-stale (the process losing
+# the identity later) only ever keeps the rail in place, which is the safe direction.
+_LAUNCHD_SHIM_CONFIRMED = False
 
 logger = logging.getLogger(__name__)
 
@@ -293,14 +306,57 @@ def _filter_secret_env(
             out[key] = value
 
 
+def _launchd_shim_env(env: dict) -> None:
+    """Front-load the launchd job-set backstop for children of a SUPERVISED gateway.
+
+    ``cron/lifecycle_guard.py`` refuses launchd job-set writes by reading the command
+    text, which cannot see a value built at runtime (``$(printf launchctl)``, a name read
+    from a file, an env-provided command word). This is the action side of that boundary:
+    the shim at ``tools/environments/launchd_shim/launchctl`` decides on the VERB, after a
+    shell exists, and refuses from the process that would execute it (SOU-1932).
+
+    Only a supervised gateway injects it — the shim is a cost/audit layer for that one
+    blast radius, and nothing outside the gateway may inherit it (the release path arms
+    jobs from a login shell). The gateway's own pid rides along so the shim can walk
+    ancestry instead of sniffing command lines (root AGENTS.md: never infer process
+    identity from argv). A child that rebuilds its env keeps both, because the gateway is
+    still its ancestor.
+
+    Called from :func:`_finalize_child_env`, not from ``build_subprocess_env`` alone: the
+    terminal tool builds its spawn env through ``_make_run_env`` → ``_scrubbed_env``, and
+    that is the path the guard exists for.
+    """
+    if not _IS_MACOS:
+        return
+    # Inherited marker: this process was already shimmed by its gateway, so the (file- and
+    # ps-probing) supervised probe would only re-prove what the env says. Skipping it keeps
+    # every descendant spawn cheap, and a positive verdict is latched for this process.
+    gateway_pid = os.environ.get(LAUNCHD_SHIM_GATEWAY_ENV)
+    if not gateway_pid:
+        global _LAUNCHD_SHIM_CONFIRMED
+        if not _LAUNCHD_SHIM_CONFIRMED:
+            from tools.process_registry import _is_supervised_gateway_process
+
+            if not _is_supervised_gateway_process():
+                return
+            _LAUNCHD_SHIM_CONFIRMED = True
+        gateway_pid = str(os.getpid())
+    shim_dir = str(LAUNCHD_SHIM_DIR)
+    path_key = _path_env_key(env) or "PATH"
+    env[LAUNCHD_SHIM_GATEWAY_ENV] = gateway_pid
+    env[path_key] = _prepend_missing_path_entries(
+        env.get(path_key) or os.environ.get("PATH", ""), [shim_dir])
+
+
 def _finalize_child_env(env: dict) -> dict:
     """Guards shared by every spawn surface: profile-home propagation, session-context
     bridging, Hermes-owned PYTHONPATH + venv-marker strip, MSYS defaults, delegate_task
-    Kanban scrub. Returns the (possibly new) dict."""
+    Kanban scrub, the supervised-gateway launchd backstop. Returns the (possibly new) dict."""
     _apply_profile_home(env)
     _inject_session_context_env(env)
     _strip_hermes_owned_pythonpath_and_runtime_markers(env)
     _apply_windows_msys_bash_env_defaults(env)
+    _launchd_shim_env(env)
     from agent.delegation_context import delegated_child_subprocess_env
     return delegated_child_subprocess_env(env)
 
@@ -407,6 +463,9 @@ def build_subprocess_env(
         _apply_profile_home(env)
     if extra:
         env.update(extra)
+    # This branch bypasses _finalize_child_env, so the launchd backstop is applied here too
+    # (after ``extra``: a caller override must not be able to strip a safety rail).
+    _launchd_shim_env(env)
     from agent.delegation_context import delegated_child_subprocess_env
     return delegated_child_subprocess_env(env)
 

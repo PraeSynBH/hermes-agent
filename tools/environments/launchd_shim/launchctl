@@ -1,0 +1,113 @@
+#!/bin/sh
+# launchd job-set backstop (SOU-1932) — the action side of the launchd guard.
+#
+# `build_subprocess_env`'s shared guard (`_finalize_child_env`) puts this directory
+# first on PATH for children of a SUPERVISED Hermes gateway only, together with
+# HERMES_LAUNCHD_SHIM_GATEWAY (the gateway's pid). A child that asks this shim for a
+# launchd JOB-SET write is refused at the process that would execute it, whatever the
+# spelling the caller used: `L=$(printf launchctl); $L bootstrap ...`, `${L}ctl`, a
+# value read from a file, or an env-provided command word. The static content scan
+# (`cron/lifecycle_guard.py`) cannot see any of those, because it runs before a shell
+# exists; this can, because it runs after.
+#
+# HONEST LIMITS — this is L3 in ~/.paperclip/bin/SOU-1900-launchctl-indirection-plan.md,
+# a cost/audit layer, not a security boundary:
+#   * an absolute path (/bin/launchctl) or a copied binary bypasses the shim entirely;
+#   * so does a child that rebuilds PATH (or unsets HOME / HERMES_LAUNCHD_SHIM_GATEWAY);
+#   * the shim is only on PATH where the gateway injected it, so nothing outside the
+#     gateway is affected — which is the point (the release path must still arm jobs).
+# The only real boundary is L4 (root-owned LaunchDaemons the uid-501 gateway cannot
+# boot out at all); that is a host-detector architecture change, not a guard change.
+#
+# Decision is on the VERB, never on argv shape: read verbs (`list`, `print`, `blame`,
+# `getenv`, ...) and the rest of launchctl's surface exec straight through to the real
+# binary, so `launchctl list` inside an agent shell keeps working.
+#
+# Fail direction: refusing is the safe direction for every case this shim can be in
+# (it exists only as a gateway child's PATH entry), so an ancestry walk that cannot
+# reach pid 1, or a missing gateway marker, refuses instead of guessing.
+#
+# Every refusal appends one line to $HERMES_LAUNCHD_SHIM_LOG
+# (default ~/.paperclip/logs/launchd-shim-refusals.log): ts, verb, pid, ancestry, argv.
+# That log is how a mismatch between the static guard and this shim is found.
+
+set -u
+LC_ALL=C
+export LC_ALL
+
+REAL_LAUNCHCTL=/bin/launchctl
+[ -x "$REAL_LAUNCHCTL" ] || REAL_LAUNCHCTL=/usr/bin/launchctl
+
+# Job-set writes: registration (a launchd job that KeepAlive will keep respawned),
+# removal (a job that can then never be brought back by the gateway it belongs to),
+# and the legacy per-job state verbs `kickstart`/`stop`/`start`/`kill`, which restart or
+# signal a job — `kickstart ai.hermes.gateway` is the respawn loop in one word.
+JOB_SET_VERBS=" submit bootstrap load bootout unload disable remove kickstart stop start kill "
+
+shim_argv="$*"
+
+verb=""
+for arg in "$@"; do
+    case "$arg" in
+        -*) continue ;;
+        *) verb="$arg"; break ;;
+    esac
+done
+
+case "$JOB_SET_VERBS" in
+    *" $verb "*) ;;
+    *) exec "$REAL_LAUNCHCTL" "$@" ;;
+esac
+
+log_path=${HERMES_LAUNCHD_SHIM_LOG:-${HOME:-/tmp}/.paperclip/logs/launchd-shim-refusals.log}
+
+# Ancestry: this pid up to 1, as " pid pid pid". Non-zero when the walk breaks
+# (ps missing/failing, a non-numeric parent, a self-parent, or 64 hops without pid 1).
+ancestry() {
+    pid=$$
+    chain=" $pid"
+    hops=0
+    while [ "$pid" != "1" ]; do
+        parent=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' \t')
+        case "$parent" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        [ "$parent" -gt 0 ] 2>/dev/null || return 1
+        [ "$parent" = "$pid" ] && return 1
+        pid=$parent
+        chain="$chain $pid"
+        hops=$((hops + 1))
+        [ "$hops" -gt 64 ] && return 1
+    done
+    printf '%s' "$chain"
+    return 0
+}
+
+refuse() {
+    # $1: policy reason (one line). Logging is best-effort — a full/absent log directory
+    # must never turn a refusal into an execution.
+    line=$(printf '%s verb=%s pid=%s ancestry=%s argv=%s reason=%s' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$verb" "$$" "${chain:-unknown}" "$shim_argv" "$1")
+    printf '%s\n' "$line" >>"$log_path" 2>/dev/null ||
+        { mkdir -p "${log_path%/*}" 2>/dev/null && printf '%s\n' "$line" >>"$log_path" 2>/dev/null; }
+    printf 'launchd-shim: refused `launchctl %s`: %s\n' "$verb" "$1" >&2
+    printf 'launchd-shim: policy — no launchd job-set write from inside the supervised Hermes gateway.\n' >&2
+    printf 'launchd-shim: run it from a login shell outside the gateway (see SOU-1932 / L4 for the real boundary).\n' >&2
+    exit 77
+}
+
+chain=""
+gateway=${HERMES_LAUNCHD_SHIM_GATEWAY:-}
+case "$gateway" in
+    ''|*[!0-9]*) refuse "no supervised-gateway ancestry marker in the environment (fail closed)" ;;
+esac
+# pid 1 is in every walk: a "gateway pid" of 1 is an absent/garbled marker, never the gateway.
+[ "$gateway" -gt 1 ] 2>/dev/null || refuse "supervised-gateway ancestry marker is not a usable pid (fail closed)"
+
+chain=$(ancestry) || refuse "could not walk this process's ancestry to pid 1 (fail closed)"
+
+case "$chain " in
+    *" $gateway "*) refuse "the supervised gateway (pid $gateway) is in this process's ancestry" ;;
+esac
+
+exec "$REAL_LAUNCHCTL" "$@"
