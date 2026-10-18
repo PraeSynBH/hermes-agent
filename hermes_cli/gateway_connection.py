@@ -139,6 +139,12 @@ class GatewayConnection:
     # -- lifecycle ---------------------------------------------------------------------------
     def start(self, timeout=90):
         deadline = time.monotonic() + timeout
+        # A failed dial is retried until the deadline, so the run's final error is the last
+        # dial's, not the admission's: the 07:00Z-shape deaths (30.8-79.2 s) are one or two
+        # dials deep. Carry the dial count and the wall time into the message so a fleet death
+        # says how many admissions it paid for instead of only where the last one stopped.
+        began = time.monotonic()
+        dials = 0
         while True:
             with self._start_lock:
                 if self.final:
@@ -161,17 +167,27 @@ class GatewayConnection:
                         self.closed = False
                     thread = self._thread = spawn_context_thread(self._run, name="hermes-gateway-loop")
                     thread.start()
+                    dials += 1
             # Every caller waits out a dial in progress, its own or another thread's.
             if not self._ready.wait(max(deadline - time.monotonic(), 0)):
-                raise GatewayClientError("Gateway connection timed out; no local fallback")
+                raise GatewayClientError(
+                    f"Gateway connection timed out; no local fallback "
+                    f"({dials} dial(s) in {time.monotonic() - began:.1f}s)")
             if self._error is not None:
-                raise self._error
+                error = self._error
+                # GatewayUnavailableError carries a `.state` a caller inspects; only annotate the
+                # plain transport error, never re-wrap a typed one.
+                if type(error) is GatewayClientError:
+                    error = GatewayClientError(f"{error} ({dials} dial(s) in {time.monotonic() - began:.1f}s)")
+                raise error
             if self.client is not None or self.final:
                 return
             # Hung up right after that dial: let its loop end, then dial again.
             thread.join(max(deadline - time.monotonic(), 0))
             if time.monotonic() >= deadline:
-                raise GatewayClientError("Gateway connection timed out; no local fallback")
+                raise GatewayClientError(
+                    f"Gateway connection timed out; no local fallback "
+                    f"({dials} dial(s) in {time.monotonic() - began:.1f}s)")
 
     def _run(self):
         try:
