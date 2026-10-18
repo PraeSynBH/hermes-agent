@@ -36,6 +36,19 @@ GATEWAY_WS_PING_TIMEOUT_S = 60.0
 # DEFAULT_RPC_TIMEOUT and keeps margin over the widest observed answer (12.8 s) without
 # inventing a new number; a truly dead owner still fails, just 25 s later.
 GATEWAY_SESSION_TICKET_DEADLINE_S = 30.0
+# The run's own first in-band RPCs (``runtime.describe`` -> ``session.create``/``session.resume``)
+# are NOT prompt admissions: ``session.create`` binds the profile, loads the agent config and opens
+# the state DB on the owner's event loop, in the same process that is running every other agent
+# turn. Measured on this host 2026-10-18T09:23-09:25Z (``probe_session_create.py``, gateway pid
+# 30963, 1-min load 87-100, ~300 threads in that process): ``runtime.describe`` p50 1.5 s / max
+# 3.1 s, ``session.create`` p50 21.8 s / max 24.8 s. Against ``DEFAULT_RPC_TIMEOUT`` = 30 s that
+# is zero headroom, and it is exactly what the fleet dies of: 83 % of connect deaths in the 2 h to
+# 09:09Z carried ``phase=session`` + ``TimeoutError`` (``phase_census.py``), i.e. ticket minted,
+# socket open, then the in-band RPC outlived its budget and the run exited before any output.
+# 120 s keeps ~5x margin over the widest observed answer while still bounding a genuinely hung
+# owner (a dead owner closes the socket instead of going silent). Failure mode if this is wrong:
+# a run that used to die at 30 s waits longer before dying.
+GATEWAY_STARTUP_RPC_DEADLINE_S = 120.0
 # Canonical ``/compress`` answers only after the summary call(s) and the commit: a long session's
 # summary routinely takes more than 30 s (``auxiliary.compression.timeout`` defaults to 120 s per
 # request, ``compression.context_total_ceiling_seconds`` to 600 s). Same budget as Desktop's
