@@ -31,11 +31,10 @@ def _control_event(kind, *, admission="neighbor", prompt_id="p1"):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["approval.request", "clarify.request"])
 @pytest.mark.parametrize("timing", ["before_receipt", "after_receipt"])
-async def test_oneshot_tracks_foreign_blocking_control_and_detaches(
-    capsys, kind, timing
-):
+async def test_oneshot_tracks_foreign_clarify_and_detaches(capsys, timing):
+    kind = "clarify.request"
+
     class Peer:
         events = asyncio.Queue()
 
@@ -78,6 +77,27 @@ async def test_oneshot_tracks_foreign_blocking_control_and_detaches(
     assert "secret command" not in captured.err
     assert "secret question" not in captured.err
     assert "Input required; detached without cancelling" in captured.err
+
+
+def test_finite_block_detaches_only_on_a_prompt_that_needs_a_human():
+    """A pending APPROVAL must not end a one-shot: it resolves itself at approvals.timeout and the
+    owner's turn carries on (a 14-minute run was recorded failed on a protected-file approval prompt,
+    then completed successfully 15 minutes later). A CLARIFY blocks on a human for
+    agent.clarify_timeout, so that one still detaches."""
+
+    class Peer:
+        events = asyncio.Queue()
+
+    view = GatewayChatView(Peer(), {"stored_session_id": "stored"}, quiet=True)
+    view.finite = True
+    view.finite_admission = "mine"
+
+    view.prompts = {"p1": {"kind": "approval", "prompt_id": "p1", "command": "write to AGENTS.md"}}
+    assert view._finite_block("mine") is None
+
+    view.prompts["p2"] = {"kind": "clarify", "prompt_id": "p2", "question": "which branch?"}
+    blocked = view._finite_block("mine")
+    assert blocked and "Input required; detached without cancelling" in blocked
 
 
 @pytest.mark.asyncio

@@ -432,7 +432,15 @@ class GatewayChatView:
         if own == "queued" and self.unknown_admissions():
             return ("Unknown execution blocks this session; your accepted input is retained. "
                     "Resume interactively to resolve the lost turn; do not resend the input.")
-        if self.prompts and (own or not self.gaps):  # a control blocks only a turn still pending
+        # Only a CLARIFY blocks the turn on a human (agent.clarify_timeout, 3600 s default).
+        # An APPROVAL self-terminates at approvals.timeout and fails that one tool closed; the
+        # owner's turn then carries on to a real settled result (#PRX-5378: detaching on the first
+        # pending approval ended a 14-minute run that went on to complete 15 minutes later, and the
+        # consumer recorded a successful run as failed). Waiting here is bounded twice over — by the
+        # tool's own approval timeout and by the caller's run deadline. The older scoping survives:
+        # a control blocks only a turn that is still pending (own, or no re-attach gap).
+        if (any(prompt.get("kind") == "clarify" for prompt in self.prompts.values())
+                and (own or not self.gaps)):
             return "Input required; detached without cancelling. Resume this session interactively."
         return None
 
