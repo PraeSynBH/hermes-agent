@@ -767,7 +767,10 @@ def _assigned_launchctl_variables(command: str) -> frozenset[str]:
     """Variables the command's own text assigns a launchctl spelling to.
 
     ``LAUNCHCTL=launchctl``, ``export LAUNCHCTL=/bin/launchctl`` and ``env L=launchctl …`` all state
-    the program in the text; only the *reference* later in the line is indirect.
+    the program in the text; only the *reference* later in the line is indirect. The value may itself
+    be an expansion: ``PROG="${ARM_PROG:-launchctl}"`` states the program in its default, so the
+    assignment is judged by the same resolver as a command word (found by the SOU-1934 corpus: the
+    removal direction was reachable through a neutral name with a defaulted launchctl value).
     """
     names = set()
     for segment in _iter_command_segments(command):
@@ -775,7 +778,7 @@ def _assigned_launchctl_variables(command: str) -> frozenset[str]:
             if not _ENV_ASSIGNMENT.match(token):
                 continue
             name, _, value = token.partition("=")
-            if _executable_name(value.strip().strip("\"'")) == "launchctl":
+            if _command_word_reaches_launchctl(value.strip().strip("\"'"), frozenset()):
                 names.add(name)
     return frozenset(names)
 
