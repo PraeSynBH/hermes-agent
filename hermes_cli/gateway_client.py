@@ -21,11 +21,22 @@ DEFAULT_RPC_TIMEOUT = 30
 # 127 (1-min) a control-socket ``identify`` round trip ran p50 5.7 s / p90 19.4 s / max 24.5 s, and
 # 11 attached runs dropped with "Gateway disconnected; turn outcome is unknown" in the same minute
 # (2026-10-18T03:45:10Z, gateway pid 38118 alive throughout, no restart). A ping deadline that
-# fires on a *slow* owner tears down a turn the owner is still serving. 60 s keeps 2.4x margin over
-# the observed max; a genuinely dead owner still fails fast because the socket closes (close frame
-# or FIN) rather than going silent, which is the case the ping deadline exists for.
+# fires on a *slow* owner tears down a turn the owner is still serving.
+#
+# 60 s was still below this owner's worst *recoverable* stall. `ws_drop_causes.py --hours 4` over
+# 15:22-19:22Z found 73 socket deaths, 99 % of them in three bursts, and the faulthandler dump in
+# each burst's tail shows a loop starved by one GIL (100 live threads, 4 of them inside macOS
+# peer-cert evaluation, 36 inside filesystem scans) rather than a dead process: at 18:12:14Z
+# 11 runs died together, the loop then recovered and the process kept serving. At 18:17:16Z 29 runs
+# died at the 60 s deadline *while the owner was still running its turns*; the loop-liveness
+# watchdog only confirmed the wedge 27 s later. Raising the deadline 60 -> 300 s deliberately puts
+# it ABOVE the leash that decides a stall is fatal: `gateway.loop_watchdog_max_strikes: 6`
+# (~240 s of no dispatch before the out-of-loop watchdog hard-exits, see shutdown_watchdog.py), so
+# the ping deadline can no longer be the thing that kills a run during a stall the owner survives.
+# A genuinely dead owner still fails fast: the socket gets a close frame or FIN, which is the case
+# the ping deadline exists for.
 GATEWAY_WS_PING_INTERVAL_S = 20.0
-GATEWAY_WS_PING_TIMEOUT_S = 60.0
+GATEWAY_WS_PING_TIMEOUT_S = 300.0
 # Admission deadline for the session-ticket mint (``_session_ticket``). The owner answers this
 # control-socket verb from its event loop, so the budget is really "how long may the loop stall
 # before this run dies at admission". 5 s was measured against a healthy host; on this one the
