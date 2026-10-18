@@ -1635,31 +1635,41 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             "deferring stop() until they finish (cap=%.0fs) so in-flight "
             "turns are not amputated (#77184)", active, timeout,
         )
+        from gateway.drain_control import (
+            RESTART_WAIT_ADMISSION_CLOSE_S, close_restart_wait_admission, open_restart_wait)
+        # The wait keeps admitting new work until the force-drain window opens: a healthy owner that
+        # refuses every new turn for up to `timeout` seconds is an outage, not a restart (measured
+        # 267 refused admissions / 30 min, 2026-10-18 05:30Z). Closed the instant the wait ends.
+        open_restart_wait(self, admit_for=timeout - RESTART_WAIT_ADMISSION_CLOSE_S)
         self._scale_to_zero_status("draining", "restart wait: status mark failed")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         last_status_at = 0.0
-        while self._awaitable_work_count() > 0:
-            now = loop.time()
-            if now >= deadline:
-                logger.warning(
-                    "Restart after-turn wait timed out after %.0fs with %d "
-                    "still active; proceeding to stop()/drain which may "
-                    "interrupt remaining work (#77184)", timeout, self._active_work_count(),
-                )
-                return False
-            if (now - last_status_at) >= 30.0:
-                logger.info(
-                    "Restart deferred: waiting on %d active work unit(s) "
-                    "(%d wedged and excluded, %d restart-safe and excluded; "
-                    "%.0fs remaining before force drain): %s",
-                    self._awaitable_work_count(), self._wedged_agent_count(),
-                    self._restart_safe_cron_count(), deadline - now,
-                    self._describe_active_work(),
-                )
-                self._scale_to_zero_status("draining", "restart wait: status mark failed")
-                last_status_at = now
-            await asyncio.sleep(0.1)
+        try:
+            while self._awaitable_work_count() > 0:
+                now = loop.time()
+                if now >= deadline:
+                    logger.warning(
+                        "Restart after-turn wait timed out after %.0fs with %d "
+                        "still active; proceeding to stop()/drain which may "
+                        "interrupt remaining work (#77184)", timeout, self._active_work_count(),
+                    )
+                    return False
+                if (now - last_status_at) >= 30.0:
+                    logger.info(
+                        "Restart deferred: waiting on %d active work unit(s) "
+                        "(%d wedged and excluded, %d restart-safe and excluded; "
+                        "%.0fs remaining before force drain, admission %s): %s",
+                        self._awaitable_work_count(), self._wedged_agent_count(),
+                        self._restart_safe_cron_count(), deadline - now,
+                        "open" if (deadline - now) > RESTART_WAIT_ADMISSION_CLOSE_S else "closed",
+                        self._describe_active_work(),
+                    )
+                    self._scale_to_zero_status("draining", "restart wait: status mark failed")
+                    last_status_at = now
+                await asyncio.sleep(0.1)
+        finally:
+            close_restart_wait_admission(self)
         if self._active_work_count() > 0:
             logger.warning(
                 "Restart deferred wait: %d excluded work unit(s) remain "

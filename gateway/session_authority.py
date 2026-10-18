@@ -212,13 +212,20 @@ class SessionAuthority:
     def _require_admission_open(self, *, queue_only=False):
         """``queue_only``: the caller only COMMITS a queued row (never claims or runs it). A restart's
         after-turn wait accepts those (#139041): the row is durable FIFO input the next owner runs
-        exactly once, while this owner's claim path stays refused."""
+        exactly once, while this owner's claim path stays refused.
+
+        That wait is also the ONLY drain that admits new work outright (``restart_wait_admits``):
+        it can hold the process for ``restart_after_turn_timeout`` while the owner is healthy and
+        serving, so refusing every new claim for that window is a fleet-wide blackout, not a
+        graceful restart. It stops admitting :data:`gateway.drain_control.RESTART_WAIT_ADMISSION_CLOSE_S`
+        before its force-drain deadline, and not at all once the wait ends (``stop()``)."""
         if self.retiring:
             raise RuntimeStoreError('runtime_draining')
         if self.runner._draining:
-            from gateway.drain_control import restart_wait_open
-            if not (queue_only and restart_wait_open(self.runner)):
-                raise RuntimeStoreError('runtime_draining')
+            from gateway.drain_control import restart_wait_admits, restart_wait_open
+            if (queue_only and restart_wait_open(self.runner)) or restart_wait_admits(self.runner):
+                return
+            raise RuntimeStoreError('runtime_draining')
 
     def _admission_gate(self, authorize=None, *, queue_only=False):
         """The admission gate re-checked inside an off-loop write transaction (with the caller's
