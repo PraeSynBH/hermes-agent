@@ -202,3 +202,15 @@ def test_defined_variable_with_a_launchctl_value_is_collected():
     )
 
     assert found == frozenset({"A", "B"})
+
+
+def test_defined_variable_with_a_defaulted_launchctl_value_is_collected():
+    """`PROG="${ARM_PROG:-launchctl}"` states the program in the default (found by SOU-1934)."""
+    found = lifecycle_guard._assigned_launchctl_variables(
+        'PROG="${ARM_PROG:-launchctl}" TAIL=${X} OTHER=git'
+    )
+
+    assert found == frozenset({"PROG"})
+    assert lifecycle_guard.contains_launchctl_removal_command(
+        'PROG="${ARM_PROG:-launchctl}"; "$PROG" bootout "gui/$uid/$label"'
+    ) is True
