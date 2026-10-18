@@ -288,6 +288,12 @@ async def connect_gateway(endpoint=None, subject=None):
 
     remote = "" if endpoint is not None else os.environ.get("HERMES_TUI_GATEWAY_URL", "").strip()
     protocols = None
+    # Admission is the stage a run dies on that leaves no other trace: the run log records one
+    # final string, so a death cannot say whether the ticket mint or the WS open burned the
+    # budget. Name the phase and the elapsed time in the error itself (2026-10-18T07:00Z: 8
+    # fleet deaths at load 129, 30.8-79.2 s, all reported as this one opaque string).
+    started = time.monotonic()
+    phase = "session-ticket"
     if endpoint is not None:
         ticket = await asyncio.to_thread(_session_ticket, gateway_profile_home(get_hermes_home()), endpoint,
                                          subject=subject)
@@ -302,6 +308,7 @@ async def connect_gateway(endpoint=None, subject=None):
         home = gateway_profile_home(get_hermes_home())
         # A client's own start: the daemon it may launch ends itself once idle (no client, adapter,
         # cron/kanban work or admission), and the next client starts a fresh one.
+        phase = "runtime"
         result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True)
         if not attachable(result):
             detail = getattr(result, "detail", None)
@@ -314,6 +321,7 @@ async def connect_gateway(endpoint=None, subject=None):
         endpoint = result.endpoint
         ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
         url, protocols = gateway_ws_target(endpoint, ticket)
+    phase = "ws-open"
     try:
         # The gateway is a loopback (or explicitly named) peer, never something to route through the
         # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
@@ -326,9 +334,13 @@ async def connect_gateway(endpoint=None, subject=None):
                            ping_timeout=GATEWAY_WS_PING_TIMEOUT_S) as ws:
             if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError("Gateway protocol mismatch; update/restart required")
+            phase = "session"
             async with GatewayClient(ws) as client:
                 yield client
     except GatewayClientError:
         raise
     except (OSError, TimeoutError) as exc:
-        raise GatewayClientError("Gateway connection failed; no local fallback") from exc
+        raise GatewayClientError(
+            f"Gateway connection failed; no local fallback "
+            f"(phase={phase}, elapsed={time.monotonic() - started:.1f}s, "
+            f"{type(exc).__name__}: {exc})") from exc
