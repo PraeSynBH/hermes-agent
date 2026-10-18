@@ -14,7 +14,8 @@ from acp.schema import (
     SessionCapabilities, SessionForkCapabilities, SessionListCapabilities, SessionResumeCapabilities,
 )
 
-from hermes_cli.gateway_client import GatewayClientError, connect_gateway
+from hermes_cli.gateway_client import (GATEWAY_STARTUP_RPC_DEADLINE_S, GatewayClientError,
+                                       connect_gateway)
 from hermes_constants import get_hermes_home
 from acp_adapter.gateway_reply import GatewayReplyMixin, _text
 from acp_adapter.session import _translate_acp_cwd, _normalize_cwd_for_compare
@@ -254,8 +255,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         flags = env_launch_flags()
         if flags.get("safe_mode") or flags.get("ignore_user_config"):
             flags.update(_bypass_route())
-        snapshot = await client.rpc("session.create", request_id=uuid.uuid4().hex,
-            source="acp", cwd=_translate_acp_cwd(cwd),
+        snapshot = await client.rpc("session.create", _timeout=GATEWAY_STARTUP_RPC_DEADLINE_S,
+            request_id=uuid.uuid4().hex, source="acp", cwd=_translate_acp_cwd(cwd),
             editor={"mcp_servers": [s.model_dump(by_alias=True) for s in mcp_servers or []],
                     "edit_approval_policy": "ask"}, **flags)
         session_id = snapshot["session_id"]
