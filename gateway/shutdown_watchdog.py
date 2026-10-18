@@ -238,6 +238,30 @@ def resolve_shutdown_watchdog_delay(
     return _coerce_float(drain_timeout, 0.0) + grace
 
 
+def _frame_snapshot(wanted: int = 12) -> str:
+    """Per-thread innermost frames from ``sys._current_frames()``: the always-available fallback.
+
+    ``faulthandler.dump_traceback`` silently yields ``<freed thread state>`` (or nothing) when it
+    cannot read a thread's state, which is exactly what the 2026-10-18T18:17:43Z loop-liveness fire
+    hit — the most damaging freeze of that window left no stacks at all. Reading the frames from
+    inside the watchdog thread cannot fail that way, so every fire records who was where.
+    """
+    try:
+        frames = sys._current_frames()
+        names = {t.ident: t.name for t in threading.enumerate()}
+    except Exception:
+        return "(frame snapshot unavailable)\n"
+    lines = []
+    for ident, frame in frames.items():
+        chain = []
+        while frame is not None and len(chain) < wanted:
+            chain.append(f"    {frame.f_code.co_filename}:{frame.f_lineno} {frame.f_code.co_name}")
+            frame = frame.f_back
+        lines.append(f"  thread {ident} [{names.get(ident, '?')}]")
+        lines.extend(chain)
+    return "\n".join(lines) + "\n"
+
+
 def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[dict[str, Any]],
                          event: str = "shutdown_watchdog_fired") -> None:
     """Best-effort faulthandler + metadata dump before hard-exit (file, then stderr)."""
@@ -252,6 +276,9 @@ def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[
             faulthandler.dump_traceback(file=fh, all_threads=True)
         except Exception:
             fh.write("(faulthandler.dump_traceback failed)\n")
+        # Second witness: faulthandler can return "<freed thread state>" with no stacks at all.
+        fh.write("--- sys._current_frames ---\n")
+        fh.write(_frame_snapshot())
         fh.write("--- end dump ---\n")
         fh.flush()
     with contextlib.suppress(Exception):  # stderr too: journald/launchd get it if disk is wedged
