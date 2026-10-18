@@ -5,6 +5,10 @@ A cron job that restarts/stops the gateway from inside the gateway (``hermes gat
 the supervisor revives it, auto-resume re-runs the turn: a SIGTERM-respawn loop.
 ``cron.jobs.create_job`` rejects such specs on every creation path. Patterns are command-shaped —
 anchored on concrete command identifiers — so they cannot fire on prose. Defence-in-depth layer.
+
+The same guard owns the host launchd JOB SET for a supervised session: registering (submit /
+bootstrap / load) and removing (bootout / unload / disable / remove) are both refused, whatever the
+label, because a session that cannot put a job back must never be able to take one away (SOU-1850).
 """
 
 from __future__ import annotations
@@ -40,15 +44,16 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"(?:(?<![/\w.\-])hermes(?:\.(?:exe|cmd|bat|com|ps1))?\s+gateway\s+(?:restart|stop|uninstall)\b)"
     # Branch B: launchctl ops anchored on a hermes-gateway label so unrelated hermes services stay
     # unblocked. `submit`/`bootstrap` register a NEW keepalive job wrapping an arbitrary helper (a
-    # laundered restart); neutral-label submissions are caught by
-    # `contains_launchctl_submit_command`. `bootout`/`remove`/`disable` are the
+    # laundered restart); neutral-label writes are caught by
+    # `contains_launchctl_host_job_mutation`. `bootout`/`remove`/`disable` are the
     # modern/legacy/durable forms of `unload`.
     # `submit` and `bootstrap` are included alongside the direct verbs (kickstart/etc.): `launchctl submit
     # -l ai.hermes.gateway-<suffix> -- <helper-script>` (or `launchctl bootstrap gui/<uid> <plist>`) creates
     # a NEW keepalive job wrapping an arbitrary helper, which is how a blocked direct restart/kill gets
     # laundered into a persistent restart loop instead (#62891) — same foot-gun, indirect shape.
-    # Neutral-label submissions that dodge this text anchor are caught separately by
-    # `contains_launchctl_submit_command` (execution-aware, label-independent). `bootout`/`remove`/`disable`
+    # Neutral-label writes that dodge this text anchor are caught separately by
+    # `contains_launchctl_host_job_mutation` (execution-aware, label-independent — both directions of
+    # the job-set write: registration and removal). `bootout`/`remove`/`disable`
     # sit alongside `unload`: Apple deprecated load/unload in favour of bootstrap/bootout, so `bootout` is
     # the modern spelling of an already-listed verb, `remove` is its legacy sibling, and `disable` is what
     # makes an unload durable across boots. Omitting them left the bypassable approval layer
@@ -701,21 +706,79 @@ def _executed_command_index(segment: list[str]) -> Optional[int]:
     return index if index < len(segment) else None
 
 
-def contains_launchctl_submit_command(command: str) -> bool:
-    """Detect an executed ``launchctl submit``/``bootstrap``, not quoted text.
+# launchd job-set writes, split by direction. The guard must treat both the same way: a session
+# that cannot REGISTER a job must also not REMOVE one, or the policy is a one-way ratchet.
+# Registration is label-independent because a NEW job's label is attacker-chosen, so a neutral
+# name defeats any label-anchored regex, and both verbs register a persistent job (#62891).
+# `load` is the legacy spelling of `bootstrap`: same registration, so it belongs here or the
+# set is one verb wide open.
+_LAUNCHCTL_REGISTRATION_VERBS = frozenset({"submit", "bootstrap", "load"})
+# Removal is label-independent for a different reason: the guard cannot prove the session owns
+# the job it is removing, because inside this process it can hold no launchd job at all (every
+# registration verb above is refused), so the session-owned allowlist is empty by construction.
+# Before this, `launchctl bootstrap` was refused while `launchctl bootout` reached launchd: an
+# agent session removed two human-armed host detectors 59s after they were armed and could not
+# put them back (SOU-1850). `remove` is bootout's legacy sibling and `disable` is what makes an
+# unload survive a reboot, so both ride along.
+_LAUNCHCTL_REMOVAL_VERBS = frozenset({"bootout", "unload", "disable", "remove"})
 
-    Label-independent by design: a NEW job's label is attacker-chosen, so a neutral name defeats any
-    label-anchored regex. Both verbs register a persistent launchd job — never safe in the gateway.
+# Rejection text for a launchd job-set write, shared by every tool surface that runs the guard
+# (terminal + execute_code) so the remedy is the same sentence everywhere.
+LAUNCHCTL_HOST_JOB_REJECTION = (
+    "Blocked: an agent session may not remove a launchd job (bootout/unload/disable/remove), "
+    "whatever its label, because it cannot bootstrap one back — the guard refuses registration "
+    "here too. Removing a human-armed job disarms it silently: a stopped watchdog looks exactly "
+    "like a watchdog with nothing to report. Perform authorized LaunchAgent maintenance from a "
+    "shell outside the gateway."
+)
 
-    See #62891.
-    """
+
+def _contains_launchctl_verb(command: str, verbs: frozenset[str]) -> bool:
+    """Detect an *executed* ``launchctl <verb>`` for one of *verbs* — never quoted text, never a
+    mention handed to a data sink (``grep "launchctl bootout"`` reads ``grep`` as the command)."""
     for segment in _iter_command_segments(command):
         index = _executed_command_index(segment)
         if index is not None and _executable_name(segment[index]) == "launchctl":
             arguments = segment[index + 1 :]
-            if arguments and arguments[0].lower() in {"submit", "bootstrap"}:
+            if arguments and arguments[0].lower() in verbs:
                 return True
+        # Python argv lists separate the words with brackets and commas, so the token walk above
+        # reads `subprocess.run(["launchctl", "bootout", …])` as one opaque token. Flatten that
+        # punctuation and look for the program word followed by a verb, the same re-read the
+        # lifecycle token pass does for the gateway label (#68289). Only a segment that actually
+        # carries argv-list punctuation is re-read, so `grep launchctl bootout x` stays a read.
+        if any("[" in token or "," in token for token in segment):
+            words = _ARGV_LIST_PUNCTUATION.sub(" ", " ".join(segment)).split()
+            for position, word in enumerate(words[:-1]):
+                if _executable_name(word) == "launchctl" and words[position + 1].lower() in verbs:
+                    return True
     return False
+
+
+def contains_launchctl_registration_command(command: str) -> bool:
+    """Detect an executed ``launchctl submit``/``bootstrap``/``load``, not quoted text.
+
+    Label-independent by design: a NEW job's label is attacker-chosen, so a neutral name defeats any
+    label-anchored regex. All three verbs register a persistent launchd job — never safe in the gateway.
+
+    See #62891.
+    """
+    return _contains_launchctl_verb(command, _LAUNCHCTL_REGISTRATION_VERBS)
+
+
+def contains_launchctl_removal_command(command: str) -> bool:
+    """Detect an executed ``launchctl bootout``/``unload``/``disable``/``remove``, not quoted text.
+
+    Label-independent by design — see ``_LAUNCHCTL_REMOVAL_VERBS``: no label can be proven
+    session-owned here, and an unremovable-by-the-session job must stay removable by a human
+    shell only. See SOU-1850.
+    """
+    return _contains_launchctl_verb(command, _LAUNCHCTL_REMOVAL_VERBS)
+
+
+def contains_launchctl_host_job_mutation(command: str) -> bool:
+    """Registration or removal of a launchd job: the whole label-independent launchd write surface."""
+    return contains_launchctl_registration_command(command) or contains_launchctl_removal_command(command)
 
 
 def _mask_data_sink_arguments(text: str) -> str:
@@ -768,10 +831,14 @@ def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
 
 
 def _direct_lifecycle_scan(command: str) -> bool:
-    """Pure-string direct scans: lifecycle regex (data-exempted) + submit."""
+    """Pure-string direct scans: lifecycle regex (data-exempted) + label-independent launchd writes.
+
+    The launchd half is a choke point for every recursion level, so a referenced script or a
+    ``sh -c`` payload that bootstraps or boots out a job is caught exactly like a literal one.
+    """
     return (
         _lifecycle_command_scan_with_data_exemption(command)
-        or contains_launchctl_submit_command(command)
+        or contains_launchctl_host_job_mutation(command)
     )
 
 
@@ -1214,9 +1281,9 @@ def scan_gateway_lifecycle(
         try:
             return _direct_lifecycle_scan(command), None
         except Exception:
-            # If even the data-argument masker fails, fall to raw regex + submit scan: stay total.
+            # If even the data-argument masker fails, fall to raw regex + launchd write scan: stay total.
             return (contains_gateway_lifecycle_command(command)
-                    or contains_launchctl_submit_command(command)), None
+                    or contains_launchctl_host_job_mutation(command)), None
 
 
 def contains_gateway_lifecycle_command_or_referenced_script(
