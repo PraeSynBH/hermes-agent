@@ -20,6 +20,7 @@ from gateway.lifecycle_ledger import (
     detect_unclean_exit,
     get_lifecycle_sentinel_path,
     mark_exited,
+    mark_planned_stop,
     read_prior_exit_label,
     record_startup,
     sample_memory,
@@ -252,3 +253,68 @@ def test_replace_handover_is_not_a_death_and_pid_reuse_is(tmp_path: Path, monkey
     assert detect_unclean_exit(home=tmp_path) is None
     _write_sentinel(tmp_path, {**live, "start_time": 4000.0})  # born after the claim → reuser → death
     assert detect_unclean_exit(home=tmp_path) is not None
+
+
+# ---------------------------------------------------------------------------
+# Planned stops (PRA-6427)
+# ---------------------------------------------------------------------------
+# A stop requested on purpose can exit the gateway without its own teardown running: the
+# supervisor (launchd ExitTimeOut) or an impatient stopper SIGKILLs a gateway still draining
+# in-flight turns, so mark_exited never runs. The stopper records the planned exit instead,
+# and the next boot must not report that stop as an unclean death.
+
+
+def test_planned_stop_closes_the_sentinel_and_next_boot_is_clean(tmp_path: Path) -> None:
+    _write_sentinel(tmp_path, {
+        "phase": "running", "pid": _DEAD_PID, "start_time": 1000.0, "create_time": 900.0,
+        "started_at": "2026-07-11T04:30:00+00:00",
+    })
+
+    assert mark_planned_stop(_DEAD_PID, "storage_window_stop", home=tmp_path,
+                             expected_create_time=900.0) is True
+
+    sentinel = _read_sentinel(tmp_path)
+    assert sentinel["phase"] == "exited"
+    assert sentinel["exit_reason"] == "storage_window_stop"
+    assert sentinel["recorded_by"] == "planned_stop"
+    # The incarnation identity rides along, so the exit cannot vouch for another life.
+    assert (sentinel["pid"], sentinel["create_time"]) == (_DEAD_PID, 900.0)
+
+    # The whole point: the next boot reports nothing and warns about nothing.
+    assert detect_unclean_exit(home=tmp_path) is None
+    assert record_startup(home=tmp_path) is None
+    assert [r["tag"] for r in _exit_diag_records(tmp_path)] == ["gateway.planned_stop"]
+
+
+def test_planned_stop_leaves_a_sentinel_the_gateway_already_closed_alone(tmp_path: Path) -> None:
+    record_startup(home=tmp_path)  # claims running for THIS test process
+    mark_exited(0, reason="graceful_shutdown", home=tmp_path)
+
+    assert mark_planned_stop(os.getpid(), "storage_window_stop", home=tmp_path) is False
+    assert _read_sentinel(tmp_path)["exit_reason"] == "graceful_shutdown"
+
+
+def test_planned_stop_never_clobbers_a_replacement_that_claimed_the_sentinel(tmp_path: Path) -> None:
+    """A stop racing a restart: the replacement claimed ``phase=running`` for its own PID first."""
+    record_startup(home=tmp_path)
+
+    assert mark_planned_stop(_DEAD_PID, "storage_window_stop", home=tmp_path) is False
+    sentinel = _read_sentinel(tmp_path)
+    assert (sentinel["phase"], sentinel["pid"]) == ("running", os.getpid())
+
+
+def test_planned_stop_refuses_a_recycled_pid(tmp_path: Path) -> None:
+    """The stopper's create_time is another incarnation's: a recycled PID's stop proves nothing."""
+    _write_sentinel(tmp_path, {
+        "phase": "running", "pid": _DEAD_PID, "start_time": 1000.0, "create_time": 900.0,
+    })
+
+    assert mark_planned_stop(_DEAD_PID, "storage_window_stop", home=tmp_path,
+                             expected_create_time=5000.0) is False
+    assert _read_sentinel(tmp_path)["phase"] == "running"
+
+
+def test_planned_stop_without_a_sentinel_is_a_noop(tmp_path: Path) -> None:
+    assert mark_planned_stop(_DEAD_PID, "storage_window_stop", home=tmp_path) is False
+    assert mark_planned_stop(None, "storage_window_stop", home=tmp_path) is False
+    assert not get_lifecycle_sentinel_path(tmp_path).exists()

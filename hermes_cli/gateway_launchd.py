@@ -738,8 +738,33 @@ def _launchd_ok(message: str) -> None:
     _gw()._clear_launchd_unsupported_marker()
 
 
+_STOP_FORCE_GRACE_FLOOR_S = 5.0
+_STOP_WAIT_MARGIN_S = 10.0
+
+
+def _stop_force_grace_s() -> float:
+    """Seconds ``hermes gateway stop`` lets a launchd-supervised gateway finish its teardown.
+
+    The gateway sizes its signal-driven drain to launchd's live ``ExitTimeOut``
+    (``gateway.restart.resolve_launchd_capped_drain``), so a stopper that SIGKILLs earlier
+    than that budget kills in-flight turns mid-teardown and skips the gateway's own
+    ``mark_exited`` — the next boot then reports a stop someone requested as an UNCLEAN death
+    (PRA-6427).  Fail-open to the historical 5s when no live budget can be read (not
+    launchd-owned, ``launchctl print`` unavailable).
+    """
+    try:
+        from gateway.restart import read_launchd_exit_timeout_s
+
+        budget = read_launchd_exit_timeout_s(get_launchd_label())
+        return max(_STOP_FORCE_GRACE_FLOOR_S, float(budget)) if budget else _STOP_FORCE_GRACE_FLOOR_S
+    except (ImportError, OSError, TypeError, ValueError):
+        return _STOP_FORCE_GRACE_FLOOR_S
+
+
 def launchd_stop():
     target = f"{_launchd_domain()}/{get_launchd_label()}"
+    # Read the drain budget BEFORE bootout unloads the job definition it lives in.
+    grace = _stop_force_grace_s()
     _gw()._mark_planned_stop()
     # bootout unloads the definition so KeepAlive doesn't respawn; `hermes gateway start` re-bootstraps.
     try:
@@ -752,7 +777,7 @@ def launchd_stop():
         # below.
         if not (_launchd_error_indicates_unloaded(e) or _launchctl_domain_unsupported(e.returncode)):
             raise
-    _gw()._wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+    _gw()._wait_for_gateway_exit(timeout=grace + _STOP_WAIT_MARGIN_S, force_after=grace)
     print("✓ Service stopped")
 
 
