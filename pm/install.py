@@ -64,6 +64,34 @@ def _facts() -> Facts:
     return Facts(paths.facts_path())
 
 
+_LOCATION_CACHE_LOCK = threading.Lock()
+_LOCATION_CACHE: dict[tuple, tuple[Facts, Store, Path | None]] = {}
+_STORE_DIRS_CACHE: dict[tuple, list[str]] = {}
+
+
+def _store_stamp() -> tuple:
+    """Change key over the store's mutable indexes: the store root, facts.json, the lockfile.
+
+    A reinstall rewrites facts.json (and a re-pin rewrites the lockfile, and an entry appearing
+    or vanishing touches the store root), so any of those mtimes gives a new key; nothing else
+    can change where a package's entry lives.
+    """
+    def _mtime(path: Path):
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return None
+    root = paths.store_root()
+    return str(root), _mtime(root), _mtime(paths.facts_path()), _mtime(paths.lockfile_path())
+
+
+def clear_location_cache() -> None:
+    """Drop the resolved-location caches (a caller that changed the store in-process)."""
+    with _LOCATION_CACHE_LOCK:
+        _LOCATION_CACHE.clear()
+        _STORE_DIRS_CACHE.clear()
+
+
 def _store() -> Store:
     return Store(paths.store_root())
 
@@ -84,7 +112,40 @@ def _heal_exec_bit(binary: Path) -> bool:
 def _installed_location(package: Package, lockfile: Lockfile, target: str, *,
                         verify: bool = False, allow_outdated: bool = False,
                         roots: tuple[Path, ...] | None = None):
-    """Prefer the current pin. An explicit read may retain a prior PM install."""
+    """Prefer the current pin. An explicit read may retain a prior PM install.
+
+    Callers that only need "where is it, if installed at all" (``env_for``,
+    ``_store_path_dirs``, the terminal PATH builder) resolve on EVERY terminal spawn, and
+    resolving means asking the package for its binary — ``Chromium.binary`` walks the whole
+    browser bundle (``entry.rglob``, ~125 ms measured) and ``Facts`` re-reads facts.json.
+    Stamping that work once per store state instead of once per spawn is what keeps a
+    multiplexed gateway's single interpreter from spending the GIL on directory walks while
+    its event loop waits; the stamp below is the whole freshness contract.
+    """
+    if verify or allow_outdated or roots is not None:
+        resolved = _search_installed_location(
+            package, lockfile, target, verify=verify, allow_outdated=allow_outdated, roots=roots)
+        return resolved[:2] if resolved is not None else None
+    key = (package.name, target, *_store_stamp())
+    with _LOCATION_CACHE_LOCK:
+        cached = _LOCATION_CACHE.get(key)
+    if cached is not None:
+        facts, store, binary = cached
+        # A cached entry can lose its exec bit (staging before stage() set it, a copy, a bad
+        # unpack). The heal is one access() syscall, so it still runs on every resolution.
+        if binary is None or target != current_target() or _heal_exec_bit(binary):
+            return facts, store
+    resolved = _search_installed_location(package, lockfile, target)
+    if resolved is not None:
+        with _LOCATION_CACHE_LOCK:
+            _LOCATION_CACHE[key] = resolved
+        return resolved[:2]
+    return None
+
+
+def _search_installed_location(package: Package, lockfile: Lockfile, target: str, *,
+                               verify: bool = False, allow_outdated: bool = False,
+                               roots: tuple[Path, ...] | None = None):
     search_roots = dict.fromkeys(roots if roots is not None else (paths.store_root(), paths.writable_store_root()))
     fallback = None
     for root in search_roots:
@@ -102,10 +163,10 @@ def _installed_location(package: Package, lockfile: Lockfile, target: str, *,
             continue
         if facts.installed(package.name, lockfile.version(package.name), store.root,
                            _identity(lockfile, package.name, target)):
-            return facts, store
+            return facts, store, binary
         if (allow_outdated and fact.get("target") == target
                 and fact.get("artifacts") and fact.get("digest")):
-            fallback = facts, store
+            fallback = facts, store, binary
     return fallback
 
 
@@ -929,42 +990,57 @@ def _store_path_dirs() -> list[str]:
     *installed* (facts say so) — an installed git/gh must be on PATH even
     though it's not in the root closure. A package whose dependency chain is
     not fully installed contributes nothing: store npm over a missing store
-    node would run the user's node, a partial toolchain. Never installs."""
+    node would run the user's node, a partial toolchain. Never installs.
 
-    lockfile = _lockfile()
-    target = current_target()
-    locations: dict[str, object] = {}
+    Memoized on the store stamp: the terminal PATH builder calls this on every spawn and the
+    answer cannot change while facts.json and the lockfile are untouched.
+    """
 
-    def located(package):
-        if package.name not in locations:
-            locations[package.name] = _installed_location(package, lockfile, target)
-        return locations[package.name]
+    def compute() -> list[str]:
+        lockfile = _lockfile()
+        target = current_target()
+        locations: dict[str, object] = {}
 
-    dirs: list[str] = []
-    for name in _dependents_first(lockfile.names()):
-        try:
-            package = get_package(name)
-            chain = walk([name])
-        except KeyError:
-            continue
-        if package.internal:
-            continue
-        if not getattr(package, "on_path", True):
-            continue
-        if package.missing_reason(target) is not None:
-            continue
-        location = located(package)
-        if location is None or any(located(dep) is None for dep in chain
-                                   if dep.missing_reason(target) is None):
-            continue
-        facts, store = location
-        env = facts.env_for(name, store.root)
-        path_dirs = env.get("PATH") or []
-        if isinstance(path_dirs, str):
-            path_dirs = [path_dirs]
-        for directory in path_dirs:
-            if directory and native(directory) not in dirs:
-                dirs.append(native(directory))
+        def located(package):
+            if package.name not in locations:
+                locations[package.name] = _installed_location(package, lockfile, target)
+            return locations[package.name]
+
+        dirs: list[str] = []
+        for name in _dependents_first(lockfile.names()):
+            try:
+                package = get_package(name)
+                chain = walk([name])
+            except KeyError:
+                continue
+            if package.internal:
+                continue
+            if not getattr(package, "on_path", True):
+                continue
+            if package.missing_reason(target) is not None:
+                continue
+            location = located(package)
+            if location is None or any(located(dep) is None for dep in chain
+                                       if dep.missing_reason(target) is None):
+                continue
+            facts, store = location
+            env = facts.env_for(name, store.root)
+            path_dirs = env.get("PATH") or []
+            if isinstance(path_dirs, str):
+                path_dirs = [path_dirs]
+            for directory in path_dirs:
+                if directory and native(directory) not in dirs:
+                    dirs.append(native(directory))
+        return dirs
+
+    key = (current_target(), *_store_stamp())
+    with _LOCATION_CACHE_LOCK:
+        cached = _STORE_DIRS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    dirs = compute()
+    with _LOCATION_CACHE_LOCK:
+        _STORE_DIRS_CACHE[key] = dirs
     return dirs
 
 
