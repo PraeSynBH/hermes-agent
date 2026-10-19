@@ -1474,7 +1474,7 @@ def terminal_tool(
         # guard that never rendered a verdict fails CLOSED: these checks apply
         # unconditionally (``force`` cannot bypass them), so the command is
         # refused with a retryable error instead of running unguarded.
-        from agent.deadline import run_bounded_sync
+        from agent.deadline import BoundedWorkersExhausted, run_bounded_sync
         from tools.interrupt import acting_for_tid
 
         # The guard chain runs on the deadline worker; keep it answerable to /stop
@@ -1489,6 +1489,14 @@ def terminal_tool(
                 guard_timeout,
                 label="terminal.pre-exec-guard",
             )
+        except BoundedWorkersExhausted:
+            # The guard never started: the deadline pool is full of abandoned workers. Refuse
+            # the command retryably rather than leaking one more thread into a wedged host.
+            raise _Rejected(_error_json(
+                "Terminal pre-execution guard could not start: bounded worker pool exhausted; "
+                "the command was not run. Retry the call.",
+                status="error",
+            ))
         finally:
             acting_for_tid.reset(_acting_token)
         if bounded_guard.timed_out:

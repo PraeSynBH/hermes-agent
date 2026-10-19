@@ -598,52 +598,99 @@ def _set_worker_activity_callback(agent) -> None:
 _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S = 30.0
 
 
-def _run_tool_activity_heartbeat(
-    agent,
-    stop_event: threading.Event,
-    label: str,
-    interval: float = _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S,
-    worker_tid: int | None = None,
-) -> None:
-    """Daemon thread stamping ``agent._touch_activity`` every ``interval`` seconds until
-    ``stop_event`` is set, so the gateway inactivity watchdog never abandons a turn whose
-    tool runs silently. Wedged tools stay bounded by the tool layer's own timeouts and by the
-    executor deadline — but a worker the executor gave up on never reaches its ``stop_event``,
-    so the heartbeat also exits once ``worker_tid`` carries the interrupt bit the abandoning
-    executor raises (``_interrupt_worker_tids``). Otherwise a tool wedged in a kernel probe
-    keeps reporting "activity" for the rest of the run and the inactivity watchdog, the second
-    line of defense, can never fire (#111922)."""
-    from tools.interrupt import is_thread_interrupted
+_HEARTBEAT_THREAD_NAME = "tool-activity-heartbeat"
+_HEARTBEAT_IDLE_EXIT_S = 30.0
 
-    try:
-        while not stop_event.wait(interval):
+
+class _ActivityHeartbeatScheduler:
+    """One process-wide heartbeat thread standing in for every in-flight tool call.
+
+    The old shape started a daemon thread per call and ``join(timeout=2.0)``d it; a
+    ``_touch_activity`` blocked longer than that became an orphan (50 ``tool-activity-hb-*``
+    threads were alive in one 6 h gateway pid, all still competing for the GIL). Waiters now
+    register ``(agent, label, worker_tid)`` and this single thread stamps them all, so a
+    blocked activity callback can wedge at most one thread instead of adding one per call.
+    A waiter whose worker tid carries the interrupt bit is skipped — the executor abandoned
+    that worker, and a heartbeat must not keep faking its liveness (#111922).
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition(threading.Lock())
+        self._waiters: dict[int, tuple] = {}
+        self._next_token = 0
+        self._thread: threading.Thread | None = None
+
+    def register(self, agent, label: str, worker_tid: int | None) -> int:
+        with self._cond:
+            self._next_token += 1
+            token = self._next_token
+            self._waiters[token] = (agent, label, worker_tid)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._loop, name=_HEARTBEAT_THREAD_NAME, daemon=True)
+                self._thread.start()
+            self._cond.notify_all()
+            return token
+
+    def unregister(self, token: int) -> None:
+        with self._cond:
+            self._waiters.pop(token, None)
+            self._cond.notify_all()
+
+    @staticmethod
+    def _stamp(waiters: list[tuple[int, tuple]]) -> list[int]:
+        """Stamp every live waiter; return the tokens whose worker is abandoned.
+
+        An abandoned worker never reaches its ``finally``, so its owner cannot unregister:
+        the scheduler drops it here, or the registry would keep a reference forever.
+        """
+        from tools.interrupt import is_thread_interrupted
+
+        abandoned = []
+        for token, (agent, label, worker_tid) in waiters:
             if is_thread_interrupted(worker_tid):
-                return
-            agent._touch_activity(label)
-    except Exception:
-        pass  # a heartbeat must never break the agent loop
+                abandoned.append(token)
+                continue
+            try:
+                agent._touch_activity(label)
+            except Exception:
+                pass  # a heartbeat must never break the agent loop
+        return abandoned
+
+    def _loop(self) -> None:
+        while True:
+            with self._cond:
+                if not self._waiters:
+                    if not self._cond.wait(_HEARTBEAT_IDLE_EXIT_S):
+                        self._thread = None
+                        return
+                    continue
+                # Read the module global each tick so a test (or config change) retunes the cadence.
+                self._cond.wait(_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S)
+                waiters = list(self._waiters.items())
+            abandoned = self._stamp(waiters)
+            if abandoned:
+                with self._cond:
+                    for token in abandoned:
+                        self._waiters.pop(token, None)
+
+
+_heartbeat_scheduler = _ActivityHeartbeatScheduler()
 
 
 def _run_with_activity_heartbeat(agent, function_name: str, fn):
-    """Run ``fn()`` under the activity heartbeat; covers both executor paths."""
-    stop = threading.Event()
-    thread = threading.Thread(
-        # Keep the gateway turn-inactivity watchdog from abandoning a turn whose tool call runs silently for
-        # longer than the inactivity timeout (#84491): stamp activity periodically while the tool is in
-        # flight, not just at start/completion. Both the sequential and the concurrent paths funnel through
-        # here, so a single heartbeat covers every tool.
-        target=_run_tool_activity_heartbeat,
-        args=(agent, stop, f"tool running: {function_name}"),
-        kwargs={"interval": _TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S, "worker_tid": threading.current_thread().ident},
-        daemon=True,
-        name=f"tool-activity-hb-{function_name[:24]}",
-    )
-    thread.start()
+    """Run ``fn()`` with this call registered on the shared activity heartbeat.
+
+    Both the sequential and the concurrent executor paths funnel through here, so the single
+    scheduler thread covers every tool: keep the gateway turn-inactivity watchdog from
+    abandoning a turn whose tool call runs silently longer than the inactivity timeout (#84491).
+    """
+    token = _heartbeat_scheduler.register(
+        agent, f"tool running: {function_name}", threading.current_thread().ident)
     try:
         return fn()
     finally:
-        stop.set()
-        thread.join(timeout=2.0)
+        _heartbeat_scheduler.unregister(token)
 
 
 _PRUNED_TOOL_ARGUMENTS_ERROR = "suspected_pruned_tool_arguments"

@@ -104,13 +104,15 @@ def _slow_execute(delay: float = 0.25):
     return _execute
 
 
-def test_heartbeat_touches_periodically_and_stops():
-    """The heartbeat thread touches activity on cadence, then exits on stop."""
+def test_heartbeat_touches_periodically_and_stops(monkeypatch):
+    """A registered call is stamped on cadence, and registering stops when the call returns."""
     import agent.tool_executor as te
 
+    monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.05)
+
     touches: list = []
-    stop = threading.Event()
     repeated = threading.Event()
+    release = threading.Event()
 
     class _Agent:
         def _touch_activity(self, desc):
@@ -119,19 +121,18 @@ def test_heartbeat_touches_periodically_and_stops():
                 repeated.set()
 
     thread = threading.Thread(
-        target=te._run_tool_activity_heartbeat,
-        args=(_Agent(), stop, "tool running: terminal"),
-        kwargs={"interval": 0.05},
+        target=te._run_with_activity_heartbeat,
+        args=(_Agent(), "terminal", lambda: release.wait(10)),
         daemon=True,
     )
     thread.start()
     try:
         assert repeated.wait(5), "heartbeat did not repeat"
     finally:
-        stop.set()
+        release.set()
         thread.join(timeout=5)
 
-    assert not thread.is_alive(), "heartbeat thread did not exit on stop"
+    assert not thread.is_alive(), "tool call did not return"
     assert len(touches) >= 2, f"expected periodic touches, got {len(touches)}"
     assert all(touch == "tool running: terminal" for touch in touches)
 
@@ -273,44 +274,80 @@ def test_concurrent_tool_call_heartbeat(monkeypatch):
     assert len(touches) >= 3, f"expected mid-call heartbeats, got {len(touches)}"
 
 
-def test_heartbeat_exits_once_worker_tid_is_interrupted():
-    """The heartbeat must not outlive the worker it speaks for (#111922).
+def test_heartbeat_skips_and_drops_an_abandoned_worker():
+    """The heartbeat must not speak for a worker the executor abandoned (#111922).
 
-    The executor abandons a wedged worker by raising its interrupt bit
-    (``_interrupt_worker_tids``); that worker never reaches ``stop_event.set()``,
-    so the heartbeat has to stop on the bit itself, or the abandoned tool keeps
-    the inactivity watchdog pinned for the rest of the run.
+    ``_interrupt_worker_tids`` raises the interrupt bit on a wedged worker; that worker never
+    reaches its ``finally``, so it cannot unregister. The scheduler must both stop stamping it
+    and drop the registration, or the abandoned tool keeps the inactivity watchdog pinned (and
+    its agent reference) for the rest of the run.
     """
     import agent.tool_executor as te
     from tools.interrupt import set_interrupt
 
-    touches: list = []
-    stop = threading.Event()
-    fake_worker_tid = 10**9 + 111922  # not a live thread; only the bit matters
+    scheduler = te._heartbeat_scheduler
+    live_touches: list = []
+    fake_abandoned_tid = 10**9 + 111922  # not a live thread; only the bit matters
+
+    class _LiveAgent:
+        def _touch_activity(self, desc):
+            live_touches.append(desc)
+
+    class _AbandonedAgent:
+        def _touch_activity(self, desc):  # pragma: no cover - must never fire
+            raise AssertionError("stamped an abandoned worker")
+
+    set_interrupt(True, fake_abandoned_tid)
+    live_token = scheduler.register(_LiveAgent(), "tool running: terminal", threading.get_ident())
+    dead_token = scheduler.register(_AbandonedAgent(), "tool running: terminal", fake_abandoned_tid)
+    try:
+        abandoned = scheduler._stamp(list(scheduler._waiters.items()))
+        assert abandoned == [dead_token], "abandoned waiter was not identified"
+        assert live_touches == ["tool running: terminal"]
+    finally:
+        scheduler.unregister(live_token)
+        scheduler.unregister(dead_token)
+        set_interrupt(False, fake_abandoned_tid)
+
+
+def test_sequential_calls_never_accumulate_heartbeat_threads(monkeypatch):
+    """N sequential tool calls share one heartbeat thread, even when it wedges.
+
+    The old shape started a daemon thread *per call* and ``join(timeout=2.0)``d it, so an
+    activity callback blocked past two seconds left the thread behind. Measured on the live
+    gateway: 50 ``tool-activity-hb-*`` threads in one pid, all still runnable Python competing
+    for the GIL. Sequential calls must never add a thread each.
+    """
+    import agent.tool_executor as te
+
+    monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.02)
+
+    stamped = threading.Event()
+    wedge = threading.Event()
+    unwedged = threading.Event()
 
     class _Agent:
         def _touch_activity(self, desc):
-            touches.append(desc)
+            stamped.set()
+            wedge.wait(10)  # longer than the old per-call join(2.0): the old thread is orphaned
+            unwedged.set()
 
-    thread = threading.Thread(
-        target=te._run_tool_activity_heartbeat,
-        args=(_Agent(), stop, "tool running: terminal"),
-        kwargs={"interval": 0.05, "worker_tid": fake_worker_tid},
-        daemon=True,
-    )
-    thread.start()
+    def _call():
+        # Wait for the heartbeat to have stamped (and wedged) so each call exercises the leak.
+        assert stamped.wait(5), "shared heartbeat never stamped"
+        return "ok"
+
     try:
-        time.sleep(0.12)
-        assert touches, "heartbeat never stamped while the worker was live"
-        set_interrupt(True, fake_worker_tid)
-        thread.join(timeout=1.0)
-        assert not thread.is_alive(), "heartbeat kept running after its worker was abandoned"
-        n = len(touches)
-        time.sleep(0.12)
-        assert len(touches) == n
+        for _ in range(3):
+            assert te._run_with_activity_heartbeat(_Agent(), "terminal", _call) == "ok"
+        heartbeat_threads = [
+            t for t in threading.enumerate() if t.name.startswith("tool-activity")
+        ]
+        assert len(heartbeat_threads) <= 1, (
+            f"sequential tool calls accumulated {len(heartbeat_threads)} heartbeat threads")
     finally:
-        set_interrupt(False, fake_worker_tid)
-        stop.set()
+        wedge.set()
+        assert unwedged.wait(5), "heartbeat thread stayed wedged after release"
 
 
 def test_sequential_timeout_stops_abandoned_workers_heartbeat(monkeypatch):

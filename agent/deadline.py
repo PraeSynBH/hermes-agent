@@ -4,7 +4,7 @@
 * :func:`clamp_timeout` — huge timeouts overflow ``time_t`` in ``Lock.acquire`` /
   ``Thread.join`` on macOS (#83220), so every timeout is capped.
 * :func:`run_bounded_async` / :func:`run_bounded_sync` — wall-clock deadlines driven by
-  a daemon ``threading.Timer`` / worker thread, so a blocked event loop cannot disable them.
+  a daemon ``threading.Timer`` / pooled worker, so a blocked event loop cannot disable them.
 * :func:`kill_process_tree` — portable whole-tree termination.
 
 Invariants: operation exceptions propagate unchanged (only the *timeout* outcome is reified
@@ -24,20 +24,23 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional, Protocol
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "MAX_SAFE_TIMEOUT_S",
+    "MAX_ABANDONED_WORKERS",
     "BoundedResult",
+    "BoundedWorkersExhausted",
     "DeadlineExpired",
     "clamp_timeout",
     "kill_process_tree",
     "resolve_timeout",
     "run_bounded_async",
     "run_bounded_sync",
+    "sync_worker_census",
 ]
 
 # Upper bound for any timeout handed to platform wait primitives.
@@ -299,6 +302,151 @@ async def run_bounded_async(
 
 
 # --- Bounded execution — sync flavor -------------------------------------------
+#
+# A thread cannot be killed: a ``fn`` that never returns keeps its worker alive forever.
+# One thread per call made every expiry a permanent leak — the shared gateway logged 4,723
+# ``worker abandoned`` lines (554 inside one 5 h pid, plus 90 live ``deadline-*`` threads)
+# and each leaked worker kept taking the GIL, starving the event loop. Workers are pooled
+# and reused instead, and the *abandoned* population is capped: at the cap a new timed call
+# fails closed with a retryable :class:`BoundedWorkersExhausted` rather than leaking one more
+# thread. A wedged worker that finally returns drops the abandoned count and rejoins the pool.
+
+# Concurrent expired calls allowed to still be running. Above this the host is already
+# wedged; refusing the new call (which the caller may retry) beats another stripped thread.
+MAX_ABANDONED_WORKERS = 8
+# An idle pool thread retires after this long, so a burst does not pin a pool full of them.
+_WORKER_IDLE_EXIT_S = 15.0
+
+
+class BoundedWorkersExhausted(TimeoutError):
+    """A bounded sync call was refused: ``MAX_ABANDONED_WORKERS`` abandoned workers are still
+    wedged. Retryable — capacity returns when one of them finishes."""
+
+    def __init__(self, label: str, abandoned: int):
+        super().__init__(
+            f"bounded worker pool exhausted: {abandoned} abandoned worker(s) still running; "
+            f"{label!r} was not started"
+        )
+        self.label = label
+        self.abandoned = abandoned
+
+
+@dataclass
+class _SyncJob:
+    """One ``run_bounded_sync`` unit: the callable, its context, its outcome box."""
+
+    fn: Callable[[], Any]
+    ctx: contextvars.Context
+    box: dict[str, Any] = field(default_factory=dict)
+    done: threading.Event = field(default_factory=threading.Event)
+    finished: bool = False
+    abandoned: bool = False
+
+
+class _DeadlineWorker(threading.Thread):
+    """Pool thread: takes one job at a time, waits up to ``_WORKER_IDLE_EXIT_S`` when idle."""
+
+    def __init__(self, pool: "_SyncWorkerPool"):
+        super().__init__(name="deadline-worker", daemon=True)
+        self._pool = pool
+        self._cond = threading.Condition(pool._lock)
+        self._job: Optional[_SyncJob] = None
+
+    def _next_job(self) -> Optional[_SyncJob]:
+        """Block under the pool lock until a job arrives or the idle TTL expires."""
+        with self._pool._lock:
+            while self._job is None:
+                if not self._cond.wait(_WORKER_IDLE_EXIT_S):
+                    self._pool._retire(self)
+                    return None
+            job, self._job = self._job, None
+            return job
+
+    def run(self) -> None:
+        while True:
+            job = self._next_job()
+            if job is None:
+                return
+            try:
+                job.box["value"] = job.ctx.run(job.fn)
+            except BaseException as exc:  # re-raised in caller; must not vanish
+                job.box["exc"] = exc
+            finally:
+                self._pool._finish(self, job)
+
+
+class _SyncWorkerPool:
+    """Reusable bounded-sync workers with a cap on abandoned (still-running) jobs."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._idle: list[_DeadlineWorker] = []
+        self._threads = 0
+        self._abandoned = 0
+        self._pid = os.getpid()
+
+    def _bind_pid(self) -> None:
+        """A forked child does not own the parent's worker threads: start from empty. (Lock held.)"""
+        pid = os.getpid()
+        if pid != self._pid:
+            self._idle = []
+            self._threads = 0
+            self._abandoned = 0
+            self._pid = pid
+
+    def submit(self, job: _SyncJob, *, label: str) -> None:
+        with self._lock:
+            self._bind_pid()
+            if self._abandoned >= MAX_ABANDONED_WORKERS:
+                raise BoundedWorkersExhausted(label, self._abandoned)
+            worker = self._idle.pop() if self._idle else None
+            if worker is None:
+                worker = _DeadlineWorker(self)
+                self._threads += 1
+                worker.start()
+            worker._job = job
+            worker._cond.notify()
+
+    def claim_expiry(self, job: _SyncJob) -> bool:
+        """True when the caller owns the timeout outcome (and has counted the abandonment)."""
+        with self._lock:
+            if job.finished:
+                return False
+            job.abandoned = True
+            self._abandoned += 1
+            return True
+
+    def _finish(self, worker: _DeadlineWorker, job: _SyncJob) -> None:
+        with self._lock:
+            job.finished = True
+            if job.abandoned:
+                if self._abandoned > 0:
+                    self._abandoned -= 1
+                job.abandoned = False
+            job.done.set()
+            self._idle.append(worker)
+
+    def _retire(self, worker: _DeadlineWorker) -> None:
+        """Idle TTL expired: drop the thread from the pool's accounting. (Pool lock held.)"""
+        with self._lock:
+            if worker in self._idle:
+                self._idle.remove(worker)
+            if self._threads > 0:
+                self._threads -= 1
+
+    def census(self) -> dict[str, int]:
+        with self._lock:
+            self._bind_pid()
+            return {"threads": self._threads, "idle": len(self._idle), "abandoned": self._abandoned,
+                    "cap": MAX_ABANDONED_WORKERS}
+
+
+_SYNC_POOL = _SyncWorkerPool()
+
+
+def sync_worker_census() -> dict[str, int]:
+    """Live pool counters (``threads``/``idle``/``abandoned``/``cap``) for diagnostics and tests."""
+    return _SYNC_POOL.census()
 
 
 def run_bounded_sync(
@@ -309,10 +457,12 @@ def run_bounded_sync(
     on_timeout: Optional[Callable[[], None]] = None,
     backend: object | None = None,
 ) -> BoundedResult:
-    """Run ``fn`` in a daemon worker thread under a wall-clock deadline; exceptions re-raise in
-    the caller. On expiry the worker is **abandoned** (every timeout leaks one daemon thread, so
-    do NOT use per-item in hot loops) and ``on_timeout`` runs best-effort in the caller's thread.
-    The worker runs under ``contextvars.copy_context()`` so secret scope / session id survive.
+    """Run ``fn`` on a pooled daemon worker under a wall-clock deadline; exceptions re-raise in
+    the caller. On expiry the call is **abandoned** — its worker keeps running but the abandoned
+    population is capped at :data:`MAX_ABANDONED_WORKERS`; at the cap this raises
+    :class:`BoundedWorkersExhausted` (retryable) instead of leaking a thread. ``on_timeout`` runs
+    best-effort in the caller's thread. The worker runs under ``contextvars.copy_context()`` so
+    secret scope / session id survive.
 
     See #94285.
     """
@@ -321,27 +471,16 @@ def run_bounded_sync(
     if timeout_s is None:
         return _result(start, None, label, value=fn())
 
-    box: dict[str, Any] = {}
-    done = threading.Event()
-    ctx = contextvars.copy_context()
-
-    def _worker() -> None:
-        try:
-            box["value"] = ctx.run(fn)
-        except BaseException as exc:  # re-raised in caller; must not vanish
-            box["exc"] = exc
-        finally:
-            done.set()
-
-    threading.Thread(target=_worker, name=f"deadline-{label}", daemon=True).start()
+    job = _SyncJob(fn=fn, ctx=contextvars.copy_context())
+    _SYNC_POOL.submit(job, label=label)
     deadline = start + timeout_s
-    while not done.is_set():
+    while not job.done.is_set():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        done.wait(min(_BOUNDED_SYNC_WAIT_SLICE_S, remaining))
+        job.done.wait(min(_BOUNDED_SYNC_WAIT_SLICE_S, remaining))
 
-    if not done.is_set():
+    if _SYNC_POOL.claim_expiry(job):
         logger.warning("[deadline] %r timed out after %.1fs; worker abandoned", label, timeout_s)
         # Mark suspect BEFORE owner cleanup so a recycle in on_timeout never
         # inherits a stale flag on the healed replacement.
@@ -353,9 +492,9 @@ def run_bounded_sync(
                 logger.debug("deadline on_timeout callback failed", exc_info=True)
         return _result(start, timeout_s, label, timed_out=True)
 
-    if "exc" in box:
-        raise box["exc"]
-    return _result(start, timeout_s, label, value=box.get("value"))
+    if "exc" in job.box:
+        raise job.box["exc"]
+    return _result(start, timeout_s, label, value=job.box.get("value"))
 
 
 # --- Whole-tree process termination --------------------------------------------

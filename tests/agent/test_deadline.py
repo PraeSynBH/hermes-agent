@@ -250,6 +250,43 @@ class TestRunBoundedSync:
         assert holder.get("exc") == "KeyboardInterrupt"
 
 
+    def test_abandoned_workers_are_capped_and_new_calls_are_refused(self, monkeypatch):
+        """A timed-out call may not grow the abandoned population past the cap.
+
+        One thread per call made every expiry a permanent leak (4,723 ``worker abandoned``
+        lines, ~90 live ``deadline-*`` threads in one gateway pid). Past the cap a *new* call
+        must be refused with a retryable error instead of leaking another thread, and the
+        population must drain when the wedged calls finally return.
+        """
+        import agent.deadline as dl
+        from tests.waiting import wait_until
+
+        monkeypatch.setattr(dl, "MAX_ABANDONED_WORKERS", 2)
+        release = threading.Event()
+
+        def _wedged():
+            release.wait(30)
+            return "late"
+
+        # Earlier tests in this file abandon their own workers; start from a drained pool.
+        wait_until(lambda: dl.sync_worker_census()["abandoned"] == 0, timeout=10)
+        try:
+            for index in range(2):
+                assert dl.run_bounded_sync(_wedged, 0.1, label=f"wedged-{index}").timed_out
+            assert dl.sync_worker_census()["abandoned"] == 2
+            before = dl.sync_worker_census()
+            with pytest.raises(dl.BoundedWorkersExhausted) as refused:
+                dl.run_bounded_sync(lambda: "started", 0.1, label="refused")
+            assert refused.value.abandoned == 2
+            assert refused.value.label == "refused"
+            # The refused call never reached a worker, so it spawned no thread.
+            assert dl.sync_worker_census()["threads"] == before["threads"]
+        finally:
+            release.set()
+
+        wait_until(lambda: dl.sync_worker_census()["abandoned"] == 0, timeout=10)
+        assert dl.run_bounded_sync(lambda: "ok", 5.0, label="after").value == "ok"
+
     def test_worker_inherits_caller_contextvars(self):
         """Profile secret scope / session id must survive the thread hop."""
         import contextvars
