@@ -152,19 +152,31 @@ class GatewayAdmissionTimeout(GatewayClientError):
         super().__init__(f"{self.reason}: {detail} (budget={budget:g}s{owner})")
 
 
+class _AdmissionBudget(float):
+    """A wait bounded by the run's ONE admission budget — and knows it.
+
+    The marker is what makes the classification exact. Admission verbs are ordinary RPCs issued
+    after ``connect_gateway`` has already handed the connection to the caller, so "did this fail
+    before the handover?" cannot tell an admission stall from a mid-run one: a ``prompt.receipt``
+    read 200 s into a healthy session also times out, and it must stay a retryable connection
+    error. Only a wait that was itself derived from the admission budget is starvation.
+    """
+
+
 def admission_timeout(client, cap: float) -> float:
     """``cap`` seconds, or what is left of this run's ONE admission budget when that is less.
 
     The admission verbs (``runtime.describe`` -> ``session.create``/``session.resume``) share one
     deadline, so a phase that ran long shortens the next instead of queueing a fresh cap behind it.
-    A spent budget returns 0: the RPC times out at once and ``connect_gateway`` turns that
-    ``TimeoutError`` into a ``GatewayAdmissionTimeout`` naming the phase and the owner build.
+    A spent budget returns 0: the RPC times out at once and ``GatewayClient.rpc`` turns that
+    ``TimeoutError`` into a ``GatewayAdmissionTimeout`` naming the owner build (the value carries
+    ``_AdmissionBudget`` so only admission-bounded waits are classified that way).
 
     The deadline rides on the connection ``connect_gateway`` yields; a peer without one (a test
     double, an embedded server) has no budget to share, and there ``cap`` is the whole story.
     """
     deadline = getattr(client, "admission_deadline", None)
-    return cap if deadline is None else max(0.0, min(cap, deadline - time.monotonic()))
+    return cap if deadline is None else _AdmissionBudget(max(0.0, min(cap, deadline - time.monotonic())))
 
 
 def _bounded_reason(value):
@@ -250,7 +262,8 @@ def put_behind(events, item):
 
 
 class GatewayClient:
-    def __init__(self, websocket, *, admission_deadline=None):
+    def __init__(self, websocket, *, admission_deadline=None, admission_started=None,
+                 admission_budget=None, code_sha=None):
         self.websocket = websocket
         self.events = EventQueue(maxsize=4096)
         self.pending = {}
@@ -259,6 +272,11 @@ class GatewayClient:
         # ``time.monotonic()`` at which the ONE admission budget expires (``connect_gateway`` sets
         # it); absent on a hand-built peer, which ``admission_timeout`` treats as "no budget".
         self.admission_deadline = admission_deadline
+        # Enough of the admission's own frame to file an overrun as ``GatewayAdmissionTimeout``:
+        # when it started, how long it was, and the build of the owner that held it.
+        self.admission_started = admission_started
+        self.admission_budget = admission_budget
+        self.code_sha = code_sha
 
     def _read_on(self):
         """Keep reading past a full queue: nothing is held, or an awaited answer may sit behind the
@@ -329,6 +347,20 @@ class GatewayClient:
             await self.websocket.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
             budget = DEFAULT_RPC_TIMEOUT if _timeout is None else _timeout
             return await asyncio.wait_for(future, None if budget == float("inf") else budget)
+        except TimeoutError as exc:
+            # Only a wait this run bounded with its admission budget is starvation. A mid-run RPC
+            # that times out against its own (default) cap — ``prompt.receipt`` 200 s into a healthy
+            # session, say — must stay a retryable connection error; filing it under the give-up
+            # code would tell the retry chain to abandon a run that only needs to be retried.
+            if not isinstance(_timeout, _AdmissionBudget):
+                raise
+            started = self.admission_started if self.admission_started is not None else time.monotonic()
+            raise GatewayAdmissionTimeout(
+                f"Gateway connection failed; no local fallback (phase=session, "
+                f"elapsed={time.monotonic() - started:.1f}s, TimeoutError: {exc})",
+                phase="session", elapsed=time.monotonic() - started,
+                budget=self.admission_budget if self.admission_budget is not None else GATEWAY_ADMISSION_BUDGET_S,
+                code_sha=self.code_sha) from exc
         finally:
             self.pending.pop(rid, None)
 
@@ -397,6 +429,7 @@ async def connect_gateway(endpoint=None, subject=None):
     budget = GATEWAY_ADMISSION_BUDGET_S
     deadline = started + budget
     owner_sha = None
+    handed_over = False
 
     def left(cap):
         return max(0.0, min(cap, deadline - time.monotonic()))
@@ -406,13 +439,25 @@ async def connect_gateway(endpoint=None, subject=None):
         return GatewayAdmissionTimeout(detail, phase=phase, elapsed=time.monotonic() - started,
                                        budget=budget, code_sha=owner_sha)
 
+    async def mint(home, target, **kwargs):
+        """The ticket mint, filed under admission when it runs out (it used to escape as a bare
+        ``TimeoutError`` before the try below, so the class token never reached the dead run)."""
+        try:
+            return await asyncio.to_thread(_session_ticket, home, target, **kwargs,
+                                           timeout=left(GATEWAY_SESSION_TICKET_DEADLINE_S))
+        except (OSError, TimeoutError) as exc:
+            detail = (f"Gateway connection failed; no local fallback (phase=session-ticket, "
+                      f"elapsed={time.monotonic() - started:.1f}s, {type(exc).__name__}: {exc})")
+            if isinstance(exc, TimeoutError) or left(1.0) <= 0:
+                raise spent(detail) from exc
+            raise GatewayClientError(detail) from exc
+
     phase = "session-ticket"
     if left(1.0) <= 0:
         raise spent("Gateway connection failed; no local fallback (admission budget spent before the ticket mint)")
     if endpoint is not None:
         owner_sha = getattr(endpoint, "code_sha", None)
-        ticket = await asyncio.to_thread(_session_ticket, gateway_profile_home(get_hermes_home()), endpoint,
-                                         subject=subject, timeout=left(GATEWAY_SESSION_TICKET_DEADLINE_S))
+        ticket = await mint(gateway_profile_home(get_hermes_home()), endpoint, subject=subject)
         url, protocols = gateway_ws_target(endpoint, ticket)
     elif remote:
         parsed = urlsplit(remote)
@@ -440,8 +485,7 @@ async def connect_gateway(endpoint=None, subject=None):
                                           result.state)
         endpoint = result.endpoint
         owner_sha = getattr(endpoint, "code_sha", None)
-        ticket = await asyncio.to_thread(_session_ticket, home, endpoint,
-                                         timeout=left(GATEWAY_SESSION_TICKET_DEADLINE_S))
+        ticket = await mint(home, endpoint)
         url, protocols = gateway_ws_target(endpoint, ticket)
     phase = "ws-open"
     if left(1.0) <= 0:
@@ -460,7 +504,13 @@ async def connect_gateway(endpoint=None, subject=None):
             if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError("Gateway protocol mismatch; update/restart required")
             phase = "session"
-            async with GatewayClient(ws, admission_deadline=deadline) as client:
+            async with GatewayClient(ws, admission_deadline=deadline, admission_started=started,
+                                     admission_budget=budget, code_sha=owner_sha) as client:
+                # From here on, errors from the caller's body are NOT admission errors unless the
+                # wait that produced them was admission-bounded (``GatewayClient.rpc`` raises
+                # ``GatewayAdmissionTimeout`` for those itself). A run 200 s into its turn is
+                # still inside this context; its body's failures must stay retryable.
+                handed_over = True
                 yield client
     except GatewayClientError:
         raise
@@ -471,7 +521,8 @@ async def connect_gateway(endpoint=None, subject=None):
         # took the socket (or left it open) and stopped answering, so a retry re-pays the whole
         # budget for the same result. A refusal — dial error, FIN, closed port — is NOT that: it is
         # an absent/broken owner, which a retry legitimately rides out. Only the former gets the
-        # classifiable admission class.
-        if isinstance(exc, TimeoutError) or left(1.0) <= 0:
+        # classifiable admission class, and only before the connection changed hands: after
+        # ``yield`` the same exception may belong to a 30 s mid-turn verb on a healthy run.
+        if not handed_over and (isinstance(exc, TimeoutError) or left(1.0) <= 0):
             raise spent(detail) from exc
         raise GatewayClientError(detail) from exc

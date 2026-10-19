@@ -127,3 +127,113 @@ def test_the_owner_build_is_named_when_the_budget_expires():
                                     code_sha="4d96afbff73f0aa5e4237957855e8800cb519033")
     assert "owner=4d96afbff73f" in str(error) and "budget=120s" in str(error)
     assert (error.phase, error.reason) == ("session", "gateway_admission_timeout")
+
+
+class _SilentSocket:
+    """A peer that accepts every frame and answers none."""
+
+    async def send(self, _payload):
+        return None
+
+
+def _open_client(gateway_client, *, budget=120.0, remaining=0.0, code_sha=None):
+    """A client mid-admission: its budget started ``budget`` seconds ago and has ``remaining`` left."""
+    import time as clock
+
+    return gateway_client.GatewayClient(
+        _SilentSocket(), admission_deadline=clock.monotonic() + remaining,
+        admission_started=clock.monotonic() - (budget - remaining),
+        admission_budget=budget, code_sha=code_sha)
+
+
+def test_a_mid_run_rpc_timeout_is_not_an_admission_timeout():
+    """Regression (SOU-2824 review): only a wait the admission budget bounded is starvation.
+
+    Admission verbs are ordinary RPCs issued after ``connect_gateway`` handed the socket over, so
+    a run 200 s into its turn still sits inside that context. When such a run's own 30 s verb
+    (``prompt.receipt`` after a long turn) times out, the old classification called it
+    ``gateway_admission_timeout`` — ``elapsed`` larger than ``budget`` was the tell — and the
+    adapter is being told (SOU-2840) to treat that code as a non-retryable verdict. It must stay
+    the retryable connection error instead.
+    """
+    from hermes_cli import gateway_client
+
+    client = _open_client(gateway_client, remaining=-1.0)  # budget long spent, as mid-run
+
+    async def call():
+        with pytest.raises(TimeoutError) as caught:
+            await client.rpc("prompt.receipt", _timeout=0.01)
+        return caught.value
+
+    error = asyncio.run(call())
+    assert not isinstance(error, gateway_client.GatewayClientError)
+
+
+def test_an_admission_bounded_rpc_is_still_classified():
+    """The complement: the same client, the same exhausted budget, an admission-bounded wait."""
+    from hermes_cli import gateway_client
+
+    client = _open_client(gateway_client, remaining=-1.0, code_sha="4d96afbff73f0aa5")
+
+    async def call():
+        with pytest.raises(gateway_client.GatewayAdmissionTimeout) as caught:
+            await client.rpc("session.create",
+                             _timeout=gateway_client.admission_timeout(client, 120.0))
+        return caught.value
+
+    error = asyncio.run(call())
+    assert error.reason == "gateway_admission_timeout"
+    assert error.budget == 120.0 and error.code_sha == "4d96afbff73f0aa5"
+    # The budget, not the 120 s cap or the caller's own verb cap, is what the run paid.
+    assert error.elapsed >= 120.0
+
+
+def test_a_ticket_mint_timeout_is_admission_starvation(monkeypatch):
+    """The mint runs before the socket exists; its timeout used to escape as a bare TimeoutError."""
+    from types import SimpleNamespace
+    from hermes_cli import gateway_client
+
+    def expired(*_args, **_kwargs):
+        raise TimeoutError("mint expired")
+
+    monkeypatch.setattr(gateway_client, "_session_ticket", expired)
+    endpoint = SimpleNamespace(api_origin="http://127.0.0.1:1", profile_id="p", instance_id="i",
+                               code_sha="4d96afbff73f0aa5")
+
+    async def attach():
+        async with gateway_client.connect_gateway(endpoint=endpoint):
+            raise AssertionError("an expired mint must not admit")
+
+    with pytest.raises(gateway_client.GatewayAdmissionTimeout) as caught:
+        asyncio.run(attach())
+    assert caught.value.phase == "session-ticket"
+    assert "phase=session-ticket" in str(caught.value)
+
+
+def test_a_mid_run_body_timeout_is_not_an_admission_timeout(monkeypatch):
+    """The handover boundary: after ``yield``, the caller's own TimeoutError keeps its old class."""
+    from types import SimpleNamespace
+    from websockets.asyncio.server import serve
+    from hermes_cli import gateway_client
+
+    monkeypatch.setattr(gateway_client, "_session_ticket", lambda *a, **k: "ticket")
+
+    async def silent_owner(ws):
+        async for _raw in ws:
+            pass
+
+    async def attach(port):
+        endpoint = SimpleNamespace(api_origin=f"http://127.0.0.1:{port}", profile_id="p",
+                                   instance_id="i", code_sha=None)
+        async with gateway_client.connect_gateway(endpoint=endpoint):
+            raise TimeoutError("a mid-run verb, not admission")
+
+    async def run():
+        async with serve(silent_owner, "127.0.0.1", 0,
+                         subprotocols=[gateway_client.GATEWAY_WS_PROTOCOL]) as server:
+            await attach(server.sockets[0].getsockname()[1])
+
+    with pytest.raises(gateway_client.GatewayClientError) as caught:
+        asyncio.run(run())
+    assert not isinstance(caught.value, gateway_client.GatewayAdmissionTimeout)
+    assert "phase=session" in str(caught.value)
