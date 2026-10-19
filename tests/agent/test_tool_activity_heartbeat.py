@@ -310,44 +310,40 @@ def test_heartbeat_skips_and_drops_an_abandoned_worker():
         set_interrupt(False, fake_abandoned_tid)
 
 
-def test_sequential_calls_never_accumulate_heartbeat_threads(monkeypatch):
-    """N sequential tool calls share one heartbeat thread, even when it wedges.
+def test_sequential_calls_share_one_heartbeat_thread(monkeypatch):
+    """N sequential tool calls are stamped by one heartbeat thread, not one per call.
 
-    The old shape started a daemon thread *per call* and ``join(timeout=2.0)``d it, so an
-    activity callback blocked past two seconds left the thread behind. Measured on the live
-    gateway: 50 ``tool-activity-hb-*`` threads in one pid, all still runnable Python competing
-    for the GIL. Sequential calls must never add a thread each.
+    The old shape started a daemon thread per call and ``join(timeout=2.0)``d it. On the live
+    gateway that left 50 ``tool-activity-hb-*`` threads alive at once, every one of them a
+    runnable Python thread competing for the GIL. Sequential calls must be served by a single
+    heartbeat thread.
     """
     import agent.tool_executor as te
+    from tests.waiting import wait_until
 
     monkeypatch.setattr(te, "_TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.02)
 
-    stamped = threading.Event()
-    wedge = threading.Event()
-    unwedged = threading.Event()
+    stamping_threads: list[threading.Thread] = []
 
     class _Agent:
         def _touch_activity(self, desc):
-            stamped.set()
-            wedge.wait(10)  # longer than the old per-call join(2.0): the old thread is orphaned
-            unwedged.set()
+            # The Thread object, not the ident: CPython recycles idents between short-lived threads.
+            stamping_threads.append(threading.current_thread())
 
-    def _call():
-        # Wait for the heartbeat to have stamped (and wedged) so each call exercises the leak.
-        assert stamped.wait(5), "shared heartbeat never stamped"
-        return "ok"
+    for _ in range(5):
+        before = len(stamping_threads)
 
-    try:
-        for _ in range(3):
-            assert te._run_with_activity_heartbeat(_Agent(), "terminal", _call) == "ok"
-        heartbeat_threads = [
-            t for t in threading.enumerate() if t.name.startswith("tool-activity")
-        ]
-        assert len(heartbeat_threads) <= 1, (
-            f"sequential tool calls accumulated {len(heartbeat_threads)} heartbeat threads")
-    finally:
-        wedge.set()
-        assert unwedged.wait(5), "heartbeat thread stayed wedged after release"
+        def _call(before=before):
+            # Return only once a heartbeat has actually stamped for this call.
+            wait_until(lambda: len(stamping_threads) > before, timeout=5)
+            return "ok"
+
+        assert te._run_with_activity_heartbeat(_Agent(), "terminal", _call) == "ok"
+
+    assert len(set(stamping_threads)) == 1, (
+        f"{len(set(stamping_threads))} heartbeat threads stamped 5 sequential calls")
+    alive = [t for t in threading.enumerate() if t.name.startswith("tool-activity")]
+    assert len(alive) <= 1, f"heartbeat threads accumulated: {[t.name for t in alive]}"
 
 
 def test_sequential_timeout_stops_abandoned_workers_heartbeat(monkeypatch):
