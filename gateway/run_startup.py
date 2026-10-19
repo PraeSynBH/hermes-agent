@@ -13,6 +13,7 @@ import faulthandler
 import logging
 import os
 import signal
+import threading
 import time
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
@@ -715,6 +716,9 @@ class GatewayStartupMixin:
                     max_strikes=int(getattr(
                         config, "loop_watchdog_max_strikes", DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
                     )),
+                    # This method runs on the loop thread, so its ident is the loop's: the watchdog
+                    # needs it to name the frame holding the loop when a probe goes unanswered.
+                    loop_thread_ident=threading.get_ident(),
                 )
             except Exception:
                 logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)

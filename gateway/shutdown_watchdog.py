@@ -41,6 +41,8 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
 # the loop it monitors) is fixed at the root by the off-loop heartbeat write + two-witness probe (#90502),
 # so the default stays tight for genuine wedges.
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
+# Frames reported for a stalled loop: the innermost coroutine plus its dispatcher callers.
+DEFAULT_LOOP_STACK_DEPTH = 14
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
 
@@ -84,19 +86,47 @@ def _arm_loop_floor_timer(
     return _LoopFloorTimerHandle(loop, iv if iv > 0 else DEFAULT_LOOP_FLOOR_TIMER_INTERVAL_S)
 
 
+def loop_thread_stack(ident: int, depth: int = DEFAULT_LOOP_STACK_DEPTH) -> str:
+    """Innermost Python frames of the loop thread, read from another thread.
+
+    ``sample``/``faulthandler`` report C frames only, which named the syscall (``open``,
+    ``os_stat``, ``_Py_read``) in a stall but never the coroutine that made it. Reading
+    ``sys._current_frames()`` from the watchdog thread names the ``file:line function`` for
+    free, including the coroutine frame that is executing on the loop right now.
+    """
+    try:
+        frame = sys._current_frames().get(ident)
+    except Exception:
+        return "(loop thread frames unavailable)\n"
+    if frame is None:
+        return f"(thread {ident} is not running Python)\n"
+    lines = []
+    while frame is not None and len(lines) < depth:
+        marker = "->" if not lines else "  "
+        lines.append(f"  {marker} {frame.f_code.co_filename}:{frame.f_lineno} {frame.f_code.co_name}")
+        frame = frame.f_back
+    return "\n".join(lines) + "\n"
+
+
 def start_loop_liveness_watchdog(
     loop: asyncio.AbstractEventLoop, *, probe_interval: float = DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     probe_timeout: float = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
     max_strikes: int = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
     exit_code: int = GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    loop_thread_ident: Optional[int] = None,
 ) -> Optional[_LoopLivenessWatchdogHandle]:
     """Start an out-of-loop watchdog that hard-exits after missed probes. The caller
     (``GatewayRunner._start_loop_liveness_guards``) enforces the ``gateway.loop_watchdog: false``
-    opt-out."""
+    opt-out.
+
+    ``loop_thread_ident`` is the loop's own thread (pass ``threading.get_ident()`` from it) so a
+    missed probe can name the code that is holding the loop; without it a stall is only counted.
+    """
     stop_event = threading.Event()
 
     def _watchdog() -> None:
         strikes = 0
+        stall_since: Optional[float] = None
         while not stop_event.wait(timeout=probe_interval):
             probe_event = threading.Event()
             try:
@@ -114,8 +144,23 @@ def start_loop_liveness_watchdog(
             else:
                 return
             if probe_event.is_set():
+                if stall_since is not None:
+                    # The loop came back: its answers arrive on the frame AFTER the queued
+                    # callback, so a recovered stall is the only honest source for the duration.
+                    logger.warning(
+                        "Gateway event loop stalled %.1fs and recovered (probe interval %.1fs, "
+                        "timeout %.1fs)", time.monotonic() - stall_since, probe_interval, probe_timeout)
                 strikes = 0
+                stall_since = None
                 continue
+            if stall_since is None:
+                stall_since = deadline - probe_timeout
+                if loop_thread_ident is not None:
+                    # First miss of this stall: the loop is wedged NOW, so this is a live stack,
+                    # not a post-mortem. Logged once per stall so a 60s freeze cannot flood the log.
+                    logger.warning(
+                        "Gateway event loop stalled >%.1fs: probe unanswered. Loop thread stack:\n%s",
+                        probe_timeout, loop_thread_stack(loop_thread_ident))
             if stop_event.is_set():  # re-checked before each irreversible step: a late stop() wins
                 return
             strikes += 1
