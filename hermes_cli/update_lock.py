@@ -323,6 +323,27 @@ def _identity_line(pid: int | None = None) -> str:
     return "" if ct is None else f"ct:{ct:.3f}"
 
 
+def _run_line() -> str:
+    """``run:<id>\\n`` naming this update's correlation id, or ``""`` — A7 rule 6's tag.
+
+    Every reader already parses ``run:`` (the Desktop writes it; the Rust/Electron judges and
+    ``judge_marker`` return it). Stamping it on a CLI update is what lets a run refused or held by
+    the fence quote WHICH update it waited on instead of "update_paused". Absent when no update
+    receipt is open in this context (nothing to name), and never raises: the marker body is built
+    on the path that must publish the claim, in partial trees where the receipt module may not
+    import.
+    """
+    try:
+        from hermes_cli.update_receipt import current_correlation_id
+
+        run = current_correlation_id()
+    except ImportError:
+        return ""
+    if not isinstance(run, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", run):
+        return ""
+    return f"run:{run}\n"
+
+
 # --- ancestry ----------------------------------------------------------------------------
 
 
@@ -1482,7 +1503,7 @@ class UpdateLock:
             if legacy:
                 self.holder = legacy[0]
                 return False
-        body = f"{os.getpid()}\n{int(time.time())}\n{_identity_line()}\n".encode()
+        body = f"{os.getpid()}\n{int(time.time())}\n{_identity_line()}\n{_run_line()}".encode()
         try:
             for _attempt in range(3):
                 # A7 rule 2: an exclusive create needs no mutex — it only succeeds on no marker.

@@ -5,6 +5,7 @@ import asyncio
 from collections import deque
 from contextlib import asynccontextmanager, suppress
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -59,7 +60,21 @@ GATEWAY_SESSION_TICKET_DEADLINE_S = 30.0
 # 120 s is not the admission latency budget (that is ~5.4 s p95 / 7.4 s max, measured over 41
 # ``ensure_session`` samples at 30 concurrent runs after the 08:23Z restart); it is the ceiling on
 # how long a run may be held before it is told, in its own error, that the OWNER was starving.
+#
+# The DEFAULT, not the value: ``gateway.admission_budget_seconds`` in config.yaml raises it (the
+# floor is this number — a run may be held longer, never killed sooner than the class was designed
+# for), because the stall distribution is a property of the HOST: on 2026-10-19 the owner's loop
+# stalled 10-25 s under load 38 and past 40 s at load 100, and every run admitted inside those
+# windows died here with no knob to widen it (`hermes gateway` has no hand on a run's client).
 GATEWAY_ADMISSION_BUDGET_S = 120.0
+# A live update fence is polled this often while an admission waits it out, so a 9-minute install
+# update (2026-10-19: 18:54-19:03Z) costs a wake-up rather than a run.
+UPDATE_FENCE_POLL_INTERVAL_S = 2.0
+# The bound on sampling the owner's loop at the moment this run dies at admission: the owner is
+# already stalling, so the probe is allowed less than the slack a healthy loop answers in
+# milliseconds, and a no-answer is reported as a floor (``owner_loop>2s``), never as healthy.
+ADMISSION_STALL_PROBE_TIMEOUT_S = 2.0
+
 # The run's own first in-band RPCs (``runtime.describe`` -> ``session.create``/``session.resume``)
 # are NOT prompt admissions: ``session.create`` binds the profile, loads the agent config and opens
 # the state DB on the owner's event loop, in the same process that is running every other agent
@@ -140,16 +155,61 @@ class GatewayAdmissionTimeout(GatewayClientError):
     ``no local fallback`` failure). ``reason`` is the stable code such a chain keys on, ``phase``
     names the stage that was left holding the deadline, and ``code_sha`` the build of the owner that
     was holding it — the field whose absence turned the 2026-10-19 investigation into an ``lsof``
-    dig. ``str(exc)`` keeps the original wording so existing readers/log scrapers still match.
+    dig. ``evidence`` is what the host was doing at that instant (the owner's loopback latency, the
+    1-minute load): the run's log line is the only place a death at admission is ever read from, so
+    the stall has to be in it rather than 20 minutes of hand-probing later. ``str(exc)`` keeps the
+    original wording so existing readers/log scrapers still match.
     """
 
     reason = "gateway_admission_timeout"
 
-    def __init__(self, detail, *, phase, elapsed, budget=GATEWAY_ADMISSION_BUDGET_S, code_sha=None):
+    def __init__(self, detail, *, phase, elapsed, budget=GATEWAY_ADMISSION_BUDGET_S, code_sha=None,
+                 evidence=None):
         self.phase, self.elapsed, self.budget = phase, elapsed, budget
         self.code_sha = code_sha if isinstance(code_sha, str) and code_sha else None
+        self.evidence = evidence or None
         owner = f", owner={self.code_sha[:12]}" if self.code_sha else ""
-        super().__init__(f"{self.reason}: {detail} (budget={budget:g}s{owner})")
+        host = f", {self.evidence}" if self.evidence else ""
+        super().__init__(f"{self.reason}: {detail} (budget={budget:g}s{owner}{host})")
+
+
+def admission_budget_seconds() -> float:
+    """``gateway.admission_budget_seconds`` from this home's config.yaml, floored at the default.
+
+    Read through the effective-user-config loader — the gateway's own reader, which does not merge
+    ``DEFAULT_CONFIG`` — so an absent key stays absent and this function owns the default. The floor
+    is ``GATEWAY_ADMISSION_BUDGET_S``: the knob exists so a host whose loop stalls for longer than
+    the class was designed against can still admit runs, never so a typo can kill them sooner.
+    Never raises: a config read must not be what ends a run at admission.
+    """
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+
+        gateway = load_user_config_effective().get("gateway")
+        value = gateway.get("admission_budget_seconds") if isinstance(gateway, dict) else None
+        budget = float(value)
+    except (ImportError, TypeError, ValueError, OSError):
+        return GATEWAY_ADMISSION_BUDGET_S
+    if not math.isfinite(budget):
+        return GATEWAY_ADMISSION_BUDGET_S
+    return max(GATEWAY_ADMISSION_BUDGET_S, budget)
+
+
+def admission_stall_evidence(homes) -> str | None:
+    """``owner_loop=25.5s, load1=100.21`` — what the owner and the host were doing at this death.
+
+    Sampled once, bounded by ``ADMISSION_STALL_PROBE_TIMEOUT_S``, and only on the path where the run
+    has already lost its budget: the owner's loopback witness answers in milliseconds when the loop
+    is healthy, so a probe that does not answer at all is reported as a floor, never as healthy.
+    Either half may be missing (no witness for this home, no ``getloadavg`` on Windows).
+    """
+    from gateway.loop_latency import describe_load, describe_probe, load_average_1m, probe_loop
+
+    loop = describe_probe(probe_loop(homes, timeout=ADMISSION_STALL_PROBE_TIMEOUT_S),
+                          timeout=ADMISSION_STALL_PROBE_TIMEOUT_S)
+    parts = [part for part in (loop, describe_load(load_average_1m())) if part]
+    return ", ".join(parts) or None
+
 
 
 class _AdmissionBudget(float):
@@ -421,23 +481,33 @@ async def connect_gateway(endpoint=None, subject=None):
     # budget. Name the phase and the elapsed time in the error itself (2026-10-18T07:00Z: 8
     # fleet deaths at load 129, 30.8-79.2 s, all reported as this one opaque string).
     #
-    # Every phase below spends from ONE budget (``GATEWAY_ADMISSION_BUDGET_S``): each waits at most
-    # its own cap AND at most what the budget has left, so four starved phases fail at the budget
-    # instead of at their sum. Before that, ensure + ticket + ws-open + describe + create could each
-    # run their cap out in turn and the run died at ~181 s with nothing in the error to classify.
+    # Every phase below spends from ONE budget: ``GATEWAY_ADMISSION_BUDGET_S``, or the larger
+    # ``gateway.admission_budget_seconds`` from config.yaml (``admission_budget_seconds()``). Each
+    # waits at most its own cap AND at most what the budget has left, so four starved phases fail
+    # at the budget instead of at their sum. Before that, ensure + ticket + ws-open + describe +
+    # create could each run their cap out in turn and the run died at ~181 s with nothing in the
+    # error to classify.
     started = time.monotonic()
-    budget = GATEWAY_ADMISSION_BUDGET_S
+    budget = admission_budget_seconds()
     deadline = started + budget
     owner_sha = None
+    home = None
     handed_over = False
 
     def left(cap):
         return max(0.0, min(cap, deadline - time.monotonic()))
 
+    def probe_homes():
+        """Homes whose loop-tick witness is this owner's: the endpoint's control home first (a named
+        profile is served by the multiplexer's loop), then the profile home, then this process's."""
+        control = getattr(endpoint, "control_home", None) if endpoint is not None else None
+        return list(dict.fromkeys(Path(h) for h in (control, home, get_hermes_home()) if h))
+
     def spent(detail):
-        """The budget is gone: one class, one stable code, the owner's build in the text."""
+        """The budget is gone: one class, one stable code, the owner's build and the host's state."""
         return GatewayAdmissionTimeout(detail, phase=phase, elapsed=time.monotonic() - started,
-                                       budget=budget, code_sha=owner_sha)
+                                       budget=budget, code_sha=owner_sha,
+                                       evidence=admission_stall_evidence(probe_homes()))
 
     async def mint(home, target, **kwargs):
         """The ticket mint, filed under admission when it runs out (it used to escape as a bare
@@ -451,6 +521,41 @@ async def connect_gateway(endpoint=None, subject=None):
             if isinstance(exc, TimeoutError) or left(1.0) <= 0:
                 raise spent(detail) from exc
             raise GatewayClientError(detail) from exc
+
+    async def admit_owner(home):
+        """Ensure an owner, waiting out a live update fence instead of failing at t=0.
+
+        An update owns the install for minutes (2026-10-19: 18:54-19:03Z) and every run started in
+        that window died in under a second on ``Gateway draining: update_paused`` — six of them,
+        and the survivors went on to die at the budget once the fence cleared. The fence is a wait,
+        not a verdict: poll it within this run's ONE budget and admit as soon as it clears, and name
+        the fence's owner (pid + update run) if the fence outlives the budget.
+        """
+        nonlocal phase
+        fence = None
+        while True:
+            cap = left(DEFAULT_ENSURE_TIMEOUT)
+            if cap <= 0:
+                if fence is None:
+                    raise spent("Gateway connection failed; no local fallback "
+                                f"(phase={phase}, elapsed={time.monotonic() - started:.1f}s, "
+                                "admission budget spent before an owner could be ensured)")
+                break
+            result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True, timeout=cap)
+            if result.reason_code != "update_paused":
+                return result
+            fence = getattr(result, "detail", None) or "update fence live"
+            if left(1.0) <= 0:
+                break
+            phase = "update-fence"
+            await asyncio.sleep(min(UPDATE_FENCE_POLL_INTERVAL_S, left(UPDATE_FENCE_POLL_INTERVAL_S)))
+        # The fence outlived the budget. This is not owner starvation — an install update holds the
+        # install — so the failure keeps the class a retry chain already handles (the owner is
+        # draining, not starving) and spends its words on WHO held it and how long we waited.
+        raise GatewayUnavailableError(
+            f"Gateway draining: update_paused; admission budget {budget:g}s spent "
+            f"({time.monotonic() - started:.1f}s) waiting for the update fence to clear, so this run "
+            f"was never admitted: {fence}", "draining")
 
     phase = "session-ticket"
     if left(1.0) <= 0:
@@ -470,8 +575,7 @@ async def connect_gateway(endpoint=None, subject=None):
         # A client's own start: the daemon it may launch ends itself once idle (no client, adapter,
         # cron/kanban work or admission), and the next client starts a fresh one.
         phase = "runtime"
-        result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True,
-                                         timeout=left(DEFAULT_ENSURE_TIMEOUT))
+        result = await admit_owner(home)
         if not attachable(result):
             # No attachable owner is NOT admission starvation: it is either a boot in progress (which
             # a retry legitimately waits out) or a broken install (whose report the caller must read).

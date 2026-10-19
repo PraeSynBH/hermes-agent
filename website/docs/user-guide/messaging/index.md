@@ -208,6 +208,41 @@ stamp is more than 120 s old, `hermes gateway status` prints
 for N s …` and the dashboard badge reads **Heartbeat stale** — the "looks
 running but nothing is scheduled" case. Restart the gateway.
 
+### Event-loop latency alarm, and the run's admission budget
+
+One gateway process serves every profile on one asyncio loop, so a stall of
+10-25 s is a fleet-wide outage of *session admission* — long before the liveness
+watchdog above reaches its hard-exit threshold. The gateway therefore samples
+its own loopback health (the loop-tick socket a coroutine on the loop answers)
+every 10 s and **warns** when the p95 of the last 20 samples stays above 5 s
+for three consecutive samples, naming the pid, the process's thread count and
+the host's 1-minute load average:
+
+```
+WARNING Gateway event loop is stalling session admission: loopback health probe
+p95=21.8s over the last 100 samples (threshold 5.0s, 3 consecutive) pid=63813
+threads=412 load1=100.25 — runs admitted now die at their admission budget
+```
+
+A run is held at admission (ensure → ticket → websocket → `session.create`) for
+at most `gateway.admission_budget_seconds` (default and floor: `120`). Raise it on
+a host whose loop stalls longer than that; a smaller value is ignored rather than
+killing runs sooner. A run that dies at the budget logs the owner's loopback
+latency and the load average in its own failure line:
+
+```
+gateway_admission_timeout: … (budget=120s, owner=4d96afbff73f, owner_loop>2.0s, load1=100.25)
+```
+
+`owner_loop>2.0s` means the loop did not answer the probe within 2 s (a floor on
+the stall); no `owner_loop` field means no loop-tick witness was available.
+
+While an update owns the install (`.hermes-update-in-progress`), admission
+**waits** the fence out instead of failing at once, admitting as soon as it
+clears. If the fence outlives the budget the run fails with the fence's owner in
+the text (`update fence live: pid=… update_run=… age=…s`), and the run id is the
+same correlation id the update's receipt (`logs/update_receipts/`) carries.
+
 ### Optional Linux event-loop watchdog
 
 A systemd-managed gateway can opt into process recovery when Python's asyncio
