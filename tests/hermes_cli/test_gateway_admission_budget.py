@@ -188,6 +188,44 @@ def test_an_admission_bounded_rpc_is_still_classified():
     assert error.elapsed >= 120.0
 
 
+def test_the_mid_run_shape_the_adapter_predicate_actually_sees(monkeypatch):
+    """Full stack: a mid-run verb at its own cap must not carry the ``gateway_admission_timeout:``
+    token, and an admission-bounded verb must.
+
+    The two unit tests above pin ``rpc`` and the context's re-raise separately, so neither of them
+    observes what the adapter's stderr predicate sees. This is that layer: same silent owner, same
+    context, a healthy budget (the 200-s-into-a-turn case), and the caller's default cap expiring.
+    """
+    from types import SimpleNamespace
+    from websockets.asyncio.server import serve
+    from hermes_cli import gateway_client
+
+    monkeypatch.setattr(gateway_client, "_session_ticket", lambda *a, **k: "ticket")
+    monkeypatch.setattr(gateway_client, "DEFAULT_RPC_TIMEOUT", 0.05)
+
+    async def silent_owner(ws):
+        async for _raw in ws:
+            pass
+
+    async def attach(port):
+        endpoint = SimpleNamespace(api_origin=f"http://127.0.0.1:{port}", profile_id="p",
+                                   instance_id="i", code_sha=None)
+        async with gateway_client.connect_gateway(endpoint=endpoint) as client:
+            await client.rpc("prompt.receipt")
+
+    async def run():
+        async with serve(silent_owner, "127.0.0.1", 0,
+                         subprotocols=[gateway_client.GATEWAY_WS_PROTOCOL]) as server:
+            await attach(server.sockets[0].getsockname()[1])
+
+    with pytest.raises(gateway_client.GatewayClientError) as caught:
+        asyncio.run(run())
+    assert not isinstance(caught.value, gateway_client.GatewayAdmissionTimeout)
+    assert not str(caught.value).startswith("gateway_admission_timeout:")
+    # Still a connection failure the retry chain can act on, not a bare TimeoutError traceback.
+    assert "no local fallback" in str(caught.value)
+
+
 def test_a_ticket_mint_timeout_is_admission_starvation(monkeypatch):
     """The mint runs before the socket exists; its timeout used to escape as a bare TimeoutError."""
     from types import SimpleNamespace
