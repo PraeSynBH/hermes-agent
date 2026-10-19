@@ -177,7 +177,8 @@ Every event carries `timestamp` (Unix epoch milliseconds).
 
 | Event `type` | Fields |
 |---|---|
-| `system` | `subtype: "init"`, `model`, `session_id` |
+| `system` | `subtype: "init"`, `model`, `session_id` (empty until the session exists) |
+| `system` | `subtype: "session"`, `session_id` — written the moment the transport creates/attaches the session, so a killed run still reports which session holds the accepted work |
 | `text` | `text` — a streamed assistant text delta |
 | `tool_use` | `name`; `input` when the tool arguments are available |
 | `tool_result` | `name`, `output` (capped at 5000 chars), `duration_ms`, `is_error` |

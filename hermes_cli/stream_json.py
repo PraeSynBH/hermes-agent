@@ -1,8 +1,9 @@
 """``hermes chat -q … --format stream-json``: one JSON object per stdout line.
 
 CI runners and orchestrators consume a one-shot run without scraping human-formatted text:
-``system/init`` → ``text`` deltas / ``tool_use`` / ``tool_result`` → one terminal ``result``
-envelope (exit code, final text, token stats). Diagnostics and ``session_id`` stay on stderr.
+``system/init`` → (``system/session`` once the session exists) → ``text`` deltas / ``tool_use`` /
+``tool_result`` → one terminal ``result`` envelope (exit code, final text, token stats).
+Diagnostics and ``session_id`` stay on stderr.
 """
 
 from __future__ import annotations
@@ -52,8 +53,15 @@ class StreamJsonEmitter:
 
     def bind_session(self, session_id: str) -> None:
         """Record the id the gateway assigned after ``init`` was written, so an interrupted or failed
-        run still reports which session holds the accepted work."""
-        self._session_id = session_id or self._session_id
+        run still reports which session holds the accepted work — and write it to the stream at the
+        moment it is known: a SIGKILLed process never reaches ``emit_result``, so a consumer reading
+        the partial stdout (a supervisor enforcing a timeout) must not have to wait for the terminal
+        record to learn what to ``--resume``."""
+        if not session_id or session_id == self._session_id:
+            self._session_id = session_id or self._session_id
+            return
+        self._session_id = session_id
+        self._emit({"type": "system", "subtype": "session", "session_id": self._session_id})
 
     def on_text_delta(self, text: str | None) -> None:
         # Only None/"" (the turn-end sentinel) is dropped: whitespace deltas are part of the text, and

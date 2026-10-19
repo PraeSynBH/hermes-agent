@@ -104,9 +104,53 @@ def _interrupted_turn(_peer):
     raise KeyboardInterrupt
 
 
+def test_session_record_reaches_stdout_before_the_turn_so_a_kill_keeps_it(monkeypatch, capsys):
+    """SOU-2781: a supervisor that SIGKILLs the child mid-tool-call only has the flushed stdout.
+
+    The terminal ``result`` record is exactly what a kill destroys, so the id must be on the stream
+    before the transport submits the prompt — otherwise the next run starts cold and the killed
+    run's work is lost twice over.
+    """
+    seen = {}
+
+    def turn_killed_mid_tool(peer):
+        peer.emit("tool.start", {"tool_call_id": "c1", "tool_name": "terminal", "args": {"command": "sleep 900"}})
+        # Everything the child flushed up to the kill: no ``result`` record, just what had already gone out.
+        seen["partial"] = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line]
+        raise KeyboardInterrupt
+
+    code, tail = _run_stream_json_chat(monkeypatch, capsys, turn_killed_mid_tool)
+
+    assert code == 130
+    # The kill lands with a tool call in flight and nothing of the turn on stdout yet — the id is
+    # already there, so the partial transcript alone is enough to resume the session.
+    assert [e.get("subtype") or e["type"] for e in seen["partial"]] == ["init", "session"]
+    assert seen["partial"][1]["session_id"] == "session-123"
+    assert [e["type"] for e in tail] == ["result"]  # only the post-kill Ctrl-C envelope is left
+
+
+def test_bind_session_writes_the_id_once_as_a_system_record(capsys):
+    """``bind_session`` is the emitter's one chance to report an id a kill cannot take back.
+
+    A rebind of the id it already reported is not a second event (a clean run must not hand the
+    consumer a duplicate to disambiguate), and an empty id claims nothing.
+    """
+    emitter = StreamJsonEmitter(model="m")  # ``init`` was written before any session existed
+    emitter.bind_session("s-2")
+    emitter.bind_session("s-2")
+    emitter.bind_session("")
+    emitter.emit_result({"final_response": "x"})
+
+    events = _events(capsys)
+    assert [e["type"] for e in events] == ["system", "system", "result"]
+    assert events[0]["subtype"] == "init" and events[0]["session_id"] == ""
+    assert events[1]["subtype"] == "session" and events[1]["session_id"] == "s-2"
+    assert events[2]["session_id"] == "s-2"  # the terminal record still repeats the id
+
+
 @pytest.mark.parametrize("turn, credentials_ok, exit_code, types", [
-    (_ok_turn, True, 0, ["system", "text", "tool_use", "tool_result", "result"]),
-    (_interrupted_turn, True, 130, ["system", "result"]),
+    (_ok_turn, True, 0, ["system", "system", "text", "tool_use", "tool_result", "result"]),
+    (_interrupted_turn, True, 130, ["system", "system", "result"]),
     (_ok_turn, False, 1, ["system", "result"]),  # credentials fail before any session exists
 ])
 def test_chat_stream_json_implies_quiet_and_closes_with_result(monkeypatch, capsys, turn, credentials_ok, exit_code,
