@@ -11,6 +11,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -1092,16 +1093,48 @@ _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # v2 added org provenance fields (org_id/org_author); v4 adds ``rel`` (SKILL.md path relative to its root) for
 # duplicate-name resolution. Older snapshots are rebuilt.
 _SKILLS_SNAPSHOT_VERSION = 4
+# Every build read and json-parsed the snapshot (335 KB here) BEFORE it looked at the prompt cache,
+# so even a cache hit paid a disk read on the loop. Memoised on the file's own stat signature: one
+# stat is the invalidation, and a repeat build with an unchanged snapshot touches no file at all.
+_SKILLS_SNAPSHOT_MEMO: dict[str, tuple[tuple, dict]] = {}
+_SKILLS_SNAPSHOT_MEMO_LOCK = threading.Lock()
 
 
 def _skills_prompt_snapshot_path() -> Path:
     return get_hermes_home() / ".skills_prompt_snapshot.json"
 
 
+def _read_skills_snapshot_file() -> Optional[dict]:
+    """The disk snapshot as a dict, or None when it is absent, unreadable or corrupt."""
+    path = _skills_prompt_snapshot_path()
+    key = str(path)
+    try:
+        signature = tuple(file_signature(path.stat()))
+    except OSError:
+        return None
+    with _SKILLS_SNAPSHOT_MEMO_LOCK:
+        memo = _SKILLS_SNAPSHOT_MEMO.get(key)
+    if memo is not None and memo[0] == signature:
+        return memo[1]
+    try:
+        snapshot = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:  # missing, unreadable or corrupt -> rebuild
+        return None
+    if not isinstance(snapshot, dict):
+        return None
+    with _SKILLS_SNAPSHOT_MEMO_LOCK:
+        _SKILLS_SNAPSHOT_MEMO[key] = (signature, snapshot)
+    return snapshot
+
+
 def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
     """Drop the in-process skills prompt cache (and optionally the disk snapshot)."""
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE.clear()
+    with _MANIFEST_LOCK:
+        _MANIFEST_CACHE.clear()
+    with _SKILLS_SNAPSHOT_MEMO_LOCK:
+        _SKILLS_SNAPSHOT_MEMO.clear()
     try:
         if clear_snapshot:
             _skills_prompt_snapshot_path().unlink(missing_ok=True)
@@ -1110,11 +1143,28 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
 
 
 def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
-    """File-signature manifest of every SKILL.md and DESCRIPTION.md."""
+    """File-signature manifest of every SKILL.md and DESCRIPTION.md.
+
+    ``followlinks`` is deliberate: a profile's skills dir is largely symlinks (92 on this host, many
+    into Paperclip's instance dirs) and not following them would hide those skills from every prompt.
+    What must not happen is *re-entering* a directory — a back-link makes ``os.walk`` revisit the tree
+    it came from and the manifest grows without bound (measured here: 194,279 entries in 156 s,
+    against 523 entries in 0.09 s when the same tree walks cleanly). ``seen`` holds the real path of
+    every directory already expanded, so each real directory is expanded once.
+    """
     manifest: dict[str, list[int]] = {}
     skills_dir_str = str(skills_dir)
     prefix_len = len(os.path.join(skills_dir_str, ""))
+    seen: set[str] = set()
     for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+        try:
+            real = os.path.realpath(root)
+        except OSError:
+            real = root
+        if real in seen:  # a link led back into a tree already walked
+            dirs[:] = []
+            continue
+        seen.add(real)
         has_skill_md = "SKILL.md" in files
         dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
         for filename in ("SKILL.md", "DESCRIPTION.md"):
@@ -1128,13 +1178,98 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     return manifest
 
 
+# The manifest walk is the load-sensitive half of a prompt build: 0.1-0.6 s here when the host is
+# idle, and hundreds of seconds while a co-tenant whole-disk scan holds the directory inodes (PRA-6517
+# measured 226-290 s at load 115-130). Prompt assembly runs on the shared gateway's event loop, so a
+# build that walks inline stops the control socket for every profile. On a loop thread the build
+# therefore serves the last known manifest and refreshes it in a daemon thread; a change lands at the
+# next build, which is the visibility an on-disk install always had (the system prompt is built once
+# per session). Off a loop thread — the CLI, skill commands, tests — the walk stays exact.
+_MANIFEST_TTL = 30.0
+_MANIFEST_CACHE: dict[str, tuple[float, dict[str, list[int]]]] = {}
+_MANIFEST_REFRESHING: set[str] = set()
+_MANIFEST_LOCK = threading.Lock()
+
+
+def _calling_on_event_loop() -> bool:
+    """True when the caller is a coroutine running on an event loop (the gateway's shared thread)."""
+    try:
+        import asyncio
+
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _seed_manifest_from_snapshot() -> Optional[dict[str, list[int]]]:
+    """The manifest the last build walked, taken from the disk snapshot (one small read).
+
+    A fresh process has no in-process manifest and its first prompt build is also on the loop; the
+    snapshot is what keeps that build from walking the tree in front of every profile.
+    """
+    snapshot = _read_skills_snapshot_file()
+    if not isinstance(snapshot, dict) or snapshot.get("version") != _SKILLS_SNAPSHOT_VERSION:
+        return None
+    manifest = snapshot.get("manifest")
+    if not isinstance(manifest, dict):
+        return None
+    try:
+        return {str(rel): [int(part) for part in sig] for rel, sig in manifest.items() if isinstance(sig, list)}
+    except (TypeError, ValueError):
+        return None
+
+
+def _refresh_skills_manifest(skills_dir: Path) -> None:
+    key = str(skills_dir)
+    manifest = None
+    try:
+        manifest = _build_skills_manifest(skills_dir)
+    except Exception:
+        logger.debug("Skills manifest refresh failed for %s", key, exc_info=True)
+    with _MANIFEST_LOCK:
+        _MANIFEST_REFRESHING.discard(key)
+        if manifest is not None:
+            _MANIFEST_CACHE[key] = (time.monotonic(), manifest)
+
+
+def _skills_manifest_for_prompt(skills_dir: Path) -> dict[str, list[int]]:
+    """Manifest for a prompt build: exact off an event loop, never walked inline on one.
+
+    Only a tree with neither a cached manifest nor a snapshot (a brand-new profile's first build)
+    still walks inline, and that walk is itself the refresh.
+    """
+    key = str(skills_dir)
+    if not _calling_on_event_loop():
+        manifest = _build_skills_manifest(skills_dir)
+        with _MANIFEST_LOCK:
+            _MANIFEST_CACHE[key] = (time.monotonic(), manifest)
+        return manifest
+    now = time.monotonic()
+    with _MANIFEST_LOCK:
+        cached = _MANIFEST_CACHE.get(key)
+        if cached is not None and now - cached[0] <= _MANIFEST_TTL:
+            return cached[1]
+        start_refresh = key not in _MANIFEST_REFRESHING
+        if start_refresh:
+            _MANIFEST_REFRESHING.add(key)
+    known = cached[1] if cached is not None else _seed_manifest_from_snapshot()
+    if known is None:
+        manifest = _build_skills_manifest(skills_dir)
+        with _MANIFEST_LOCK:
+            _MANIFEST_REFRESHING.discard(key)
+            _MANIFEST_CACHE[key] = (time.monotonic(), manifest)
+        return manifest
+    if start_refresh:
+        threading.Thread(target=_refresh_skills_manifest, args=(skills_dir,),
+                         name="skills-manifest-refresh", daemon=True).start()
+    return known
+
+
 def _load_skills_snapshot(skills_dir: Path, manifest: Optional[dict] = None) -> Optional[dict]:
     """The disk snapshot if it exists, is current-version, and its manifest still matches."""
-    try:
-        snapshot = json.loads(_skills_prompt_snapshot_path().read_text(encoding="utf-8-sig"))
-    except Exception:  # missing, unreadable or corrupt -> rebuild
-        return None
-    if (isinstance(snapshot, dict) and snapshot.get("version") == _SKILLS_SNAPSHOT_VERSION
+    snapshot = _read_skills_snapshot_file()
+    if (snapshot is not None and snapshot.get("version") == _SKILLS_SNAPSHOT_VERSION
             and snapshot.get("manifest") == (manifest if manifest is not None else _build_skills_manifest(skills_dir))):
         return snapshot
     return None
@@ -1431,9 +1566,9 @@ def _build_skills_system_prompt_inner(
     # Skill files are part of the key: another process (a hub install in a second terminal, the curator
     # inside the gateway, a git pull of an external dir) never clears this process's LRU, so a key of
     # config alone served the pre-change index to every running session until restart (#92313).
-    manifest = _build_skills_manifest(skills_dir)
+    manifest = _skills_manifest_for_prompt(skills_dir)
     files = frozenset((rel, *sig) for rel, sig in manifest.items())
-    files |= {(str(d), rel, *sig) for _, d in extra_roots for rel, sig in _build_skills_manifest(d).items()}
+    files |= {(str(d), rel, *sig) for _, d in extra_roots for rel, sig in _skills_manifest_for_prompt(d).items()}
     cache_key = (
         str(skills_dir), tuple((t, str(d)) for t, d in extra_roots), files,
         tuple(sorted(str(t) for t in (available_tools or set()))),
@@ -1501,8 +1636,11 @@ def _build_skills_system_prompt_inner(
     if snapshot is None:  # persist for fast cold-start reuse (best-effort)
         category_descriptions.update(_read_category_descriptions(skills_dir, "Could not read skill description %s: %s"))
         try:
+            # The manifest this build already resolved, never a second walk: this is the branch that
+            # runs when the tree DID change, i.e. the one build that must stay cheap on the loop. A
+            # manifest that a concurrent refresh has since replaced only costs one extra rebuild.
             atomic_json_write(_skills_prompt_snapshot_path(), {
-                "version": _SKILLS_SNAPSHOT_VERSION, "manifest": _build_skills_manifest(skills_dir),
+                "version": _SKILLS_SNAPSHOT_VERSION, "manifest": manifest,
                 "skills": [entry for entry, _ in candidates], "category_descriptions": category_descriptions,
             })
         except Exception as e:
