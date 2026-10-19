@@ -60,6 +60,25 @@ GATEWAY_SESSION_TICKET_DEADLINE_S = 30.0
 # owner (a dead owner closes the socket instead of going silent). Failure mode if this is wrong:
 # a run that used to die at 30 s waits longer before dying.
 GATEWAY_STARTUP_RPC_DEADLINE_S = 120.0
+# Opening-handshake budget for the run socket (``phase=ws-open``). The owner answers the upgrade
+# from its event loop, in the process running every other agent turn, so this budget is really
+# "how long may the loop stall before this run dies at admission" — the same question
+# GATEWAY_SESSION_TICKET_DEADLINE_S answers for the mint. 10 s was measured against a healthy
+# host; on this one the loop is starved continuously. Measured 2026-10-19T02:05-02:25Z (gateway
+# pid 20061, 412 threads, 70 live agents, 1-min load ~120): a trivial ``GET /healthz`` on the
+# owner's own loopback ran p50 13.0 s / max 16.3 s and two of eight exceeded 20 s, while TCP
+# connect stayed at 0.3 ms — the kernel accepts, the loop is the queue. A parallel probe of the
+# admission path reproduced the reported death exactly: ``designer`` ws-open 7.04 s (opened),
+# ``praxis`` ws-open 10.02 s (``TimeoutError: timed out during opening handshake``). 10 s sits
+# below the loop's median, which is why PRX-5511 looked like a dead Design Agent when the owner
+# was alive and serving throughout. Measured alone, the upgrade is normally instant (n=8, p50
+# 0.08 s / p90 0.29 s) and bimodal: the tail is a stall spike landing inside the handshake
+# (7.5-10.0 s seen, 10.02 s observed failing). This host's documented stall tail is p90 19.4 s /
+# max 24.5 s on the owner's ``identify`` verb (see GATEWAY_WS_PING_TIMEOUT_S). 30 s sits just
+# above that tail and matches GATEWAY_SESSION_TICKET_DEADLINE_S, which answers the identical
+# question ("how long may the loop stall") for the mint. A genuinely dead owner is not slow, it
+# is refused or FIN'd, which fails this immediately rather than at the deadline.
+GATEWAY_WS_OPEN_TIMEOUT_S = 30.0
 # Canonical ``/compress`` answers only after the summary call(s) and the commit: a long session's
 # summary routinely takes more than 30 s (``auxiliary.compression.timeout`` defaults to 120 s per
 # request, ``compression.context_total_ceiling_seconds`` to 600 s). Same budget as Desktop's
@@ -350,7 +369,8 @@ async def connect_gateway(endpoint=None, subject=None):
         # The gateway is a loopback (or explicitly named) peer, never something to route through the
         # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
         # cannot reach 127.0.0.1 turns every launch into a 10 s open timeout.
-        async with connect(url, subprotocols=protocols, open_timeout=10, max_size=8 * 1024 * 1024,
+        async with connect(url, subprotocols=protocols, open_timeout=GATEWAY_WS_OPEN_TIMEOUT_S,
+                           max_size=8 * 1024 * 1024,
                            proxy=None,
                            # Explicit keepalive: the default 20 s pong deadline is inside this
                            # host's measured stall distribution (see GATEWAY_WS_PING_TIMEOUT_S).
