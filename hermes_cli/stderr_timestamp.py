@@ -48,10 +48,91 @@ def _open_log(log_path: Path) -> TextIO:
     return log_path.open("a", encoding="utf-8", buffering=1)
 
 
+_ERROR_LOG_ROTATE_ENV = "HERMES_ERROR_LOG_MAX_BYTES"
+# 64 MiB: a week of gateway noise, and small enough that `grep`/`hermes logs` stay interactive. The
+# file reached 421 MB on this host, where one diagnostic pass took 2-4 minutes and every scan of it was
+# loop-visible I/O (PRA-6517).
+_DEFAULT_ERROR_LOG_MAX_BYTES = 64 * 1024 * 1024
+_ERROR_LOG_BACKUPS = 2
+
+
+def _error_log_max_bytes(override: int | None = None) -> int:
+    """Cap from the argument, else ``HERMES_ERROR_LOG_MAX_BYTES``, else 64 MiB; 0 disables rotation."""
+    if override is not None:
+        return max(0, int(override))
+    raw = os.environ.get(_ERROR_LOG_ROTATE_ENV, "").strip()
+    try:
+        return max(0, int(raw)) if raw else _DEFAULT_ERROR_LOG_MAX_BYTES
+    except ValueError:
+        return _DEFAULT_ERROR_LOG_MAX_BYTES
+
+
+class _BoundedLogWriter:
+    """Append lines to *log_path*, rotating to ``<name>.1`` / ``<name>.2`` at a byte cap.
+
+    The wrapper owns this file for the life of the supervised gateway, so the cap has to be enforced
+    here: nothing else ever reopens or truncates it (that is why it grew to 421 MB).
+    """
+
+    def __init__(self, log_path: Path, max_bytes: int | None = None) -> None:
+        self.log_path = Path(log_path)
+        self.max_bytes = _error_log_max_bytes(max_bytes)
+        self._file: TextIO | None = None
+        self._open()
+
+    def _open(self) -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.log_path.open("a", encoding="utf-8", buffering=1)
+
+    def _size(self) -> int:
+        try:
+            return self.log_path.stat().st_size
+        except OSError:
+            return 0
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def rotate(self) -> None:
+        """Shift live → .1 → .2, drop the oldest, and reopen a fresh live file."""
+        self.close()
+        try:
+            oldest = self.log_path.with_name(f"{self.log_path.name}.{_ERROR_LOG_BACKUPS}")
+            oldest.unlink(missing_ok=True)
+            for index in range(_ERROR_LOG_BACKUPS - 1, 0, -1):
+                src = self.log_path.with_name(f"{self.log_path.name}.{index}")
+                if src.exists():
+                    src.replace(self.log_path.with_name(f"{self.log_path.name}.{index + 1}"))
+            if self.log_path.exists():
+                self.log_path.replace(self.log_path.with_name(f"{self.log_path.name}.1"))
+        except OSError:
+            # A rotation that cannot rename must not lose the stream: reopen and keep appending.
+            pass
+        self._open()
+        if self._file is not None:
+            self._file.write(f"{timestamp()} [gateway-log] rotated at {self.max_bytes} bytes\n")
+
+    def write_line(self, line: str) -> None:
+        stamped = stamp_line(line)
+        if self.max_bytes and self._size() + len(stamped.encode("utf-8")) > self.max_bytes:
+            self.rotate()
+        if self._file is not None:
+            self._file.write(stamped)
+            self._file.flush()
+
+
 def _copy_stderr_with_timestamps(stderr: BinaryIO, log_path: Path) -> None:
-    with _open_log(log_path) as log_file:
+    with _BoundedLogWriter(log_path) as writer:
         for raw_line in iter(stderr.readline, b""):
-            _write_timestamped_line(log_file, raw_line.decode("utf-8", errors="replace"))
+            writer.write_line(raw_line.decode("utf-8", errors="replace"))
 
 
 def _copy_stdout_with_timestamps(stdout: BinaryIO) -> None:

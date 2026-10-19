@@ -1163,18 +1163,48 @@ def _build_snapshot_entry(skill_file: Path, skills_dir: Path, frontmatter: dict,
     return entry
 
 
+# Parsed SKILL.md frontmatter, keyed by (path, *stat signature). A skills tree changes one file at a
+# time (an install, the curator, another agent's skill dir symlinked in), and the disk snapshot is
+# keyed on the WHOLE manifest — so every such change made `_load_skills_snapshot` miss and the build
+# re-open + re-parse every SKILL.md in the tree (495 files here: 4-8 s, and tens of seconds while a
+# co-tenant scan contends for the disk). The manifest stat is the invalidation: unchanged files cost a
+# dict lookup, only the changed one is read again (PRA-6517).
+_SKILL_PARSE_CACHE: dict[tuple[str, tuple], tuple[bool, dict, str]] = {}
+_SKILL_PARSE_CACHE_MAX = 4096
+_SKILL_PARSE_CACHE_LOCK = threading.Lock()
+
+
 def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
-    """Read a SKILL.md once -> (is_compatible, frontmatter, description); errors yield (True, {}, "")."""
+    """Read a SKILL.md once -> (is_compatible, frontmatter, description); errors yield (True, {}, "").
+
+    Memoised on the file's stat signature, so a re-scan after one skill changed re-reads one file.
+    """
+    try:
+        key = (str(skill_file), tuple(file_signature(skill_file.stat())))
+    except OSError:
+        key = None
+    if key is not None:
+        with _SKILL_PARSE_CACHE_LOCK:
+            cached = _SKILL_PARSE_CACHE.get(key)
+        if cached is not None:
+            return cached
     try:
         raw = skill_file.read_text(encoding="utf-8-sig")
         frontmatter, _ = parse_frontmatter(raw)
         # Host-platform / runtime-environment gates are offer-time only; explicit loads bypass them.
         if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter) or not skill_matches_apps(frontmatter):
-            return False, frontmatter, extract_skill_description(frontmatter)
-        return True, frontmatter, extract_skill_description(frontmatter)
+            result: tuple[bool, dict, str] = (False, frontmatter, extract_skill_description(frontmatter))
+        else:
+            result = (True, frontmatter, extract_skill_description(frontmatter))
     except Exception as e:
         logger.warning("Failed to parse skill file %s: %s", skill_file, e)
-        return True, {}, ""
+        result = (True, {}, "")
+    if key is not None:
+        with _SKILL_PARSE_CACHE_LOCK:
+            if len(_SKILL_PARSE_CACHE) >= _SKILL_PARSE_CACHE_MAX:
+                _SKILL_PARSE_CACHE.clear()  # bounded, and a clear is always safe: the stat key is the truth
+            _SKILL_PARSE_CACHE[key] = result
+    return result
 
 
 def _skill_should_show(
