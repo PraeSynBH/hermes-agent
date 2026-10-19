@@ -934,6 +934,29 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
                                  _windows_gateway_resume=_windows_gateway_resume)
 
 
+def _refuse_stopped_git_operation(git_cmd, root=None) -> None:
+    """A pull that stopped in a merge/rebase must never hand back a successful update (PRA-6515).
+
+    The 2026-10-19 outage was a rebase that stopped at commit 11 of 20 and left conflict markers in
+    the file every launch imports; the update reported success and the fleet served a tree that
+    could not be imported. ``.git/rebase-merge`` (or ``MERGE_HEAD``) at exit *is* the degradation,
+    so name the operation, the conflicted file and the commit, and exit non-zero.
+    """
+    root = Path(root if root is not None else _m().PROJECT_ROOT)
+    operation = git_operation_in_progress(root)
+    if not operation:
+        return
+    unmerged = [p for p in (_git_run(git_cmd, ["diff", "--name-only", "--diff-filter=U"], cwd=root).stdout or "").split() if p]
+    head = _capture_head_sha(git_cmd, root) or "?"
+    print()
+    print(f"✗ `hermes update` stopped a Git {operation} in {root} — the install is degraded and no run can start from it.")
+    print(f"  Conflicted: {', '.join(unmerged) or '(git names no unmerged path)'}")
+    print(f"  At commit: {head}")
+    print(f"  Resolve it, or run `git -C {root} {operation} --abort`, then re-run `hermes update`.")
+    _record_stop("checkout_broken")
+    sys.exit(1)
+
+
 def _roll_back_broken_update(git_cmd, pre_pull_sha, failing_path, syntax_error, *, rollback_branch=None,
                              header="✗ Pulled code has a syntax error in a critical file:",
                              _windows_gateway_resume=None, stop_class="syntax_rollback") -> NoReturn:
@@ -1173,6 +1196,9 @@ def _pull_updates(
         _rollback_if_pulled_syntax_error(
             git_cmd, pre_sync_sha or pre_pull_sha, rollback_branch=rollback_branch,
             _windows_gateway_resume=_windows_gateway_resume)
+        # A tree move that stopped in a merge/rebase serves conflict markers to every run: never
+        # claim success for it (PRA-6515).
+        _refuse_stopped_git_operation(git_cmd)
         if sync_upstream:
             # Only a validated update is published to the fork (#97052 sync, after the commit point).
             _push_synced_fork(git_cmd, _m().PROJECT_ROOT)

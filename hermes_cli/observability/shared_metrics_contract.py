@@ -500,6 +500,7 @@ UPDATE_STOP_CLASSES = frozenset({
     "branch_missing",         # the target branch exists neither locally nor on origin
     "branch_unsupported",     # --branch on the Windows ZIP fallback
     "channel_unresolved",     # the update channel could not be resolved
+    "checkout_broken",        # a tree move stopped in a rebase/merge: the install cannot run (PRA-6515)
     "checkout_move_failed",   # git could not move the checkout (ff refused, reset or switch failed)
     "commit_point_refused",   # the commit point could not be armed durably; nothing moved
     "detached_head",          # a detached checkout stayed put, or its commits could not be backed up

@@ -544,6 +544,25 @@ def _settle_interrupted_update() -> None:
 _settle_interrupted_update()
 
 
+def _refuse_broken_checkout() -> None:
+    """Name a working tree no launch can import from, before anything imports it (PRA-6515).
+
+    An unresolved merge conflict left by a stopped pull killed every run for 3 h 22 m at import in
+    ~4 s, and the adapter recorded each one as ``adapter_failed`` — the code the gateway/handshake
+    timeouts carry. :mod:`hermes_cli._checkout_preflight` reports that tree as ``checkout_broken``
+    and exits 78 instead; ``hermes update``/``pm``/``doctor`` pass through, because they are how it
+    gets repaired.
+    """
+    try:
+        from hermes_cli._checkout_preflight import refuse_broken_launch
+    except ImportError:
+        return  # a tree without the preflight: the imports below report the real damage
+    refuse_broken_launch()
+
+
+_refuse_broken_checkout()
+
+
 def _pin_launcher_home() -> None:
     """A minted launcher (``hermes_cli._launchers``) pins ``HERMES_HOME`` to the install's default
     root. That needs ``hermes_constants`` from the checkout, so the launcher asks for it here, after
