@@ -357,6 +357,9 @@ class _DeadlineWorker(threading.Thread):
         with self._pool._lock:
             while self._job is None:
                 if not self._cond.wait(_WORKER_IDLE_EXIT_S):
+                    # A submit that won the lock just as the wait expired still owns this worker.
+                    if self._job is not None:
+                        break
                     self._pool._retire(self)
                     return None
             job, self._job = self._job, None
