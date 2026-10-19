@@ -275,3 +275,81 @@ def test_a_mid_run_body_timeout_is_not_an_admission_timeout(monkeypatch):
         asyncio.run(run())
     assert not isinstance(caught.value, gateway_client.GatewayAdmissionTimeout)
     assert "phase=session" in str(caught.value)
+
+
+def test_the_budget_comes_from_config_yaml_with_a_floor():
+    """``gateway.admission_budget_seconds`` raises the budget, never lowers it (PRX-5598).
+
+    The value is host-dependent — a loop that stalls 10-25 s under load 38 (2026-10-19) is survivable
+    only by waiting longer — so it has to be tunable from config.yaml; and the floor keeps a typo or
+    a 5 s "fix" from killing runs sooner than the class above was designed for.
+    """
+    from hermes_cli import gateway_client
+    from hermes_constants import get_hermes_home
+
+    config = get_hermes_home() / "config.yaml"
+    config.write_text("gateway:\n  admission_budget_seconds: 300\n", encoding="utf-8")
+    assert gateway_client.admission_budget_seconds() == 300.0
+    config.write_text("gateway:\n  admission_budget_seconds: 30\n", encoding="utf-8")
+    assert gateway_client.admission_budget_seconds() == gateway_client.GATEWAY_ADMISSION_BUDGET_S
+    config.write_text("gateway:\n  admission_budget_seconds: nonsense\n", encoding="utf-8")
+    assert gateway_client.admission_budget_seconds() == gateway_client.GATEWAY_ADMISSION_BUDGET_S
+    config.unlink()
+    assert gateway_client.admission_budget_seconds() == gateway_client.GATEWAY_ADMISSION_BUDGET_S
+
+
+@pytest.mark.platforms("posix")
+def test_a_death_at_the_budget_reports_the_owner_loop_and_the_load():
+    """The failure line carries what nobody could see on 2026-10-19: the stall and the load.
+
+    The owner's loopback witness is the loop-tick socket it already serves; sampling it here is a
+    millisecond round trip on a healthy loop, and a no-answer (or an old build with no witness) must
+    degrade to "no number", never to a healthy-looking one.
+    """
+    import os
+    import shutil
+    import socket
+    import tempfile
+    import threading
+    from pathlib import Path
+
+    from hermes_cli import gateway_client
+
+    # AF_UNIX paths cap out near 104 bytes, which a pytest tmp_path is not: same reason the owner
+    # keeps a TCP fallback for its witness.
+    home = Path(tempfile.mkdtemp(prefix="adm-", dir="/tmp"))
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        (home / "state").mkdir()
+        server.bind(str(home / "state" / f"gateway.loop-tick.{os.getpid()}.sock"))
+        server.listen(1)
+
+        def answer():
+            conn, _address = server.accept()
+            with conn:
+                conn.recv(1)
+                conn.sendall(b"1")
+
+        thread = threading.Thread(target=answer, daemon=True)
+        thread.start()
+        try:
+            evidence = gateway_client.admission_stall_evidence([home])
+        finally:
+            thread.join(10)
+    finally:
+        server.close()
+        shutil.rmtree(home, ignore_errors=True)
+
+    assert evidence is not None and "owner_loop=" in evidence, evidence
+    assert "load1=" in evidence, evidence
+    error = gateway_client.GatewayAdmissionTimeout("boom", phase="session", elapsed=120.0,
+                                                   evidence=evidence)
+    line = str(error)
+    assert "budget=120s" in line and "owner_loop=" in line and "load1=" in line
+
+    # No witness anywhere: the loop number is absent rather than fabricated.
+    empty = Path(tempfile.mkdtemp(prefix="adm-", dir="/tmp"))
+    try:
+        assert "owner_loop=" not in (gateway_client.admission_stall_evidence([empty]) or "")
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)

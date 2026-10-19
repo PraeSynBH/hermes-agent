@@ -322,11 +322,19 @@ def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0)
         return GatewayDiscovery("inaccessible", reason_code="invalid_control_peer")
 
 
-def _update_fenced(homes) -> bool:
-    """True while an update owns the install, judged the way main's launchers and the Desktop
-    judge ``.hermes-update-in-progress``: a live (or still being written) marker, or a dead or
-    malformed one while the checkout lock is held (a killed update's tree still runs). A dead
-    marker over a free lock is a killed update: it never blocks a launch.
+def _update_fence(homes) -> str | None:
+    """The live update fence on ``homes`` as a bounded one-liner naming its owner, or None.
+
+    Judged the way main's launchers and the Desktop judge ``.hermes-update-in-progress``: a live
+    (or still being written) marker, or a dead or malformed one while the checkout lock is held (a
+    killed update's tree still runs). A dead marker over a free lock is a killed update: it never
+    blocks a launch.
+
+    The owner is named because the admission path now waits the fence out instead of refusing at
+    t=0: a run that dies on it has to say WHO it waited on, and 2026-10-19's ``update_paused``
+    lines named neither pid nor update — six dead runs and a receipt dir to read by hand. The run
+    id is the marker's ``run:<id>`` line (A7 rule 6, the Desktop update run's correlation id),
+    which ``hermes update`` writes and every reader already tolerates.
 
     A live owner fences only while its marker is being touched: ``hermes update`` claims it before
     it knows whether the checkout moves at all, and a claim held through a slow fetch, a parked
@@ -345,33 +353,42 @@ def _update_fenced(homes) -> bool:
         path = fence_home / update_lock.MARKER_NAME
         try:
             raw = path.read_bytes()
-            if not raw:
+            age = max(0.0, time.time() - path.stat().st_mtime)
+            if not raw and age < update_lock.EMPTY_MARKER_GRACE_SECONDS:
                 # An exclusive first publish in flight (contract A3), not yet a dead claim.
-                if time.time() - path.stat().st_mtime < update_lock.EMPTY_MARKER_GRACE_SECONDS:
-                    return True
+                return f"update fence live: marker={path} (a claim still being published)"
         except FileNotFoundError:
             continue
         except OSError:
-            return True
-        if update_lock.judge_marker(raw)[0] in {"live", "ours"}:
-            if update_lock.marker_activity_fresh(path):
-                return True
+            return f"update fence live: marker={path} (unjudgeable: it cannot be read)"
+        verdict, owner, run = update_lock.judge_marker(raw)
+        if verdict in {"live", "ours"} and update_lock.marker_activity_fresh(path):
+            return (f"update fence live: pid={owner} update_run={run or 'unknown'} "
+                    f"age={age:.0f}s marker={path}")
         # Whatever the claim says, a held checkout lock is a tree being written (a killed
         # update's completion, build or git still runs) and is never raced.
         if update_lock.checkout_lock_held():
-            return True
-    return False
+            return (f"update fence live: pid={owner or 0} update_run={run or 'unknown'} "
+                    f"age={age:.0f}s marker={path} (its owner is gone; a process it started still "
+                    "holds the checkout lock)")
+    return None
 
 
-def _fenced_verdict(home: Path, timeout: float) -> GatewayDiscovery:
+def _update_fenced(homes) -> bool:
+    """True while an update owns the install (``_update_fence`` names it)."""
+    return _update_fence(homes) is not None
+
+
+def _fenced_verdict(home: Path, timeout: float, fence: str) -> GatewayDiscovery:
     """What ensure answers while an update owns the install. The update's own drain
     (``pause-for-update``) is a restart's after-turn wait whose owner may hold a turn parked on
     approval/clarify, so it is handed out for clients to answer it (#139041). Discovery only:
-    nothing is started or replaced while fenced, and any other owner state stays ``update_paused``."""
+    nothing is started or replaced while fenced, and any other owner state stays ``update_paused``
+    with ``fence`` — who holds it, for how long — in the detail the client reports."""
     observed = discover_gateway_endpoint(home, timeout=timeout)
     if observed.state == "draining" and attachable(observed):
         return observed
-    return GatewayDiscovery("draining", reason_code="update_paused")
+    return GatewayDiscovery("draining", reason_code="update_paused", detail=fence)
 
 
 _REPLACE_FAILED_DETAIL = "an older Hermes gateway still owns this profile after a stop; run: hermes gateway stop"
@@ -434,11 +451,12 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
     retiring = False
     replaced: set[Path] = set()
     delay = 0.025
+    # The install-root marker also covers profiles.
+    fence_homes = {home, get_process_hermes_home(), get_default_hermes_root()}
     try:
         while True:
-            # The install-root marker also covers profiles.
-            if _update_fenced({home, get_process_hermes_home(), get_default_hermes_root()}):
-                return _fenced_verdict(home, remaining(deadline))
+            if fence := _update_fence(fence_homes):
+                return _fenced_verdict(home, remaining(deadline), fence)
             # Poll BEFORE discovering: an exit observed first, then "absent", cannot be a child that
             # published its owner a moment later. A winning racer shows up as starting/ready instead.
             status = child.poll() if child is not None else None

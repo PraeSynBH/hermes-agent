@@ -2131,10 +2131,9 @@ DEFAULT_CONFIG = {
         # "discord connect timed out" / "Timeout waiting for connection to Discord" restart loops. ``0`` or
         # negative disables the timeout entirely (wait indefinitely).
         "platform_connect_timeout": 30,
-        # Event-loop liveness watchdog: a daemon thread probes the asyncio loop; after consecutive
-        # missed probes it dumps all-thread stacks and hard-exits with the service-restart code so
-        # systemd/launchd revives the process instead of leaving a wedged-but-alive zombie.
-        # Set to false to disable. See #69089.
+        # Event-loop liveness watchdog: a daemon thread probes the asyncio loop; consecutive missed
+        # probes dump all-thread stacks and hard-exit with the service-restart code, so systemd or
+        # launchd revives the process instead of leaving a wedged-but-alive zombie. False disables.
         "loop_watchdog": True,
         # Watchdog tuning (defaults mirror gateway/shutdown_watchdog.py): probe_interval = seconds
         # between probes; probe_timeout = seconds before an unprocessed probe counts as a miss;
@@ -2143,6 +2142,7 @@ DEFAULT_CONFIG = {
         "loop_watchdog_probe_interval_s": 30.0,
         "loop_watchdog_probe_timeout_s": 10.0,
         "loop_watchdog_max_strikes": 3,
+        "admission_budget_seconds": 120.0,  # also the floor; raise on a stalling host
         # Allow all users without allowlists (security opt-in).
         "allow_all_users": False,
         # Bot-to-bot loop guard: admitted bot messages per conversation before a cooldown.
