@@ -59,6 +59,16 @@ def profile_serve_signature(home: Path) -> tuple:
     return tuple(sig)
 
 
+def _serve_signatures(homes: dict[str, Path]) -> dict[str, tuple]:
+    """Off-loop half of the changed-profile diff: one batched stat pass per reconcile cycle.
+
+    ``profile_serve_signature`` is two ``os.stat`` calls per served profile, run every 30 s over
+    every served home. Inline on the loop that is a whole stat sweep competing with turn execution
+    for the GIL; the sibling hook-consent sync next door already hops off-loop for the same reason.
+    """
+    return {name: profile_serve_signature(home) for name, home in homes.items()}
+
+
 class GatewayProfileReconcileMixin:
     """Runtime reconciliation of the multiplexed served-profile set (hot add / unroute / credential-add)."""
 
@@ -163,7 +173,8 @@ class GatewayProfileReconcileMixin:
             return {**result, "pending": True, "served_profiles": self.served_profile_names()}
         async with self._reconcile_lock():
             active = getattr(self, "_primary_profile_name", None) or "default"
-            live = {str(name): Path(home) for name, home in profiles_to_serve(multiplex=True)}
+            live = {str(name): Path(home) for name, home in
+                    await asyncio.to_thread(profiles_to_serve, True)}
             listed = set(live)  # a probe skip below is not a deletion: it never clears a parked verdict
             known = dict(self._served_profile_homes or {})
             from gateway.status import live_gateway_pid_for_home
@@ -212,8 +223,12 @@ class GatewayProfileReconcileMixin:
             retry_parked = reason == "control-socket"
             added = [n for n in live if n not in known and n != active and (retry_parked or n not in parked)]
             removed = [n for n in known if n not in live and n != active]
-            changed = [n for n in live if n in known and n != active and n not in added
-                       and profile_serve_signature(live[n]) != sigs.get(n)]
+            # Signature compare off the loop too: it stats config.yaml + .env for every served
+            # profile, and this runs on the 30 s watcher while turns are executing.
+            candidates = [n for n in live if n in known and n != active and n not in added]
+            current_sigs = await asyncio.to_thread(
+                _serve_signatures, {n: live[n] for n in candidates})
+            changed = [n for n in candidates if current_sigs[n] != sigs.get(n)]
             current = {n: h for n, h in live.items() if n in known or n == active}
             return await self._apply_profile_changes(
                 current, added, removed, changed, reason=reason, live=live, result=result)
@@ -285,7 +300,7 @@ class GatewayProfileReconcileMixin:
         self._served_profile_signatures = sigs
         # A profile deleted while an adapter above was still connecting must not be recorded back
         # (the deleter's signal timed out against this lock and rmtree already ran).
-        live_now = {str(name) for name, _home in profiles_to_serve(multiplex=True)}
+        live_now = {str(name) for name, _home in await asyncio.to_thread(profiles_to_serve, True)}
         for name in [n for n in current if n not in live_now and n != active]:
             await self._unserve_profile(name, current.pop(name))
             result["removed"].append(name)
