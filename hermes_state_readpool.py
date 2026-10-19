@@ -61,6 +61,21 @@ _FD_USAGE_CACHE_SECONDS = 0.25
 
 _process_read_permits = threading.BoundedSemaphore(_READ_POOL_PROCESS_MAX)
 
+
+def _calling_on_event_loop() -> bool:
+    """True when the caller is a coroutine running on an event loop (the gateway's shared thread).
+
+    Same predicate as ``agent/prompt_builder._calling_on_event_loop``; kept local so the state
+    layer does not import the agent package.
+    """
+    try:
+        import asyncio
+
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
 # Read opens refused for low descriptor headroom — the only visible signal the
 # guard fires. Guarded by _read_budgets_lock.
 _read_open_denied_fd_headroom = 0
@@ -199,6 +214,17 @@ class _PathReadBudget:
         """Take a permit for a new read connection, or refuse (caller degrades to the
         locked writer connection). Gates, broadest first: fd headroom, process
         ceiling, this file's ceiling."""
+        # A loop thread must never take this path. Everything below it is synchronous
+        # filesystem work — a /dev/fd listing, a read-only open, and (on a permit miss)
+        # a CLOSE of an idle pooled connection to reclaim that permit — and the last of
+        # those is the one that was measured holding the gateway's event loop for 46.4 s
+        # (PRA-6517 loop-thread stack: `_acquire_process_permit -> reclaim_idle ->
+        # _evict_one_idle_read_conn -> _close_conn_logged -> close`). Refusing here makes
+        # the caller take the documented degradation (the writer connection under the
+        # lock) instead of doing descriptor work in front of every other profile's turn.
+        # Off a loop thread (CLI, workers, tests) the pool behaves exactly as before.
+        if _calling_on_event_loop():
+            return False
         if not _fd_headroom_ok():
             global _read_open_denied_fd_headroom
             with _read_budgets_lock:
