@@ -176,7 +176,7 @@ async def test_selected_profile_ticket_is_minted_on_that_profiles_own_socket(tmp
     _discover(monkeypatch, endpoint, seen)
     minted = {}
 
-    def fake_ticket(home, ep, *, purpose='interactive', scope=None, subject=None):
+    def fake_ticket(home, ep, *, purpose='interactive', scope=None, subject=None, timeout=None):
         from hermes_cli.gateway_runtime import control_home_for
         minted['socket_home'] = control_home_for(home, ep)
         minted['profile_id'] = ep.profile_id
@@ -208,7 +208,7 @@ async def test_a_multiplexed_profile_keeps_the_multiplexers_socket(tmp_path, mon
     _discover(monkeypatch, endpoint)
     minted = {}
 
-    def fake_ticket(home, ep, *, purpose='interactive', scope=None, subject=None):
+    def fake_ticket(home, ep, *, purpose='interactive', scope=None, subject=None, timeout=None):
         from hermes_cli.gateway_runtime import control_home_for
         minted['socket_home'] = control_home_for(home, ep)
         raise _StopAfterMint
@@ -272,7 +272,7 @@ async def test_dead_owner_websocket_dial_is_a_retryable_503(tmp_path, monkeypatc
     request = _standalone_request(monkeypatch, tmp_path)
     _discover(monkeypatch, _real_endpoint(_closed_port()))
     monkeypatch.setattr('hermes_cli.gateway_client._session_ticket',
-                        lambda home, ep, *, purpose='interactive', scope=None, subject=None: 'ticket')
+                        lambda home, ep, *, purpose='interactive', scope=None, subject=None, timeout=None: 'ticket')
     offline = []
     monkeypatch.setattr(web_server_sessions, '_mutate_offline_store',
                         lambda profile, actor, params: offline.append(params))

@@ -191,7 +191,7 @@ async def test_forward_wakes_on_the_completion_frame_instead_of_a_fixed_100ms_po
         endpoint = SimpleNamespace(api_origin=f'http://127.0.0.1:{port}')
         monkeypatch.setattr(gateway_runtime, 'ensure_gateway_runtime',
                             lambda home: SimpleNamespace(state='ready', endpoint=endpoint, reason_code=None))
-        monkeypatch.setattr(gateway_client, '_session_ticket', lambda home, ep: 'fixture')
+        monkeypatch.setattr(gateway_client, '_session_ticket', lambda home, ep, **kwargs: 'fixture')
         started = time.monotonic()
         receipt = await forward_to_owner(tmp_path, agent='dev', tenant='', peer='alice', context_id='ctx',
                                          input_id='i1', text='hello', timeout=10)

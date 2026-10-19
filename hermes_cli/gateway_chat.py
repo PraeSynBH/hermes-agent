@@ -10,7 +10,7 @@ import sys
 import uuid
 
 from hermes_cli.gateway_client import (GATEWAY_STARTUP_RPC_DEADLINE_S, GatewayClientError,
-                                       connect_gateway)
+                                       admission_timeout, connect_gateway)
 
 # These options change execution or require frontend facilities not yet exposed by
 # the authority. Reject them, rather than mutate process-wide gateway settings.
@@ -131,7 +131,8 @@ async def _resume(client, args, **params):
     else is a route override and refused like every other creation flag on resume."""
     key = getattr(args, "api_key", None)
     try:
-        return await client.rpc("session.resume", _timeout=GATEWAY_STARTUP_RPC_DEADLINE_S,
+        return await client.rpc("session.resume",
+                                _timeout=admission_timeout(client, GATEWAY_STARTUP_RPC_DEADLINE_S),
                                 **params, **({"api_key": key} if key else {}))
     except GatewayClientError as exc:
         if key and str(exc) == "admission_conflict":
@@ -172,7 +173,8 @@ async def run_gateway_chat(args, emitter=None):
     oneshot = bool(oneshot_prompt or getattr(args, "oneshot_exit", False) or quiet or
                    (query and not (sys.stdin.isatty() and sys.stdout.isatty())))
     async with connect_gateway() as client:
-        description = await client.rpc("runtime.describe", _timeout=GATEWAY_STARTUP_RPC_DEADLINE_S)
+        description = await client.rpc(
+            "runtime.describe", _timeout=admission_timeout(client, GATEWAY_STARTUP_RPC_DEADLINE_S))
         title = continue_title(args)
         create_if_missing = bool(title and getattr(args, "create_if_missing", False))
         latest = wants_latest(args)
@@ -221,8 +223,9 @@ async def run_gateway_chat(args, emitter=None):
             missing = sorted(set(policy) - set(parameters))
             if missing:
                 raise GatewayClientError("Gateway does not support creation options: " + ", ".join(missing))
-            snapshot = await client.rpc("session.create", _timeout=GATEWAY_STARTUP_RPC_DEADLINE_S,
-                                        request_id=uuid.uuid4().hex, source=source, **policy)
+            snapshot = await client.rpc(
+                "session.create", _timeout=admission_timeout(client, GATEWAY_STARTUP_RPC_DEADLINE_S),
+                request_id=uuid.uuid4().hex, source=source, **policy)
             if (warning := (snapshot.get("info") or {}).get("config_warning")) and not isinstance(oneshot_prompt, str):
                 print(f"Warning: {warning}", file=sys.stderr)
         if not isinstance(oneshot_prompt, str):  # main's -z writes nothing to stderr on success

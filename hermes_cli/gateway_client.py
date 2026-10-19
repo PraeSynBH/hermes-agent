@@ -47,6 +47,19 @@ GATEWAY_WS_PING_TIMEOUT_S = 300.0
 # DEFAULT_RPC_TIMEOUT and keeps margin over the widest observed answer (12.8 s) without
 # inventing a new number; a truly dead owner still fails, just 25 s later.
 GATEWAY_SESSION_TICKET_DEADLINE_S = 30.0
+# The ONE admission budget: ensure -> ticket mint -> ws-open -> ``runtime.describe`` ->
+# ``session.create``/``session.resume``, as one deadline. The per-phase numbers above are caps
+# INSIDE it, never a sum: they used to be independent, so a starved owner could burn every cap in
+# turn. Measured under a wedged owner on 2026-10-19 (fleet, 35 admissions in one minute): the run
+# survived 181 s of admission and then died with the generic "no local fallback" — 30 s describe +
+# 120 s create, plus ~31 s of ticket/ws — because no phase was accountable to the others. One
+# number also makes the failure classifiable: at 181 s a retry chain re-pays it 3 times (9 min of a
+# run's life) for an owner that is stalled, not slow.
+#
+# 120 s is not the admission latency budget (that is ~5.4 s p95 / 7.4 s max, measured over 41
+# ``ensure_session`` samples at 30 concurrent runs after the 08:23Z restart); it is the ceiling on
+# how long a run may be held before it is told, in its own error, that the OWNER was starving.
+GATEWAY_ADMISSION_BUDGET_S = 120.0
 # The run's own first in-band RPCs (``runtime.describe`` -> ``session.create``/``session.resume``)
 # are NOT prompt admissions: ``session.create`` binds the profile, loads the agent config and opens
 # the state DB on the owner's event loop, in the same process that is running every other agent
@@ -117,6 +130,41 @@ class GatewayRPCError(GatewayClientError):
         super().__init__(reason)
         self.code = code
         self.data = data or {}
+
+
+class GatewayAdmissionTimeout(GatewayClientError):
+    """The one admission budget (``GATEWAY_ADMISSION_BUDGET_S``) expired before this run was admitted.
+
+    A distinct class, not a string a consumer has to pattern-match on: a retry chain must be able to
+    tell "the owner is starving" from "this install is broken" (the class of every other
+    ``no local fallback`` failure). ``reason`` is the stable code such a chain keys on, ``phase``
+    names the stage that was left holding the deadline, and ``code_sha`` the build of the owner that
+    was holding it — the field whose absence turned the 2026-10-19 investigation into an ``lsof``
+    dig. ``str(exc)`` keeps the original wording so existing readers/log scrapers still match.
+    """
+
+    reason = "gateway_admission_timeout"
+
+    def __init__(self, detail, *, phase, elapsed, budget=GATEWAY_ADMISSION_BUDGET_S, code_sha=None):
+        self.phase, self.elapsed, self.budget = phase, elapsed, budget
+        self.code_sha = code_sha if isinstance(code_sha, str) and code_sha else None
+        owner = f", owner={self.code_sha[:12]}" if self.code_sha else ""
+        super().__init__(f"{self.reason}: {detail} (budget={budget:g}s{owner})")
+
+
+def admission_timeout(client, cap: float) -> float:
+    """``cap`` seconds, or what is left of this run's ONE admission budget when that is less.
+
+    The admission verbs (``runtime.describe`` -> ``session.create``/``session.resume``) share one
+    deadline, so a phase that ran long shortens the next instead of queueing a fresh cap behind it.
+    A spent budget returns 0: the RPC times out at once and ``connect_gateway`` turns that
+    ``TimeoutError`` into a ``GatewayAdmissionTimeout`` naming the phase and the owner build.
+
+    The deadline rides on the connection ``connect_gateway`` yields; a peer without one (a test
+    double, an embedded server) has no budget to share, and there ``cap`` is the whole story.
+    """
+    deadline = getattr(client, "admission_deadline", None)
+    return cap if deadline is None else max(0.0, min(cap, deadline - time.monotonic()))
 
 
 def _bounded_reason(value):
@@ -202,12 +250,15 @@ def put_behind(events, item):
 
 
 class GatewayClient:
-    def __init__(self, websocket):
+    def __init__(self, websocket, *, admission_deadline=None):
         self.websocket = websocket
         self.events = EventQueue(maxsize=4096)
         self.pending = {}
         self.sequence = 0
         self.reader = None
+        # ``time.monotonic()`` at which the ONE admission budget expires (``connect_gateway`` sets
+        # it); absent on a hand-built peer, which ``admission_timeout`` treats as "no budget".
+        self.admission_deadline = admission_deadline
 
     def _read_on(self):
         """Keep reading past a full queue: nothing is held, or an awaited answer may sit behind the
@@ -282,7 +333,8 @@ class GatewayClient:
             self.pending.pop(rid, None)
 
 
-def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, subject=None) -> str:
+def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, subject=None,
+                    timeout=GATEWAY_SESSION_TICKET_DEADLINE_S) -> str:
     from hermes_cli.gateway_runtime import control_home_for
     from hermes_cli.gateway_runtime_discovery import connect_private, _identify_response
     # A served secondary's ticket is minted by the multiplexer's socket, bound to the secondary.
@@ -295,10 +347,10 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, 
     }}).encode() + b"\n"
     if os.name == "nt":
         from gateway.runtime_bootstrap_windows import query_runtime_control
-        data = query_runtime_control(home, request, int(GATEWAY_SESSION_TICKET_DEADLINE_S))
+        data = query_runtime_control(home, request, int(timeout))
     else:
-        deadline = time.monotonic() + GATEWAY_SESSION_TICKET_DEADLINE_S
-        with connect_private(home, GATEWAY_SESSION_TICKET_DEADLINE_S) as peer:
+        deadline = time.monotonic() + timeout
+        with connect_private(home, timeout) as peer:
             peer.sendall(request)
             data = bytearray()
             while b"\n" not in data:
@@ -326,7 +378,8 @@ async def connect_gateway(endpoint=None, subject=None):
     rather than the socket identity; only a peer the owner already trusts may name one."""
     from websockets.asyncio.client import connect
     from hermes_constants import get_hermes_home
-    from hermes_cli.gateway_runtime import attachable, ensure_gateway_runtime, gateway_profile_home
+    from hermes_cli.gateway_runtime import (DEFAULT_ENSURE_TIMEOUT, attachable, ensure_gateway_runtime,
+                                            gateway_profile_home)
     from urllib.parse import urlsplit
 
     remote = "" if endpoint is not None else os.environ.get("HERMES_TUI_GATEWAY_URL", "").strip()
@@ -335,11 +388,31 @@ async def connect_gateway(endpoint=None, subject=None):
     # final string, so a death cannot say whether the ticket mint or the WS open burned the
     # budget. Name the phase and the elapsed time in the error itself (2026-10-18T07:00Z: 8
     # fleet deaths at load 129, 30.8-79.2 s, all reported as this one opaque string).
+    #
+    # Every phase below spends from ONE budget (``GATEWAY_ADMISSION_BUDGET_S``): each waits at most
+    # its own cap AND at most what the budget has left, so four starved phases fail at the budget
+    # instead of at their sum. Before that, ensure + ticket + ws-open + describe + create could each
+    # run their cap out in turn and the run died at ~181 s with nothing in the error to classify.
     started = time.monotonic()
+    budget = GATEWAY_ADMISSION_BUDGET_S
+    deadline = started + budget
+    owner_sha = None
+
+    def left(cap):
+        return max(0.0, min(cap, deadline - time.monotonic()))
+
+    def spent(detail):
+        """The budget is gone: one class, one stable code, the owner's build in the text."""
+        return GatewayAdmissionTimeout(detail, phase=phase, elapsed=time.monotonic() - started,
+                                       budget=budget, code_sha=owner_sha)
+
     phase = "session-ticket"
+    if left(1.0) <= 0:
+        raise spent("Gateway connection failed; no local fallback (admission budget spent before the ticket mint)")
     if endpoint is not None:
+        owner_sha = getattr(endpoint, "code_sha", None)
         ticket = await asyncio.to_thread(_session_ticket, gateway_profile_home(get_hermes_home()), endpoint,
-                                         subject=subject)
+                                         subject=subject, timeout=left(GATEWAY_SESSION_TICKET_DEADLINE_S))
         url, protocols = gateway_ws_target(endpoint, ticket)
     elif remote:
         parsed = urlsplit(remote)
@@ -352,8 +425,12 @@ async def connect_gateway(endpoint=None, subject=None):
         # A client's own start: the daemon it may launch ends itself once idle (no client, adapter,
         # cron/kanban work or admission), and the next client starts a fresh one.
         phase = "runtime"
-        result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True)
+        result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True,
+                                         timeout=left(DEFAULT_ENSURE_TIMEOUT))
         if not attachable(result):
+            # No attachable owner is NOT admission starvation: it is either a boot in progress (which
+            # a retry legitimately waits out) or a broken install (whose report the caller must read).
+            # Only an owner that ACCEPTED this client and then starved it is the admission class.
             detail = getattr(result, "detail", None)
             if result.reason_code == "runtime_exited" and detail:
                 # A multi-line startup report (redacted traceback tail + where the full log is).
@@ -362,14 +439,18 @@ async def connect_gateway(endpoint=None, subject=None):
             raise GatewayUnavailableError(f"Gateway {result.state}: {result.reason_code or 'not_ready'}{detail}",
                                           result.state)
         endpoint = result.endpoint
-        ticket = await asyncio.to_thread(_session_ticket, home, endpoint)
+        owner_sha = getattr(endpoint, "code_sha", None)
+        ticket = await asyncio.to_thread(_session_ticket, home, endpoint,
+                                         timeout=left(GATEWAY_SESSION_TICKET_DEADLINE_S))
         url, protocols = gateway_ws_target(endpoint, ticket)
     phase = "ws-open"
+    if left(1.0) <= 0:
+        raise spent("Gateway connection failed; no local fallback (admission budget spent at the ticket)")
     try:
         # The gateway is a loopback (or explicitly named) peer, never something to route through the
         # user's HTTP(S) proxy; websockets>=14 reads HTTP_PROXY/HTTPS_PROXY by default and a proxy that
         # cannot reach 127.0.0.1 turns every launch into a 10 s open timeout.
-        async with connect(url, subprotocols=protocols, open_timeout=GATEWAY_WS_OPEN_TIMEOUT_S,
+        async with connect(url, subprotocols=protocols, open_timeout=left(GATEWAY_WS_OPEN_TIMEOUT_S),
                            max_size=8 * 1024 * 1024,
                            proxy=None,
                            # Explicit keepalive: the default 20 s pong deadline is inside this
@@ -379,12 +460,18 @@ async def connect_gateway(endpoint=None, subject=None):
             if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError("Gateway protocol mismatch; update/restart required")
             phase = "session"
-            async with GatewayClient(ws) as client:
+            async with GatewayClient(ws, admission_deadline=deadline) as client:
                 yield client
     except GatewayClientError:
         raise
     except (OSError, TimeoutError) as exc:
-        raise GatewayClientError(
-            f"Gateway connection failed; no local fallback "
-            f"(phase={phase}, elapsed={time.monotonic() - started:.1f}s, "
-            f"{type(exc).__name__}: {exc})") from exc
+        detail = (f"Gateway connection failed; no local fallback (phase={phase}, "
+                  f"elapsed={time.monotonic() - started:.1f}s, {type(exc).__name__}: {exc})")
+        # A deadline that expired, or a phase that timed out against one, is starvation: the owner
+        # took the socket (or left it open) and stopped answering, so a retry re-pays the whole
+        # budget for the same result. A refusal — dial error, FIN, closed port — is NOT that: it is
+        # an absent/broken owner, which a retry legitimately rides out. Only the former gets the
+        # classifiable admission class.
+        if isinstance(exc, TimeoutError) or left(1.0) <= 0:
+            raise spent(detail) from exc
+        raise GatewayClientError(detail) from exc

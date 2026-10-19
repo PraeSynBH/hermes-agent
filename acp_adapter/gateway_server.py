@@ -14,8 +14,8 @@ from acp.schema import (
     SessionCapabilities, SessionForkCapabilities, SessionListCapabilities, SessionResumeCapabilities,
 )
 
-from hermes_cli.gateway_client import (GATEWAY_STARTUP_RPC_DEADLINE_S, GatewayClientError,
-                                       connect_gateway)
+from hermes_cli.gateway_client import (DEFAULT_RPC_TIMEOUT, GATEWAY_STARTUP_RPC_DEADLINE_S,
+                                       GatewayClientError, admission_timeout, connect_gateway)
 from hermes_constants import get_hermes_home
 from acp_adapter.gateway_reply import GatewayReplyMixin, _text
 from acp_adapter.session import _translate_acp_cwd, _normalize_cwd_for_compare
@@ -162,7 +162,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 connection = connect_gateway()
                 gateway = await connection.__aenter__()
                 try:
-                    descriptor = await gateway.rpc("runtime.describe")
+                    descriptor = await gateway.rpc(
+                        "runtime.describe", _timeout=admission_timeout(gateway, DEFAULT_RPC_TIMEOUT))
                     if descriptor.get("profile_id") != str(self._home):
                         raise GatewayClientError("profile_mismatch")
                     await self._reattach(gateway)
@@ -269,7 +270,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
 
     async def new_session(self, cwd, mcp_servers=None, **kwargs):
         client = await self._client()
-        descriptor = await client.rpc("runtime.describe")
+        descriptor = await client.rpc(
+            "runtime.describe", _timeout=admission_timeout(client, DEFAULT_RPC_TIMEOUT))
         if ("acp" not in descriptor.get("session_create", {}).get("sources", [])
                 or "acp-editor-policy-v1" not in descriptor.get("capabilities", [])):
             raise GatewayClientError("acp_policy_unavailable")
@@ -279,7 +281,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         flags = env_launch_flags()
         if flags.get("safe_mode") or flags.get("ignore_user_config"):
             flags.update(_bypass_route())
-        snapshot = await client.rpc("session.create", _timeout=GATEWAY_STARTUP_RPC_DEADLINE_S,
+        snapshot = await client.rpc(
+            "session.create", _timeout=admission_timeout(client, GATEWAY_STARTUP_RPC_DEADLINE_S),
             request_id=uuid.uuid4().hex, source="acp", cwd=_translate_acp_cwd(cwd),
             editor={"mcp_servers": [s.model_dump(by_alias=True) for s in mcp_servers or []],
                     "edit_approval_policy": "ask"}, **flags)
