@@ -181,10 +181,19 @@ hermes gateway status --system         # Linux only: inspect the system service 
 
 ### Stack dump on demand (`SIGUSR2`)
 
-On Linux and macOS, `kill -USR2 <gateway pid>` appends a dump of every thread's
+On Linux and macOS, `kill -USR2 <gateway pid>` appends the receiving thread's
 stack to `~/.hermes/logs/gateway_faulthandler.log` and the gateway keeps
 running — use it to see what a stalled or misbehaving gateway is doing without
 restarting it.
+
+The hook dumps one thread on purpose. The all-thread variant
+(`faulthandler`'s `_Py_DumpTracebackThreads`) walks every thread's C state from
+signal context, and on 2026-10-19 that walk took the shared gateway down
+mid-flight (EXC_BAD_ACCESS at 240 threads, exit 139, six in-flight runs lost).
+For the all-thread view, read the bounded `[thread-dump]` block the
+loop-liveness watchdog writes to `gateway.error.log` when the loop stops
+dispatching (below), or the one a blocked-loop deadline writes — both are built
+from `sys._current_frames()` and cannot crash the process.
 
 ### Built-in event-loop liveness watchdog
 

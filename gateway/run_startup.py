@@ -917,11 +917,23 @@ class GatewayStartupMixin:
         # SIGUSR2 stack dump to file for service managers that drop stderr; POSIX-only.
         # chain=False: SIGUSR2's default disposition is "terminate", so chaining to it
         # dumps the stacks and then kills the gateway the operator was trying to inspect.
+        #
+        # all_threads=False is load-bearing (PRA-6536). The all-thread walk is
+        # ``_Py_DumpTracebackThreads``, which reads every thread's C state from *signal context*;
+        # on 2026-10-19 it took the shared gateway down with EXC_BAD_ACCESS inside that walk
+        # (pid 67785, 240 threads, exit 139, six in-flight runs lost) — the crash stack in
+        # ``python3.14-*.ips`` and gateway.error.log:14424 is ``faulthandler_user`` ->
+        # ``faulthandler_dump_traceback`` -> ``_Py_DumpTracebackThreads``, i.e. exactly this
+        # registration, fired while the loop was blocked. A diagnostic signal must never be able
+        # to kill the process it is diagnosing, so this handler dumps only the receiving thread.
+        # The all-thread view is still available and is crash-proof: the loop-liveness watchdog
+        # and a blocked-loop deadline both write a bounded ``sys._current_frames()`` dump
+        # (``hermes_thread_dump``, ``[thread-dump]`` lines in gateway.error.log).
         _sigusr2 = getattr(signal, "SIGUSR2", None)
         if _sigusr2 is not None and hasattr(faulthandler, "register"):
             with _log_suppressed(logging.DEBUG, "Could not set up faulthandler file logging", exc_info=True):
                 faulthandler.register(
-                    _sigusr2, file=self._open_faulthandler_log(), all_threads=True, chain=False,
+                    _sigusr2, file=self._open_faulthandler_log(), all_threads=False, chain=False,
                 )
 
     async def _start_log_startup_environment(self) -> None:
