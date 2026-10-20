@@ -20,9 +20,12 @@ import socket
 import stat
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from tools.daemon_pool import DaemonThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,12 @@ _MAX_UNIX_PATH = 100  # sun_path limit is 104 on macOS/BSD, 108 on Linux; margin
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 512 * 1024
 _DEFAULT_CLIENT_TIMEOUT = 2.0
+# The control path gets its own workers: requests are short, so two cover a poll plus a burst, and
+# a third concurrent request is refused rather than queued (a silent 40 s queue is undiagnosable).
+_CONTROL_EXECUTOR_WORKERS = 2
+# Above this, the answer spent real time waiting for a worker — worth a line in a debug log even
+# when nobody reads the response envelope.
+_SLOW_QUEUE_WAIT_MS = 250.0
 
 
 def _home_hash(home: Path) -> str:
@@ -197,6 +206,10 @@ class GatewayControlServer:
         self._pointer_file: Optional[Path] = None
         self._fallback_root: Optional[Path] = None  # mkdtemp root created for a squatted fallback
         self._file_identities = {}
+        # One token per control worker: a request either takes a free worker or is refused at once,
+        # so this pool never grows a queue behind a handler that is stuck on a slow reconcile.
+        self._control_slots = threading.Semaphore(_CONTROL_EXECUTOR_WORKERS)
+        self._control_executor: Optional[DaemonThreadPoolExecutor] = None
         self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "identify": build_identify_payload, "status": build_status_payload, **(verb_handlers or {})}
 
@@ -270,6 +283,11 @@ class GatewayControlServer:
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(self._pipe_server.close)
         self._server = self._pipe_server = None
+        if self._control_executor is not None:
+            # Daemon workers, and admission caps in-flight work at the pool size: nothing is queued
+            # to cancel, and a wedged handler must never hold interpreter exit.
+            self._control_executor.shutdown(wait=False)
+            self._control_executor = None
         self.cleanup_files()
 
     def cleanup_files(self) -> None:
@@ -286,9 +304,24 @@ class GatewayControlServer:
                 self._fallback_root.rmdir()
             self._fallback_root = None
 
-    def handle_request_line(self, raw: bytes, peer_subject: Optional[str] = None) -> bytes:
-        """One JSON request line -> one JSON response line. Never raises (shared by POSIX + pipe)."""
+    def handle_request_line(self, raw: bytes, peer_subject: Optional[str] = None,
+                            handoff: Optional[float] = None) -> bytes:
+        """One JSON request line -> one JSON response line. Never raises (shared by POSIX + pipe).
+
+        ``handoff`` is the monotonic time the control pool was handed this request; passing it adds
+        ``queue_wait_ms`` (loop hand-off to worker start) and ``handler_ms`` (worker start to the
+        answer, parse included) to the envelope. The pipe transport and direct callers pass none.
+        Those two numbers are the whole point of PRA-6513: if the wait is in ``queue_wait_ms`` the
+        request was stuck behind another worker, and only if it is in the loop's hand-off is the
+        event loop itself the problem.
+        """
+        return self._encode_response(self._answer_for(raw, peer_subject, handoff))
+
+    def _answer_for(self, raw: bytes, peer_subject: Optional[str],
+                    handoff: Optional[float]) -> dict[str, Any]:
+        """The response envelope for one request line; never raises."""
         request_id: Any = None
+        started = time.monotonic()
         try:
             request = json.loads(raw.decode("utf-8"))
             if not isinstance(request, dict):
@@ -315,18 +348,33 @@ class GatewayControlServer:
                 wants_params = "params" in inspect.signature(handler).parameters
                 response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION,
                             "result": handler(params) if wants_params else handler()}
-        except Exception as exc:
+        # Whatever a verb handler raises, the peer must still get a structured JSON error line: a
+        # dropped connection reads as a dead gateway and sends every consumer to the scan fallback.
+        except Exception as exc:  # health: allow BLE001 -- the control socket's answer boundary; type+message go into the error line, never swallowed
             response = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "protocol": CONTROL_PROTOCOL_VERSION}
         if request_id is not None:
             response["id"] = request_id
+        if handoff is not None:
+            queue_wait_ms = (started - handoff) * 1000
+            response["queue_wait_ms"] = round(queue_wait_ms, 2)
+            response["handler_ms"] = round((time.monotonic() - started) * 1000, 2)
+            if queue_wait_ms >= _SLOW_QUEUE_WAIT_MS:
+                logger.debug("Control request queued %.0f ms for a worker (handler %.0f ms)",
+                             queue_wait_ms, response["handler_ms"])
+        return response
+
+    def _encode_response(self, response: dict[str, Any]) -> bytes:
         try:
             encoded = json.dumps(response, default=str).encode("utf-8")
-        except Exception:
+        # A handler's result is arbitrary; anything `default=str` cannot render must still come back
+        # as a JSON line, not as a dropped connection.
+        except Exception:  # health: allow BLE001 -- fail into a JSON line: a dropped connection would read as a dead gateway
             encoded = b'{"ok": false, "error": "response serialization failed"}'
         if len(encoded) > _MAX_RESPONSE_BYTES:
             # Structured and distinct: a caller must not read an oversized answer as a drain.
             too_large: dict[str, Any] = {"ok": False, "error": "response_too_large", "code": "response_too_large",
                                          "limit": _MAX_RESPONSE_BYTES, "protocol": CONTROL_PROTOCOL_VERSION}
+            request_id = response.get("id")
             if isinstance(request_id, (int, str)) and len(str(request_id)) <= 128:
                 too_large["id"] = request_id
             encoded = json.dumps(too_large).encode("utf-8")
@@ -381,10 +429,7 @@ class GatewayControlServer:
             raw = await asyncio.wait_for(reader.readline(), timeout=_DEFAULT_CLIENT_TIMEOUT)
             if not raw or len(raw) > _MAX_REQUEST_BYTES:
                 return
-            # Handlers read disk; keep that off the loop that drives every platform
-            # adapter so a fast-polling consumer can't stall heartbeats.
-            response = await asyncio.get_running_loop().run_in_executor(
-                None, self.handle_request_line, raw.rstrip(b"\n"), self._posix_peer_subject(writer))
+            response = await self._answer_off_loop(raw.rstrip(b"\n"), self._posix_peer_subject(writer))
             writer.write(response)
             await asyncio.wait_for(writer.drain(), timeout=_DEFAULT_CLIENT_TIMEOUT)
         except (TimeoutError, ConnectionError, OSError):
@@ -394,6 +439,45 @@ class GatewayControlServer:
         finally:
             with contextlib.suppress(Exception):
                 writer.close()
+
+    async def _answer_off_loop(self, raw: bytes, peer_subject: Optional[str]) -> bytes:
+        """Answer on this server's own pool: a free worker, or an immediate refusal — never a queue.
+
+        Handlers read disk, so they stay off the loop that drives every platform adapter. The pool is
+        the server's own rather than the loop's default one: that default carries every
+        ``asyncio.to_thread`` in the process — turn tools and the profile reconcile sweep alike — and
+        a control answer queued behind them is indistinguishable from a dead gateway to a consumer.
+        """
+        handoff = time.monotonic()
+        if not self._control_slots.acquire(blocking=False):
+            return _busy_response(raw, (time.monotonic() - handoff) * 1000)
+        future = self._control_pool().submit(self._run_handled, raw, peer_subject, handoff)
+        return await asyncio.wrap_future(future)
+
+    def _control_pool(self) -> DaemonThreadPoolExecutor:
+        """The control pool, created on first use so a server that never serves spawns no threads."""
+        if self._control_executor is None:
+            self._control_executor = DaemonThreadPoolExecutor(
+                max_workers=_CONTROL_EXECUTOR_WORKERS, thread_name_prefix="hermes-control")
+        return self._control_executor
+
+    def _run_handled(self, raw: bytes, peer_subject: Optional[str], handoff: float) -> bytes:
+        try:
+            return self.handle_request_line(raw, peer_subject, handoff)
+        finally:
+            self._control_slots.release()
+
+
+def _busy_response(raw: bytes, waited_ms: float) -> bytes:
+    """Refuse at once when the control pool is drained: a fast structured failure is diagnosable
+    where a silent queue past the client's deadline is not (the client then uses its scan fallback)."""
+    payload: dict[str, Any] = {"ok": False, "error": "control_busy", "code": "control_busy",
+                               "protocol": CONTROL_PROTOCOL_VERSION, "queue_wait_ms": round(waited_ms, 2)}
+    with contextlib.suppress(Exception):
+        request_id = json.loads(raw.decode("utf-8")).get("id")
+        if isinstance(request_id, (int, str)) and len(str(request_id)) <= 128:
+            payload["id"] = request_id
+    return json.dumps(payload).encode("utf-8") + b"\n"
 
 
 class _PipeControlProtocol(asyncio.Protocol):
