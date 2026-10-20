@@ -396,6 +396,7 @@ _SHARED_HUBS = frozenset({
     "pm/__init__.py",
     "pm/paths.py",
     "pm/environments.py",
+    "pm/generation_store.py",
 })
 _E2E_LANES: dict[str, tuple[str, ...]] = {
     "e2e": (
