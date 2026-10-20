@@ -173,6 +173,10 @@ class GatewayProfileReconcileMixin:
             return {**result, "pending": True, "served_profiles": self.served_profile_names()}
         async with self._reconcile_lock():
             active = getattr(self, "_primary_profile_name", None) or "default"
+            # Demand feeds the ranking the enumeration below applies, and reads every named
+            # profile's cron store + .env: off the loop, once per tick, exactly like the served-set
+            # signature sweep further down (SOU-3075 §3.4).
+            await self._refresh_demand_offloop()
             live = {str(name): Path(home) for name, home in
                     await asyncio.to_thread(profiles_to_serve, True)}
             listed = set(live)  # a probe skip below is not a deletion: it never clears a parked verdict
@@ -215,14 +219,31 @@ class GatewayProfileReconcileMixin:
             self._profile_own_gateway_warned = blocked
             self._profile_probe_timeout_warned = timed_out
             sigs = self._served_profile_signatures or {}
-            from gateway.run_runtime import unpark_profile
+            from gateway.run_runtime import parked_profile_map, unpark_profile
             for name in [n for n in self._parked_profile_names() if n not in listed]:
                 unpark_profile(self, name)
             parked = self._parked_profile_names()
             # The watcher never re-parks the same profile every cycle; a creator's explicit signal does.
             retry_parked = reason == "control-socket"
-            added = [n for n in live if n not in known and n != active and (retry_parked or n not in parked)]
+            # A CEILING park is not a failed serve: it reverses on its own the moment the profile
+            # holds demand (or the ceiling rises), so a watcher tick must retry it. Only a park that
+            # describes the profile itself (unusable store, home owned elsewhere, config refusal)
+            # waits for an explicit rescan (SOU-3075 A2: a demand flip hot-serves without a human).
+            capacity_parked = {n for n, why in parked_profile_map(self).items()
+                               if str(why).startswith("capacity:")}
+            added = [n for n in live if n not in known and n != active
+                     and (retry_parked or n not in parked or n in capacity_parked)]
             removed = [n for n in known if n not in live and n != active]
+            # A capacity removal is not a deletion: a profile the ceiling just deferred keeps its
+            # slot for this cycle while it holds live work (a turn in flight, a /bg agent, an
+            # admitted-but-unstarted task), and is published as ``holding`` instead. Evicting it
+            # here would let a cron edit kill the profile a user is talking to (SOU-3075 §6).
+            from hermes_cli import gateway_multiplex_capacity as capacity
+            held, added = self._hold_busy_capacity_removals(
+                removed, added, live, capacity.deferred_by_capacity())
+            if held:
+                removed = [n for n in removed if n not in held]
+                live.update({n: known[n] for n in held})
             # Signature compare off the loop too: it stats config.yaml + .env for every served
             # profile, and this runs on the 30 s watcher while turns are executing.
             candidates = [n for n in live if n in known and n != active and n not in added]
@@ -230,11 +251,56 @@ class GatewayProfileReconcileMixin:
                 _serve_signatures, {n: live[n] for n in candidates})
             changed = [n for n in candidates if current_sigs[n] != sigs.get(n)]
             current = {n: h for n, h in live.items() if n in known or n == active}
-            return await self._apply_profile_changes(
-                current, added, removed, changed, reason=reason, live=live, result=result)
+            applied = await self._apply_profile_changes(
+                current, added, removed, changed, reason=reason, live=live, result=result,
+                held=held)
+            # Publication is the point of this tick, not a side effect of the served set moving:
+            # a decision that changes without changing the set (cost text, manifest health, a hold)
+            # used to be unrepresentable, and the live host showed `parked_profiles: {}` for months
+            # (SOU-3075 §0 finding 2). Both calls are dict compares when nothing moved.
+            with _log_suppressed(logging.DEBUG, "serving decision publication failed", exc_info=True):
+                from gateway.run_runtime import publish_serving_decision, sync_capacity_parked
+                sync_capacity_parked(self)
+                publish_serving_decision(self)
+            return applied
+
+    async def _refresh_demand_offloop(self) -> None:
+        """Refresh the demand snapshot for this tick, off the event loop (§3.4).
+
+        A no-op (never a failure) when the host sets no ceiling: nothing is ranked, so nothing is
+        read. The read is authoritative rather than TTL-gated so a 30 s tick always sees a cron or
+        manifest change within the acceptance window; the snapshot's own 5 s TTL then makes the
+        per-route reads inside the tick zero-I/O.
+        """
+        from hermes_cli import gateway_multiplex_capacity as capacity
+        if capacity.profile_ceiling() is None:
+            return
+        from hermes_cli import gateway_multiplex_demand as demand
+        await asyncio.to_thread(demand.refresh)
+
+    def _hold_busy_capacity_removals(self, removed, added, live, deferred_by_capacity):
+        """Hold capacity deferrals that hold live work, and park the newcomers they displace.
+
+        Returns ``(held, added)``: *held* stays served this cycle (re-added to *live* by the caller);
+        *added* no longer contains the profiles whose slots the holds took — the ceiling promoted
+        them into the held slots, so they stay parked with a reason naming the holder. Only a
+        CEILING deferral is held: a deletion stays authoritative (its directory is gone, and
+        re-adding it would resurrect a profile the operator removed). The set is recomputed every
+        tick, so it clears the tick the holder idles or the ceiling makes room.
+        """
+        from gateway.run_runtime import profile_is_busy, record_capacity_hold
+        held = [n for n in removed if n in deferred_by_capacity and profile_is_busy(self, n)]
+        displaced: list[str] = []
+        if held:
+            displaced = [n for n in added if n not in held][:len(held)]
+            for name in displaced:
+                live.pop(name, None)
+            added = [n for n in added if n not in displaced]
+        record_capacity_hold(self, held, displaced)
+        return held, added
 
     async def _apply_profile_changes(self, current, added, removed, changed, *, reason,
-                                     live=None, result=None):
+                                     live=None, result=None, held=()):
         """Apply a selected diff under the reconcile lock, shared by the watcher and the
         serve/unserve control verbs. New profiles first get a runtime (reservation + store); one
         whose home another gateway owns or whose store is unusable is parked, not served."""
@@ -300,7 +366,11 @@ class GatewayProfileReconcileMixin:
         self._served_profile_signatures = sigs
         # A profile deleted while an adapter above was still connecting must not be recorded back
         # (the deleter's signal timed out against this lock and rmtree already ran).
-        live_now = {str(name) for name, _home in await asyncio.to_thread(profiles_to_serve, True)}
+        # Held profiles are absent from the ceiling's enumeration by definition (that is why they
+        # were candidates for eviction); without the union this prune would unserve the very holder
+        # the previous step kept. A genuinely deleted profile is never in *held*.
+        live_now = ({str(name) for name, _home in await asyncio.to_thread(profiles_to_serve, True)}
+                    | {str(name) for name in held})
         for name in [n for n in current if n not in live_now and n != active]:
             await self._unserve_profile(name, current.pop(name))
             result["removed"].append(name)

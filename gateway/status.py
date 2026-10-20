@@ -1091,7 +1091,8 @@ def _prepare_runtime_status_update(
     active_agents: Any = _UNSET, active_work: Any = _UNSET, platform: Any = _UNSET, platform_state: Any = _UNSET,
     error_code: Any = _UNSET, error_message: Any = _UNSET, needs_attention: Any = _UNSET,
     retrying_since: Any = _UNSET, served_profiles: Any = _UNSET, session_store: Any = _UNSET,
-    parked_profiles: Any = _UNSET, multiplex_standalone_reason: Any = _UNSET,
+    parked_profiles: Any = _UNSET, serving_decision: Any = _UNSET,
+    multiplex_standalone_reason: Any = _UNSET,
     platform_metrics: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None,
@@ -1131,6 +1132,10 @@ def _prepare_runtime_status_update(
             ("served_profiles", served_profiles, lambda v: list(v or [])),
             # Profiles the multiplexer could not serve, name -> reason; clients fail fast on them.
             ("parked_profiles", parked_profiles, lambda v: {str(k): str(r) for k, r in dict(v or {}).items()}),
+            # The multiplexer's published serving decision (ranking order, deferrals with their
+            # cost, demand source health, holds). The host check reads this file, never the socket.
+            ("serving_decision", serving_decision,
+             lambda v: copy.deepcopy(v) if isinstance(v, dict) else None),
             ("multiplex_standalone_reason", multiplex_standalone_reason, lambda v: str(v) if v else None),
             ("session_store", session_store, _coerce_session_store),
         ))
@@ -1183,6 +1188,17 @@ def write_runtime_status(
     # timed-out update is still written by the background writer, so its transition happened.
     _emit_runtime_status_transition(previous_payload, payload)
     return writer.wait(generation, timeout=wait_timeout)
+
+
+def runtime_status_snapshot() -> dict[str, Any]:
+    """The process's canonical status payload as published RIGHT NOW (in-memory copy, no file read).
+
+    A change gate must know what is *published*, not what this caller last wrote: a record can be
+    cleared by another writer (or lost with the file) between two identical decisions, and a gate
+    memoised only in the caller would never republish it (SOU-3075 §0 finding 2).
+    """
+    with _runtime_status_state_lock:
+        return copy.deepcopy(_runtime_status_state or {})
 
 
 def publish_runtime_status(**fields: Any) -> int:

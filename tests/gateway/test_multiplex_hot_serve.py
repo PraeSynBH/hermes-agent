@@ -575,3 +575,146 @@ async def test_hot_added_profile_cannot_double_claim_a_live_secondary_token(tmp_
         await runner.reconcile_served_profiles()
     fp = GatewayRunner._adapter_credential_fingerprint(_Adapter("shared"))
     assert seen_claims["dupe"].get((Platform.DISCORD, fp)) == "alpha"
+
+
+# ── demand-ranked serving: publication, demotion, and the eviction hold (SOU-3075) ──────────────
+
+
+def _state(home):
+    flush_runtime_status()
+    return json.loads((home / "gateway_state.json").read_text(encoding="utf-8"))
+
+
+def _cron_job(profile_home, enabled=True):
+    (profile_home / "cron").mkdir(exist_ok=True)
+    (profile_home / "cron" / "jobs.json").write_text(
+        json.dumps({"jobs": [{"id": "job", "enabled": enabled}]}), encoding="utf-8")
+
+
+def _capped_runner(tmp_path, monkeypatch, cap=2):
+    from hermes_cli import gateway_multiplex_capacity as capacity
+    from hermes_cli import gateway_multiplex_demand as demand
+
+    runner, home = _runner(tmp_path, monkeypatch)
+    (home / "config.yaml").write_text(
+        f"gateway:\n  multiplex_max_profiles: {cap}\n", encoding="utf-8")
+    capacity.reset_memo()
+    demand.reset()
+    return runner, home
+
+
+@pytest.mark.asyncio
+async def test_a_steady_state_tick_publishes_the_serving_decision(tmp_path, monkeypatch):
+    """§0 finding 2: ``_apply_profile_changes`` returns early when the served set is unchanged, so a
+    decision used to be published only when the SET moved. The tick must publish every time."""
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        runner, home = _capped_runner(tmp_path, monkeypatch)
+        zulu = _mkprofile(home, "zulu", "DISCORD_BOT_TOKEN=zulu-token\n")
+        _cron_job(zulu)
+        _boot(runner, home)
+        await runner._start_secondary_profile_adapters()
+        assert {p["profile"] for p in _state(home)["serving_decision"]["ranked"]} == {"default", "zulu"}
+
+        # Lose the record, then take a tick that changes nothing at all: it must come back.
+        first = _state(home)["serving_decision"]
+        from gateway.status import publish_runtime_status
+        publish_runtime_status(serving_decision=None)
+        result = await runner.reconcile_served_profiles()
+        assert result["added"] == result["removed"] == result["rescanned"] == []
+        published = _state(home)["serving_decision"]
+        assert published is not None
+        assert published["ceiling"] == 2
+        assert [p["profile"] for p in published["ranked"]] == ["default", "zulu"]
+        assert published["ranked"][1]["served"] is True
+        assert published["demand_source"]["state"] == "absent"
+        assert first["ceiling"] == published["ceiling"]
+
+
+@pytest.mark.asyncio
+async def test_publication_is_change_gated(tmp_path, monkeypatch):
+    """No 30 s disk churn: an identical decision is written once."""
+    writes = []
+    real = __import__("gateway.status", fromlist=["publish_runtime_status"]).publish_runtime_status
+
+    def counting(**fields):
+        if "serving_decision" in fields:
+            writes.append(fields["serving_decision"])
+        return real(**fields)
+
+    monkeypatch.setattr("gateway.status.publish_runtime_status", counting)
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        runner, home = _capped_runner(tmp_path, monkeypatch)
+        zulu = _mkprofile(home, "zulu", "DISCORD_BOT_TOKEN=zulu-token\n")
+        _cron_job(zulu)
+        _boot(runner, home)
+        await runner._start_secondary_profile_adapters()
+        for _ in range(3):
+            await runner.reconcile_served_profiles()
+
+    assert len(writes) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_demand_flip_hot_serves_and_parks_without_a_restart(tmp_path, monkeypatch):
+    """A2: the rank follows live demand; no hand edit, no pid change, ≤2 ticks."""
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        runner, home = _capped_runner(tmp_path, monkeypatch)
+        alpha = _mkprofile(home, "alpha")
+        zulu = _mkprofile(home, "zulu")
+        _cron_job(zulu)  # zulu holds the slot; alpha holds nothing
+        _boot(runner, home)
+        await runner._start_secondary_profile_adapters()
+        assert _served_record(home) == ["default", "zulu"]
+        assert "zulu" not in _state(home)["parked_profiles"]
+
+        _cron_job(zulu, enabled=False)
+        _cron_job(alpha, enabled=True)
+        result = await runner.reconcile_served_profiles()
+
+        assert result["added"] == ["alpha"], result
+        assert result["removed"] == ["zulu"], result
+        assert _served_record(home) == ["default", "alpha"]
+        parked = _state(home)["parked_profiles"]
+        assert parked["zulu"].startswith("capacity: ")
+        assert "; cost: " in parked["zulu"]
+        assert "alpha" not in parked
+        assert _state(home)["serving_decision"]["deferred"][0]["profile"] == "zulu"
+
+
+@pytest.mark.asyncio
+async def test_a_busy_holder_is_not_evicted_and_the_wait_is_published(tmp_path, monkeypatch):
+    """A6: ranking must never kill a turn. The holder keeps its slot, the newcomer waits visibly."""
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        runner, home = _capped_runner(tmp_path, monkeypatch)
+        alpha = _mkprofile(home, "alpha")
+        zulu = _mkprofile(home, "zulu")
+        _cron_job(zulu)
+        _boot(runner, home)
+        await runner._start_secondary_profile_adapters()
+        assert _served_record(home) == ["default", "zulu"]
+        runner._running_agents = {"agent:zulu:discord:dm:1": object()}
+
+        _cron_job(zulu, enabled=False)
+        _cron_job(alpha, enabled=True)
+        result = await runner.reconcile_served_profiles()
+
+        assert result["removed"] == []
+        assert _served_record(home) == ["default", "zulu"]       # holder untouched this cycle
+        state = _state(home)
+        holding = state["serving_decision"]["holding"]
+        assert holding["zulu"]["since"]
+        assert "alpha" in holding["zulu"]["waiting_for"]
+        assert state["parked_profiles"]["alpha"].startswith("capacity: ")
+        assert "waiting for 'zulu'" in state["parked_profiles"]["alpha"]
+        assert "zulu" not in state["parked_profiles"]            # a served holder is not parked
+        assert state["serving_decision"]["deferred"][0]["holding"] == "zulu"
+
+        # The turn ends: the next tick completes the swap.
+        runner._running_agents = {}
+        result = await runner.reconcile_served_profiles()
+        assert result["removed"] == ["zulu"]
+        assert result["added"] == ["alpha"]
+        assert _served_record(home) == ["default", "alpha"]
+        state = _state(home)
+        assert state["serving_decision"]["holding"] == {}
+        assert state["parked_profiles"]["zulu"].startswith("capacity: ")

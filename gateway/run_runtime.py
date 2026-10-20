@@ -132,6 +132,107 @@ def _record_parked_profiles(parked):
         logger.debug('could not record parked_profiles', exc_info=True)
 
 
+def capacity_holding(runner) -> dict:
+    """Profiles the ceiling wanted to evict but could not, because they hold live work (§6).
+
+    ``name -> {"since": ISO-8601, "waiting_for": "<comma-joined deferred names>"}``. A held profile
+    stays SERVED this cycle; the profile that would have taken its slot stays parked and its reason
+    names the holder, so the wait is visible instead of silent.
+    """
+    holding = getattr(runner, '_capacity_holding', None)
+    return holding if isinstance(holding, dict) else {}
+
+
+def record_capacity_hold(runner, holders, waiting_for=(), *, now: str | None = None) -> None:
+    """Replace this cycle's hold set, preserving ``since`` for a holder that was already holding.
+
+    *waiting_for* names the profiles the ceiling promoted into the held slots: they stay parked for
+    this cycle, and their published reason names the holder. Recomputed from scratch every reconcile
+    tick, so an entry disappears the tick its holder is finally evicted (idle) or the ceiling makes
+    room for it. No holders clears the map.
+    """
+    previous = capacity_holding(runner)
+    if not holders:
+        if previous:
+            runner._capacity_holding = {}
+        return
+    waiting = ', '.join(sorted(str(n) for n in waiting_for if n not in holders))
+    stamp = now or _utc_now_iso()
+    runner._capacity_holding = {
+        name: {'since': (previous.get(name) or {}).get('since') or stamp, 'waiting_for': waiting}
+        for name in sorted(holders)
+    }
+
+
+def capacity_deferrals(runner) -> dict[str, str]:
+    """Every profile this cycle parks for the ceiling, with its published reason.
+
+    The ceiling's own deferral map, minus the profiles it is HOLDING (they are still served), plus
+    the newcomers displaced by those holds — a profile the rank promoted cannot be served while the
+    busy holder keeps its slot, so it stays parked and its reason says who it is waiting for.
+    """
+    from hermes_cli.gateway_multiplex_capacity import (
+        cost_clause, deferral_head, deferred_by_capacity, profile_ceiling,
+    )
+    from hermes_cli import gateway_multiplex_demand as demand_module
+    holding = capacity_holding(runner)
+    waiting: dict[str, tuple[str, str]] = {}
+    for holder, entry in holding.items():
+        for name in str(entry.get('waiting_for') or '').split(','):
+            if name.strip():
+                waiting[name.strip()] = (holder, str(entry.get('since') or 'unknown'))
+    reasons: dict[str, str] = {}
+    for name, reason in deferred_by_capacity().items():
+        if name in holding:
+            continue
+        if name in waiting:
+            holder, since = waiting[name]
+            reason = f"{reason}; waiting for '{holder}' (live work since {since})"
+        reasons[name] = reason
+    for name, (holder, since) in waiting.items():
+        if name in reasons:
+            continue
+        reasons[name] = (f"{deferral_head(profile_ceiling())}; "
+                         f"{cost_clause(demand_module.snapshot(), name)}; "
+                         f"waiting for '{holder}' (live work since {since})")
+    return reasons
+
+
+def profile_is_busy(runner, name: str) -> bool:
+    """Does *name* hold live work right now? Used to refuse evicting it for a newcomer (§6).
+
+    The one liveness notion the runtime already has: executing turns, detached side agents, live
+    managed workers, in-process turns and admitted-but-unstamped session tasks. A profile whose
+    authority this process does not hold (adapters-only runner, a profile served without a store)
+    falls back to the in-process turn map, never to a guess.
+    """
+    homes = getattr(runner, '_served_profile_homes', None) or {}
+    home = homes.get(name)
+    registry = getattr(runner, 'session_authorities', None)
+    if home is not None and registry is not None:
+        try:
+            authority = registry.for_home(Path(home))
+        except Exception:  # health: allow BLE001 -- an unknown authority means "nothing known live"
+            authority = None
+        if authority is not None:
+            from gateway.session_runtime_workers import executing_sessions, side_agents
+            if any(True for _sid, _live, _gen in executing_sessions(authority)):
+                return True
+            if side_agents(authority):
+                return True
+            workers = getattr(authority, '_managed_workers', {}) or {}
+            if any(not closed.is_set() for closed in (getattr(w, 'closed', None) for w in workers.values())
+                   if closed is not None):
+                return True
+            for live in (getattr(authority, 'sessions', {}) or {}).values():
+                task = getattr(live, 'task', None)
+                if task is not None and not task.done():
+                    return True
+    prefix = f'agent:{name}:'
+    running = getattr(runner, '_running_agents', None) or {}
+    return any(str(key).startswith(prefix) for key in running)
+
+
 def sync_capacity_parked(runner) -> bool:
     """Fold the ``gateway.multiplex_max_profiles`` decision into ``parked_profiles``.
 
@@ -140,22 +241,98 @@ def sync_capacity_parked(runner) -> bool:
     instead of waiting out its whole deadline. The decision itself is the one the serving
     enumeration just made (``profiles_to_serve`` → ``remember_deferred``), so this only publishes
     it, and un-parks the ones a raised ceiling brought back. Returns True when the map changed.
+
+    A profile being HELD (§6, live work on a profile the ceiling just deferred) is still served
+    this cycle, so it is never published as parked; the newcomer waiting on it gets the holder's
+    name appended to its reason instead.
     """
-    from hermes_cli.gateway_multiplex_capacity import deferred_by_capacity
     parked = parked_profile_map(runner)
-    deferred = deferred_by_capacity()
+    wanted = capacity_deferrals(runner)
     changed = False
     for name in [n for n, reason in parked.items()
-                 if str(reason).startswith('capacity:') and n not in deferred]:
+                 if str(reason).startswith('capacity:') and n not in wanted]:
         parked.pop(name, None)
         changed = True
-    for name, reason in deferred.items():
+    for name, reason in wanted.items():
         if parked.get(name) != reason:
             parked[name] = reason
             changed = True
     if changed:
         _record_parked_profiles(parked)
     return changed
+
+
+def _utc_now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def _served_names(runner) -> set[str]:
+    getter = getattr(runner, 'served_profile_names', None)
+    if callable(getter):
+        try:
+            return set(getter())
+        except Exception:  # health: allow BLE001 -- fall back to the live bookkeeping below
+            pass
+    return set(getattr(runner, '_served_profile_homes', None) or {})
+
+
+def serving_decision_record(runner) -> dict:
+    """Build the published ``serving_decision`` for this cycle (§5).
+
+    Every served profile and every deferral with its demand counts, the ranking order, the demand
+    source's health, and any hold. ``decided_at`` is the only field that changes when nothing else
+    did — which is why the change gate (and the host check) compare the rest.
+    """
+    from hermes_cli import gateway_multiplex_capacity as capacity
+    from hermes_cli import gateway_multiplex_demand as demand_module
+    snapshot = demand_module.snapshot()
+    decision = capacity.last_decision() or {}
+    served = _served_names(runner)
+    deferred_reasons = {name: reason for name, reason in capacity_deferrals(runner).items()
+                        if name not in served}
+    holding = capacity_holding(runner)
+    order = [name for name in decision.get('ranked') or [] if name in served or name in deferred_reasons]
+    order += sorted(name for name in served if name not in order)
+    order += sorted(name for name in deferred_reasons if name not in order)
+
+    def _waiting_holder(name):
+        return next((holder for holder, entry in holding.items()
+                     if name in str(entry.get('waiting_for') or '').split(', ')), None)
+
+    return {
+        'decided_at': _utc_now_iso(),
+        'ceiling': capacity.profile_ceiling(),
+        'cap_note': f'gateway.{capacity.MAX_PROFILES_KEY}',
+        'demand_source': snapshot.demand_source(),
+        'ranked': [{'profile': name, 'demand': snapshot.for_profile(name).as_record(),
+                    'served': name in served} for name in order],
+        'deferred': [{'profile': name, 'demand': snapshot.for_profile(name).as_record(),
+                      'reason': reason, 'holding': _waiting_holder(name)}
+                     for name, reason in deferred_reasons.items()],
+        'holding': {name: dict(entry) for name, entry in holding.items()},
+    }
+
+
+def publish_serving_decision(runner) -> bool:
+    """Publish this cycle's serving decision to ``gateway_state.json``, change-gated (§5).
+
+    Called on EVERY reconcile tick and at boot, deliberately not only when the served set changed:
+    a decision can move without moving the set (cost text, manifest health, a hold), and a lost
+    record would otherwise never be republished — the live host showed ``parked_profiles: {}`` for
+    exactly that reason. ``decided_at`` is stripped before the compare, so a stable decision is
+    written once and boot always writes (the memo starts empty in a new process). Returns True when
+    a write was published.
+    """
+    from gateway.status import publish_runtime_status, runtime_status_snapshot
+    record = serving_decision_record(runner)
+    key = {field: value for field, value in record.items() if field != 'decided_at'}
+    published = runtime_status_snapshot().get('serving_decision')
+    if isinstance(published, dict) and {field: value for field, value in published.items()
+                                        if field != 'decided_at'} == key:
+        return False
+    publish_runtime_status(serving_decision=record)
+    return True
 
 
 async def initialize_gateway_runtime(runner):

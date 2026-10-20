@@ -76,8 +76,15 @@ def profiles_to_serve(multiplex: bool, *, include_standalone: bool = False,
     if include_parked or include_standalone:
         return serve
     from hermes_cli import gateway_multiplex_capacity as capacity
-    serve, deferred = capacity.apply_ceiling(serve, capacity.profile_ceiling(),
-                                             capacity.serve_priority())
+    cap = capacity.profile_ceiling()
+    # Ranking needs live demand (SOU-3075), but a host with no ceiling ranks nothing: building the
+    # snapshot there would put a stat sweep of every profile's cron store and .env on a path that
+    # runs per inbound route, for a decision that never defers anyone.
+    demand = None
+    if cap is not None:
+        from hermes_cli import gateway_multiplex_demand as demand_module
+        demand = demand_module.snapshot()
+    serve, deferred = capacity.apply_ceiling(serve, cap, capacity.serve_priority(), demand=demand)
     capacity.remember_deferred(deferred)
     return serve
 
