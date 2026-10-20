@@ -495,6 +495,36 @@ def _terminate_then_kill(pid: int, create_time: Optional[float]) -> bool:
         return False
 
 
+def _home_of(entry: dict) -> str:
+    """The home an entry serves, or ``"-"`` — the greppable field of every reconcile log line."""
+    return str(entry.get("hermes_home") or "") or "-"
+
+
+def _reap_reconciled(entry: dict, kill_fn) -> Optional[dict]:
+    """Reap one PROVEN orphan and log it; ``None`` when the incarnation moved on or the kill failed.
+
+    One log line per reap, ``/reconciled orphaned/``-greppable, carrying pid, purpose and home so
+    the next host census can be read against it.
+    """
+    pid = entry.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        if kill_fn is not None:
+            kill_fn(pid)
+        elif not _terminate_then_kill(pid, entry.get("create_time")):
+            return None
+    except Exception:
+        logger.debug("orphan reap failed for %s", entry, exc_info=True)
+        return None
+    record = {"pid": pid, "purpose": str(entry.get("purpose") or ""), "hermes_home": _home_of(entry)}
+    logger.info(
+        "reconciled orphaned %s pid=%s home=%s spawner=%s",
+        record["purpose"], pid, record["hermes_home"], entry.get("spawner_pid"),
+    )
+    return record
+
+
 def _reparented_orphan(pid: int) -> bool:
     """Null-spawner owner with no live supervisor: reparented to init, old, lock-unclaimed.
 
@@ -576,8 +606,8 @@ def _live_gateways_by_home() -> dict[str, list[dict]]:
     return by_home
 
 
-def reap_superseded_gateways(*, kill_fn=None) -> list[int]:
-    """Kill gateways a NEWER live gateway for the same home has already replaced.
+def _superseded_gateway_entries() -> list[dict]:
+    """Ledger entries that are residue because a NEWER live gateway replaced them, oldest first.
 
     A detached gateway's dead spawner proves nothing on its own: ``spawn_unmanaged_gateway``
     detaches by design (the client exits), and the messaging gateway is meant to survive the app
@@ -586,12 +616,12 @@ def reap_superseded_gateways(*, kill_fn=None) -> list[int]:
     runtime's own exclusive ownership fence exists to prevent — so only then is the older one
     residue.
 
-    Never touched: this process, a home with a single live gateway, an unprovable entry
+    Never returned: this process, a home with a single live gateway, an unprovable entry
     (``ledger_entries(verified_only=True)`` needs a live ``(pid, create_time)`` pair) and any
     entry whose spawner is alive — a launchd/systemd/Desktop-supervised gateway always has one,
-    so the supervised gateway is never a candidate however old it is. Returns the reaped pids.
+    so the supervised gateway is never a candidate however old it is.
     """
-    reaped: list[int] = []
+    candidates: list[dict] = []
     own = os.getpid()
     for entries in _live_gateways_by_home().values():
         if len(entries) < 2:
@@ -603,17 +633,17 @@ def reap_superseded_gateways(*, kill_fn=None) -> list[int]:
                 continue
             if spawner_is_dead(older) is not True:
                 continue  # supervised, or unprovable → never touch
-            try:
-                if kill_fn is not None:
-                    kill_fn(pid)
-                elif not _terminate_then_kill(pid, older.get("create_time")):
-                    continue
-            except Exception:
-                logger.debug("superseded gateway reap failed for %s", older, exc_info=True)
-                continue
-            logger.info("reaped superseded gateway pid %s in %s", pid, older.get("hermes_home"))
-            reaped.append(pid)
-    return reaped
+            candidates.append(older)
+    return candidates
+
+
+def reap_superseded_gateways(*, kill_fn=None) -> list[int]:
+    """Kill the gateways :func:`_superseded_gateway_entries` proves a newer live one replaced."""
+    return [
+        record["pid"]
+        for record in (_reap_reconciled(entry, kill_fn) for entry in _superseded_gateway_entries())
+        if record is not None
+    ]
 
 
 def reap_orphaned_mcp_helpers(*, project_root: Optional[Path] = None, kill_fn=None) -> list[int]:
@@ -623,43 +653,121 @@ def reap_orphaned_mcp_helpers(*, project_root: Optional[Path] = None, kill_fn=No
     live ``mcp-helper`` entry for THIS install AND ``spawner_is_dead`` is ``True`` — never
     ``None``/unprovable, never a live spawner.
     """
-    reaped: list[int] = []
+    return [
+        record["pid"]
+        for record in _reap_proven_mcp_helpers(project_root=project_root, kill_fn=kill_fn)
+    ]
+
+
+def _reap_proven_mcp_helpers(*, project_root: Optional[Path] = None, kill_fn=None) -> list[dict]:
+    """Reap the proven-orphan helpers, one ``{pid, purpose, hermes_home}`` record per kill."""
+    reaped: list[dict] = []
+    for entry in _mcp_helper_orphans(project_root=project_root):
+        try:
+            if kill_fn is not None:
+                kill_fn(entry["pid"])
+            elif not _reap_mcp_helper_process(entry):
+                continue  # PID reused since registration
+            logger.info(
+                "reconciled orphaned mcp-helper pid=%s home=%s spawner=%s",
+                entry["pid"], _home_of(entry), entry.get("spawner_pid"),
+            )
+            reaped.append({"pid": entry["pid"], "purpose": "mcp-helper", "hermes_home": _home_of(entry)})
+        except Exception:
+            logger.debug("mcp-helper orphan reap failed for %s", entry, exc_info=True)
+    return reaped
+
+
+def _mcp_helper_orphans(*, project_root: Optional[Path] = None) -> list[dict]:
+    """Live ``mcp-helper`` entries for THIS install whose recorded spawner is provably dead."""
     try:
         entries = ledger_entries(project_root=project_root)
     except Exception:
-        return reaped
+        logger.debug("could not read the spawn ledger for mcp-helper orphans", exc_info=True)
+        return []
     own_pid = os.getpid()
-    for entry in entries:
-        try:
-            pid = entry.get("pid")
-            if entry.get("purpose") != "mcp-helper" or not isinstance(pid, int) or pid <= 0 or pid == own_pid:
-                continue
-            if spawner_is_dead(entry) is not True:
-                continue  # live or unprovable spawner → never touch
-            if kill_fn is not None:
-                kill_fn(pid)
-            else:
-                import psutil
+    return [
+        entry for entry in entries
+        if entry.get("purpose") == "mcp-helper"
+        and isinstance(entry.get("pid"), int) and entry["pid"] > 0 and entry["pid"] != own_pid
+        and spawner_is_dead(entry) is True
+    ]
 
-                proc = psutil.Process(pid)
-                if not _same_incarnation(proc, entry.get("create_time")):
-                    continue  # PID reused since registration
-                # Windows: descendants (npx.cmd → node.exe) have no pgid to group-kill and
-                # reparent with ParentId=null when the direct child exits first (#61059), so
-                # reap the whole tree. On POSIX the killpg-based sweep already reaches them.
-                if _IS_WINDOWS:
-                    _kill_process_tree_windows(proc)
-                else:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=2.0)
-                    except psutil.TimeoutExpired:
-                        proc.kill()
-            reaped.append(pid)
+
+def _reap_mcp_helper_process(entry: dict) -> bool:
+    """Terminate one proven-orphan helper; ``False`` when the PID's incarnation moved on."""
+    import psutil
+
+    proc = psutil.Process(entry["pid"])
+    if not _same_incarnation(proc, entry.get("create_time")):
+        return False
+    # Windows: descendants (npx.cmd → node.exe) have no pgid to group-kill and reparent with
+    # ParentId=null when the direct child exits first (#61059), so reap the whole tree. On POSIX
+    # the killpg-based sweep already reaches them.
+    if _IS_WINDOWS:
+        _kill_process_tree_windows(proc)
+    else:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except psutil.TimeoutExpired:
+            proc.kill()
+    return True
+
+
+#: Second liveness fact each purpose needs before a dead spawner means "orphan" — see
+#: :func:`reconcile_orphans`. ``gateway`` is absent on purpose: it is judged by supersession.
+_UNCLAIMED_HOME_PURPOSES = frozenset({"serve", "dashboard"})
+
+
+def reconcile_orphans(*, kill_fn=None, reparented_fn=None) -> list[dict]:
+    """Startup sweep: reap every ledger entry across ``REAPABLE_PURPOSES`` that is PROVEN residue.
+
+    A dead recorded spawner is necessary but NOT sufficient for a long-lived entry, and getting
+    that wrong kills healthy processes: ``spawn_unmanaged_gateway`` detaches by design (a gateway
+    serving a live TUI at ``ppid=1`` with a dead spawner is *healthy*), and the messaging gateway
+    is meant to survive its app (gateway/AGENTS.md). So each purpose carries its own second fact:
+
+    * ``gateway`` — a NEWER live gateway already claims the same home (the runtime's exclusive
+      ownership fence exists precisely to prevent that pair): :func:`_superseded_gateway_entries`;
+    * ``serve`` / ``dashboard`` — the home claims no live backend for it: reparented to init, no
+      valid Desktop SSH ``backend.lock.json``, and past the lock-write grace
+      (:func:`_reparented_orphan`, the rung #121964 already uses for backend owners);
+    * ``mcp-helper`` — strict ``spawner_is_dead``: a stdio helper has no independent reason to
+      outlive its spawner.
+
+    Never this process, never a live spawner, never an unprovable entry (``None``), never an
+    interactive purpose. Returns one ``{pid, purpose, hermes_home}`` record per reap; never raises.
+    """
+    reaped: list[dict] = []
+    reparented_fn = _reparented_orphan if reparented_fn is None else reparented_fn
+    try:
+        entries = ledger_entries()
+    except Exception:
+        logger.debug("could not read the spawn ledger; reconciling nothing", exc_info=True)
+        entries = []
+    own = os.getpid()
+    for entry in entries:
+        purpose = entry.get("purpose")
+        pid = entry.get("pid")
+        if purpose not in _UNCLAIMED_HOME_PURPOSES or not isinstance(pid, int) or pid <= 0 or pid == own:
+            continue
+        if spawner_is_dead(entry) is not True:
+            continue  # live or unprovable spawner → never touch
+        try:
+            if not reparented_fn(pid):
+                continue  # a live owner still claims this backend
         except Exception:
-            logger.debug("mcp-helper orphan reap failed for %s", entry, exc_info=True)
-    if reaped:
-        logger.info("reaped %d orphaned stdio MCP helper(s): %s", len(reaped), reaped)
+            logger.debug("orphan proof failed for pid %s; leaving it alone", pid, exc_info=True)
+            continue  # unprovable → never touch
+        record = _reap_reconciled(entry, kill_fn)
+        if record is not None:
+            reaped.append(record)
+    for entry in _superseded_gateway_entries():
+        record = _reap_reconciled(entry, kill_fn)
+        if record is not None:
+            reaped.append(record)
+    reaped.extend(_reap_proven_mcp_helpers(kill_fn=kill_fn))
     return reaped
 
 
