@@ -61,7 +61,7 @@ def test_multi_profile_homes_passed_to_builtin(monkeypatch, _providers, tmp_path
     ]
     import hermes_cli.profiles as profiles_mod
 
-    monkeypatch.setattr(profiles_mod, "profiles_to_serve", lambda **_kw: list(homes))
+    monkeypatch.setattr(profiles_mod, "profiles_to_tick", lambda **_kw: list(homes))
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=7)
 
@@ -84,7 +84,7 @@ def test_single_profile_ticks_only_without_gateway(monkeypatch, tmp_path, gatewa
 
     home = tmp_path / "root"
     home.mkdir()
-    monkeypatch.setattr(profiles_mod, "profiles_to_serve", lambda **_kw: [("default", home)])
+    monkeypatch.setattr(profiles_mod, "profiles_to_tick", lambda **_kw: [("default", home)])
     monkeypatch.setattr(profiles_mod, "_check_gateway_running", lambda _home: gateway_running)
     monkeypatch.setattr(
         "cron.scheduler_provider.resolve_cron_scheduler", InProcessCronScheduler
@@ -110,7 +110,7 @@ def test_enumeration_failure_fails_open(monkeypatch, _providers):
     def _boom(**_kw):
         raise RuntimeError("profiles dir unreadable")
 
-    monkeypatch.setattr(profiles_mod, "profiles_to_serve", _boom)
+    monkeypatch.setattr(profiles_mod, "profiles_to_tick", _boom)
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=11)
 
@@ -144,11 +144,11 @@ def test_external_provider_never_gets_profile_homes(monkeypatch, tmp_path):
 
 
 def test_desktop_ticker_serves_every_profile_and_yields_to_owning_gateway(monkeypatch, _providers, tmp_path):
-    """The Desktop ticker mirrors the multiplexer's served set (default + every live profile dir)
-    and stands down, per tick, for a profile already owned by a gateway: its own running gateway,
-    or the live default multiplexer that already ticks it — such a satellite has no gateway.pid
-    of its own, so the per-home liveness check alone lets both tickers race for its fires
-    (#107485, #108428)."""
+    """The Desktop ticker ticks every profile that HAS a store — default + every live profile dir,
+    not the multiplexer's capacity-capped served set (PRX-5717) — and stands down, per tick, for a
+    profile already owned by a gateway: its own running gateway, or the live default multiplexer
+    that already ticks it — such a satellite has no gateway.pid of its own, so the per-home liveness
+    check alone lets both tickers race for its fires (#107485, #108428)."""
     import hermes_cli.profiles as profiles_mod
     import hermes_yaml as yaml
 

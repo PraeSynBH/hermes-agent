@@ -1411,6 +1411,8 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     if epochs is None:
         epochs = store._local_authority_epochs = {}
     epochs[db_key] = epoch
-    from gateway.session_local_recovery import recover_local_sessions
-    recover_local_sessions(authority)
+    # Store reads off the loop (PRX-5717): per-receipt SQLite here stalled every profile the loop
+    # serves for 45-122 s on a loaded host while a hot-serve added profiles.
+    from gateway.session_local_recovery import recover_local_sessions_offloop
+    await recover_local_sessions_offloop(authority)
     return authority
