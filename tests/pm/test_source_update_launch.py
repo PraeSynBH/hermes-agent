@@ -231,7 +231,7 @@ def _fact(root):
     selected = selected_venv(root)
     assert Path(fact["environment"]) == selected
     assert (selected.is_relative_to(install_state_dir(root) / "environments")
-            or selected.parent.parent in _trees(root))
+            or selected.parent in _trees(root))
     assert (selected / "pyvenv.cfg").is_file()
     assert Path(fact["resolved_lock"]).is_file()
     probe = subprocess.run(
