@@ -599,6 +599,41 @@ def _check_skills_hub(should_fix: bool, f: Finding) -> None:
                    ("No GITHUB_TOKEN", f"(60 req/hr rate limit — set in {_DHH}/.env for better rates)"))
 
 
+@doctor_check(on_error="")
+def _check_skills_tree_cycles(should_fix: bool, f: Finding) -> None:
+    """No symlink inside a skill dir may resolve back into that dir (PRX-5605).
+
+    A bad skill install (a temp publish that leaves ``<skill>/.tmp -> <skill>``) makes every
+    followlinks scan of the skills tree recurse forever; the scanner now prunes the cycle, and this
+    names the offending entry once, removing it under ``--fix``.
+    """
+    from hermes_cli.doctor import HERMES_HOME
+    from agent.skill_utils import iter_skill_dir_cycles
+
+    cycles = list(iter_skill_dir_cycles(HERMES_HOME / "skills"))
+    if not cycles:
+        check_ok("No skill dir entry links back into its own dir")
+        return
+    if should_fix:
+        failed: list[Path] = []
+        for path in cycles:
+            try:
+                path.unlink()
+            except OSError:
+                failed.append(path)
+        f.fixed += len(cycles) - len(failed)
+        if failed:
+            check_warn(f"{len(failed)} skill dir symlink cycle(s) could not be removed",
+                       f"(remove by hand: {failed[0]})")
+            f.manual_issues.append(f"Remove the self-referential symlink(s) by hand: {failed[0]}")
+        else:
+            check_ok(f"Removed {len(cycles)} skill dir symlink cycle(s)")
+        return
+    check_warn(f"{len(cycles)} skill dir entr{'y' if len(cycles) == 1 else 'ies'} link(s) back into "
+               f"its own dir", f"(slows every skill scan; run: hermes doctor --fix — {cycles[0]})")
+    f.issues.append("Remove the skill-dir symlink cycle(s): hermes doctor --fix")
+
+
 # provider -> (checker, ImportError row, ImportError issue, label for "check failed"); every provider
 # still bundled or catalog-installed uses the generic check.
 _MEMORY_PROVIDER_CHECKS: dict = {}

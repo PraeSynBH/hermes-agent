@@ -844,11 +844,91 @@ def is_skill_description_truncated_for_prompt(frontmatter: dict[str, Any]) -> bo
     return len(_normalize_skill_description(frontmatter)) > SKILL_PROMPT_DESC_LIMIT
 
 
+# Real paths already reported as a single-tree alias or a symlink cycle, so a bad skill dir is
+# named once per process instead of once per recursion step (PRX-5605: 8,229 warnings in one second).
+_SKILL_WALK_CYCLES_WARNED: set[str] = set()
+
+
+def _is_cycle_entry(root: str, real: str) -> bool:
+    """True when *root* resolves back into the dir that holds it (the loop shape), vs. a plain
+    alias: two skill dirs pointing at the same tree is deduplication, not a cycle."""
+    try:
+        parent_real = os.path.realpath(os.path.dirname(root))
+    except OSError:
+        return False
+    return real == parent_real or parent_real.startswith(real + os.sep)
+
+
+def _warn_skill_walk_cycle(root: str) -> None:
+    """Name a pruned cycle directory once per process."""
+    try:
+        real = os.path.realpath(root)
+    except OSError:
+        real = root
+    if real in _SKILL_WALK_CYCLES_WARNED:
+        return
+    _SKILL_WALK_CYCLES_WARNED.add(real)
+    if not _is_cycle_entry(root, real):
+        # A second path to a tree already walked (a leftover alias): harmless, and the manifest
+        # walk collapses it the same way.
+        logger.debug("Skipping skill directory %s: it is another path to %s, already walked", root, real)
+        return
+    logger.warning(
+        "Skipping skill directory %s: it resolves back to %s, which this walk already visited "
+        "(a symlink inside a skill dir points at its own directory). Remove the symlink.",
+        root, real,
+    )
+
+
+def iter_skill_dir_cycles(skills_dir: Path):
+    """Entries under *skills_dir* that resolve back into the directory holding them.
+
+    Post-install/Directory check for the shape a bad skill install leaves behind (PRX-5605): a
+    symlink inside a skill dir pointed at that same dir. Nothing legitimate has it, and a
+    ``followlinks`` scan of the tree re-enters it forever, so it is reported (and removable) here.
+    This walk does not follow links, so it cannot loop itself.
+    """
+    root = Path(skills_dir)
+    if not root.is_dir():
+        return
+    for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False):
+        for name in list(dirnames) + list(filenames):
+            path = os.path.join(dirpath, name)
+            if not os.path.islink(path):
+                continue
+            try:
+                target = os.path.realpath(path)
+            except OSError:
+                continue
+            if _is_cycle_entry(path, target):
+                yield Path(path)
+
+
 def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*; prunes
-    EXCLUDED_SKILL_DIRS and support dirs of skill roots."""
+    EXCLUDED_SKILL_DIRS and support dirs of skill roots.
+
+    ``followlinks`` is deliberate — a profile's skills dir is largely symlinks into other
+    installs. What must not happen is re-entering a directory: a symlink inside a skill dir
+    that points back at that dir (the shape a bad skill install leaves behind, PRX-5605) makes
+    a followlinks walk recurse forever, so this walk never returns and every SKILL.md it does
+    reach is re-parsed. The visited set is (st_dev, st_ino), one entry per real directory, so
+    each real tree is expanded once no matter how many paths reach it.
+    """
     matches: list[str] = []
+    visited: set[tuple[int, int]] = set()
     for root, dirs, files in os.walk(str(skills_dir), followlinks=True):
+        try:
+            st = os.stat(root)
+        except OSError:
+            dirs[:] = []
+            continue
+        identity = (st.st_dev, st.st_ino)
+        if identity in visited:
+            _warn_skill_walk_cycle(root)
+            dirs[:] = []
+            continue
+        visited.add(identity)
         has_skill_md = "SKILL.md" in files
         dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
         if filename in files:

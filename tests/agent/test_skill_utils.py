@@ -206,6 +206,83 @@ def test_iter_skill_index_files_keeps_support_named_categories(tmp_path):
     assert is_excluded_skill_path(scripts_skill / "SKILL.md") is False
 
 
+def test_iter_skill_index_files_survives_a_self_referential_skill_dir(tmp_path, monkeypatch, caplog):
+    """A skill dir holding a symlink to itself must not make the walk recurse (PRX-5605).
+
+    The shape a broken skill install leaves behind: ``<skill>/.tmp -> <skill>``. Before the
+    visited-set guard the followlinks walk re-entered that dir forever, so every prompt build
+    that scanned the tree never returned and logged one parse warning per step.
+    """
+    from agent import skill_utils
+
+    monkeypatch.setattr(skill_utils, "_SKILL_WALK_CYCLES_WARNED", set())
+    skill = tmp_path / "alpha"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: alpha\ndescription: d\n---\n", encoding="utf-8")
+    (skill / ".sou2124-tmp").symlink_to(skill)
+    (skill / ".sou2124-tmp2").symlink_to(skill)
+
+    found = list(iter_skill_index_files(tmp_path, "SKILL.md"))
+
+    assert found == [skill / "SKILL.md"]
+
+
+def test_iter_skill_index_files_names_a_cycle_once_per_process(tmp_path, monkeypatch, caplog):
+    """The cycle warning names the offending path once, not once per walk or per step."""
+    from agent import skill_utils
+
+    monkeypatch.setattr(skill_utils, "_SKILL_WALK_CYCLES_WARNED", set())
+    skill = tmp_path / "alpha"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("---\nname: alpha\n---\n", encoding="utf-8")
+    (skill / ".tmp").symlink_to(skill)
+
+    with caplog.at_level("WARNING", logger=skill_utils.logger.name):
+        list(iter_skill_index_files(tmp_path, "SKILL.md"))
+        list(iter_skill_index_files(tmp_path, "DESCRIPTION.md"))
+
+    cycle_warnings = [r for r in caplog.records if "resolves back to" in r.getMessage()]
+    assert len(cycle_warnings) == 1
+    assert str(skill) in cycle_warnings[0].getMessage()
+
+
+def test_iter_skill_index_files_lists_a_tree_once_through_two_aliases(tmp_path, monkeypatch, caplog):
+    """Two skill dirs pointing at one tree are deduplicated silently — not a cycle warning."""
+    from agent import skill_utils
+
+    monkeypatch.setattr(skill_utils, "_SKILL_WALK_CYCLES_WARNED", set())
+    tree = tmp_path / "install" / "beta"
+    tree.mkdir(parents=True)
+    (tree / "SKILL.md").write_text("---\nname: beta\n---\n", encoding="utf-8")
+    (tmp_path / "skills").mkdir()
+    (tmp_path / "skills" / "beta").symlink_to(tree)
+    (tmp_path / "skills" / "beta.bak").symlink_to(tree)
+
+    with caplog.at_level("DEBUG", logger=skill_utils.logger.name):
+        found = list(iter_skill_index_files(tmp_path / "skills", "SKILL.md"))
+
+    assert len(found) == 1
+    assert not [r for r in caplog.records if "resolves back to" in r.getMessage()]
+
+
+def test_iter_skill_dir_cycles_flags_only_links_into_their_own_dir(tmp_path):
+    """The detector names self/ancestor links and leaves a legitimate cross-dir link alone."""
+    from agent.skill_utils import iter_skill_dir_cycles
+
+    skills = tmp_path / "skills"
+    skill = skills / "alpha"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: alpha\n---\n", encoding="utf-8")
+    (skill / ".self").symlink_to(skill)
+    elsewhere = tmp_path / "elsewhere" / "beta"
+    elsewhere.mkdir(parents=True)
+    (skills / "beta").symlink_to(elsewhere)  # the normal shape: a skill dir symlinked in
+
+    found = list(iter_skill_dir_cycles(skills))
+
+    assert found == [skill / ".self"]
+
+
 def test_skill_support_path_uses_explicit_discovery_root_not_cwd(tmp_path, monkeypatch):
     discovery_root = tmp_path / "site-packages" / "skills"
     umbrella = discovery_root / "category" / "umbrella"
