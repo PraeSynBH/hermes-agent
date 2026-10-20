@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -363,7 +364,9 @@ def do_search(query: str, source: str = "all", limit: int = 10, console: Optiona
                           for r in results], indent=2))
         return
 
-    c.print(f"\n[bold]Searching for:[/] {query}")
+    # The query is the user's own text: escape it, or a typed `[/b]` makes render_str raise
+    # MarkupError and takes the command down (same class as PRX-5748).
+    c.print(f"\n[bold]Searching for:[/] {escape(query)}")
     with c.status("[bold]Searching registries..."):
         results = unified_search(query, sources, source_filter=source, limit=limit)
     if not results:

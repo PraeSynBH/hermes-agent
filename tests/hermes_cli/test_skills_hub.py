@@ -487,6 +487,22 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     assert "Searching for:" not in sink.getvalue()
 
 
+def test_do_search_prints_the_query_as_text_not_markup():
+    """A tag typed into the query is literal text, not markup: `[/b]` used to raise MarkupError
+    out of the header print and take the whole command down (PRX-5748 class)."""
+    from hermes_cli.skills_hub import do_search
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None, width=80)
+
+    with patch("tools.skills_hub_search.unified_search", return_value=[_LONG_RESULT]), \
+         patch("tools.skills_hub_search.create_source_router", return_value={}), \
+         patch("tools.skills_hub_github.GitHubAuth"):
+        do_search("[b]weather[/b]", console=console)
+
+    assert "[b]weather[/b]" in sink.getvalue()
+
+
 
 # ---------------------------------------------------------------------------
 # Local-edit protection in do_update (ported from paperclipai/paperclip#10978)

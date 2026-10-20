@@ -17,6 +17,7 @@ from agent.interrupt_compat import request_hard_interrupt
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
+from rich.markup import escape as _escape
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cli")
@@ -541,7 +542,12 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         # No welcome banner (~420 ms cold); session id / resume hint come from _print_exit_summary().
         _query_label = query or ("[image attached]" if single_query_images else "")
         if _query_label:
-            cli.console.print(f"[bold blue]{t('cli.single_query.query_label')}[/] {_query_label}")
+            # The label is the user's prompt, and on a wake/continuation turn the model's own
+            # prose: a stray tag in it (`[/ACTION]`) made render_str raise MarkupError and took
+            # the whole run down with exit 1 and no answer (PRX-5748). Escape the text, keep the
+            # chrome as markup — it also makes the `[image attached]` literal actually render,
+            # where it used to be eaten as an unknown style tag.
+            cli.console.print(f"[bold blue]{t('cli.single_query.query_label')}[/] {_escape(_query_label)}")
         cli._show_security_advisories()
         response = cli.chat(query, images=single_query_images or None)
         # Kanban worker: a failed-silently turn used to end the run as rc=0 with no
