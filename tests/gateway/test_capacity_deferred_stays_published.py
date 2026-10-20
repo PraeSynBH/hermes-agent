@@ -55,7 +55,13 @@ async def test_quiet_tick_keeps_ceiling_deferred_profiles_parked(tmp_path, monke
 
     assert set(runner.session_runtime_descriptor["parked_profiles"]) == {"charlie", "delta"}
     assert set(_parked_state(home)) == {"charlie", "delta"}
-    assert set(_parked_state(home).values()) == {CAPACITY_REASON}
+    # Since SOU-3075 the reason states the trade as well (counts only, no names); the ceiling
+    # sentence this test pins is unchanged, and the whole map is still published every tick.
+    reasons = set(_parked_state(home).values())
+    assert len(reasons) == 1
+    (reason,) = reasons
+    assert reason.startswith(f"{CAPACITY_REASON} — this profile is deferred")
+    assert "; cost: " in reason
 
 
 @pytest.mark.asyncio

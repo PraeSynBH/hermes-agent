@@ -76,3 +76,60 @@ async def test_reconcile_sweeps_never_run_on_the_event_loop(tmp_path, monkeypatc
     # None of them on the loop thread.
     on_loop = [name for name, ident in calls if ident == loop_thread]
     assert on_loop == [], f"ran on the event loop thread: {on_loop}"
+
+
+@pytest.mark.asyncio
+async def test_the_demand_check_never_runs_on_the_event_loop(tmp_path, monkeypatch):
+    """PRX-5738: ranking reads every profile's cron store + .env — the same sweep class as above.
+
+    One reconcile tick must read demand exactly where it reads the signature sweep: off the loop.
+    """
+    import hermes_cli.gateway_multiplex_capacity as capacity_mod
+    import hermes_cli.gateway_multiplex_demand as demand_mod
+
+    home = tmp_path / ".hermes"
+    profile = home / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("model: {default: test}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "default")
+    # A ceiling is what makes the tick read demand at all; without one nothing is ranked.
+    monkeypatch.setattr(capacity_mod, "profile_ceiling", lambda *_a, **_k: 4)
+    monkeypatch.setattr(capacity_mod, "serve_priority", lambda *_a, **_k: ())
+    capacity_mod.reset_memo()
+    demand_mod.reset()
+
+    reads = []
+    real_refresh = demand_mod.refresh
+
+    def spy_refresh():
+        reads.append(threading.get_ident())
+        return real_refresh()
+
+    monkeypatch.setattr(demand_mod, "refresh", spy_refresh)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._running = True
+    runner._primary_profile_name = "default"
+    runner._served_profile_homes = {"default": home, "worker": profile}
+    runner._served_profile_signatures = {"default": reconcile_mod.profile_serve_signature(home),
+                                         "worker": reconcile_mod.profile_serve_signature(profile)}
+    runner._record_served_profiles = lambda active, profile_homes: runner._note_served_profiles(profile_homes)
+
+    async def _unserve(name, home_, *, reason=""):
+        return None
+
+    runner._unserve_profile = _unserve
+    runner._live_resource_claims = lambda active: {}
+
+    loop_thread = threading.get_ident()
+    await runner.reconcile_served_profiles(reason="watcher")
+
+    assert reads, "the tick read no demand at all"
+    on_loop = [ident for ident in reads if ident == loop_thread]
+    assert on_loop == [], "the demand check ran on the event loop thread"
+    capacity_mod.reset_memo()
+    demand_mod.reset()
+

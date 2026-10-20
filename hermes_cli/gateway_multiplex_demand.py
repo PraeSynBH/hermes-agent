@@ -12,6 +12,12 @@ S3 the demand manifest — ``gateway.multiplex_demand_manifest`` (default
    ``<default home>/gateway_demand.json``), schema 1. Written by whoever knows about agents that
    wake profiles: today a host-side collector, never read from another product's database.
 
+S1–S3 are read from disk. The fourth source is LIVE and lives in this process only: a client that
+asked for a profile and is waiting on its admission (``note_wanted``, PRX-5738). S1–S3 say a profile
+*could* hold work; a pending admission says somebody is blocked on it right now, which is the
+sighting the 2026-10-20 outage never produced — the busiest profile sat deferred while its runs
+failed admission. A sighting carries its own TTL and expires, so it cannot pin a slot forever.
+
 **Trust boundary:** core never reads Paperclip. The manifest is a documented, schema-versioned host
 input; any scheduler can write it. A malformed or absent manifest degrades to S1 ∨ S2 and is
 *reported*, never silently read as "no demand".
@@ -43,7 +49,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
 
@@ -58,6 +64,17 @@ DEFAULT_TTL_SECONDS = 900.0
 #: snapshot pays no I/O inside the window.
 SNAPSHOT_TTL_SECONDS = 5.0
 
+#: How long ONE pending-admission sighting keeps a profile ranked as demand-bearing. Bounded on
+#: purpose: a client that asked once and gave up must not pin a ceiling slot forever, so a stale
+#: sighting expires by itself (PRX-5738) while a profile that keeps being asked keeps refreshing it.
+WANTED_TTL_SECONDS = 300.0
+
+#: ``name -> monotonic expiry`` for "a client asked for this profile and is waiting on it". Kept
+#: beside the snapshot, never inside it: the snapshot is a disk-derived view aged by a cache window,
+#: this is LIVE state of THIS process — a route resolved a moment ago — and caching it away would be
+#: exactly the silent deferral it exists to prevent.
+_wanted: dict[str, float] = {}
+
 MANIFEST_OK = "ok"
 MANIFEST_STALE = "stale"
 MANIFEST_ABSENT = "absent"
@@ -70,10 +87,10 @@ class DemandFacts:
 
     agents: Optional[int] = None
     cron_jobs: int = 0
-    credentials: Tuple[str, ...] = ()
+    credentials: tuple[str, ...] = ()
     blocked_admission_15m: int = 0
     #: Source ids (``cron``, ``env``) that could not be read for this profile.
-    unreadable: Tuple[str, ...] = ()
+    unreadable: tuple[str, ...] = ()
 
     def has_demand(self) -> bool:
         """An unreadable source fails toward SERVING the profile (F7 in the plan)."""
@@ -103,15 +120,24 @@ class DemandSnapshot:
     manifest_path: Optional[Path] = None
     manifest_age_seconds: Optional[float] = None
     manifest_error: Optional[str] = None
-    unknown_profiles: Tuple[str, ...] = ()
+    unknown_profiles: tuple[str, ...] = ()
     captured_at: float = 0.0
 
     def for_profile(self, name: str) -> DemandFacts:
         return self.facts.get(name) or DemandFacts()
 
+    def wanted(self, name: str) -> bool:
+        """A LIVE pending-admission sighting for *name* — never part of the cached facts."""
+        return wanted(name)
+
     def has(self, name: str) -> bool:
-        """Does *name* hold demand? ``default`` is never ranked; callers keep it served anyway."""
-        return self.for_profile(name).has_demand()
+        """Does *name* hold demand? ``default`` is never ranked; callers keep it served anyway.
+
+        A client waiting on the profile right now counts even when every disk-derived source says
+        the profile holds nothing: that client is the work (PRX-5738).
+        """
+        return self.wanted(name) or self.for_profile(name).has_demand()
+
 
     def demand_source(self) -> dict:
         """The ``serving_decision.demand_source`` record (path, state, age)."""
@@ -173,12 +199,12 @@ def _read_manifest(path: Path):
         return MANIFEST_MALFORMED, {}, None, "manifest has no 'profiles' object"
     written_at = data.get("written_at")
     try:
-        written = datetime.fromisoformat(str(written_at).replace("Z", "+00:00"))
+        written = datetime.fromisoformat(str(written_at))  # 3.11+ accepts the trailing Z
     except ValueError:
         return MANIFEST_MALFORMED, {}, None, f"manifest written_at {written_at!r} is not an ISO timestamp"
     if written.tzinfo is None:
-        written = written.replace(tzinfo=timezone.utc)
-    age = max(0.0, (datetime.now(timezone.utc) - written).total_seconds())
+        written = written.replace(tzinfo=UTC)
+    age = max(0.0, (datetime.now(UTC) - written).total_seconds())
     parsed: dict[str, tuple[int, int]] = {}
     for name, entry in profiles.items():
         if not isinstance(entry, dict):
@@ -319,10 +345,64 @@ def reset() -> None:
     global _snapshot, _snapshot_at
     with _LOCK:
         _snapshot, _snapshot_at = None, None
+    _wanted.clear()
+
+
+def note_wanted(name: str, *, ttl: Optional[float] = None, clock=None) -> None:
+    """Record that a client asked for *name* and is waiting on its admission (PRX-5738).
+
+    The cheapest demand signal there is, and the only LIVE one: cron jobs, ``.env`` credentials and
+    the manifest all say a profile *could* hold work, where this says somebody is blocked on it
+    right now. The gateway records it at the seam where an inbound route to an unserved profile is
+    refused (``gateway.run_runtime.refuse_parked_scope`` /
+    ``gateway.parked_route_refusal.refuse_parked_route``), so the next reconcile tick can serve the
+    profile instead of leaving the client to fail fast forever (PRX-5725).
+
+    Evicting something is what makes that possible, so the profile that loses the slot is named in
+    the decision's ``pinned`` / ``deferred_for_demand`` records and in the INFO pin line. The TTL
+    is the whole safety property: a sighting expires on its own, so a client that asked once and
+    walked away cannot hold a ceiling slot for the life of the process.
+    """
+    if not name:
+        return
+    lifetime = WANTED_TTL_SECONDS if ttl is None else float(ttl)
+    _wanted[str(name)] = (clock or time.monotonic)() + lifetime
+
+
+def wanted(name: str, *, clock=None) -> bool:
+    """Is *name* pinned by a pending-admission sighting that has not expired? O(1), no I/O."""
+    key = str(name)
+    expiry = _wanted.get(key)
+    if expiry is None:
+        return False
+    if (clock or time.monotonic)() >= expiry:
+        _wanted.pop(key, None)  # the sighting went stale: the profile stops being pinned
+        return False
+    return True
+
+
+def wanted_signal(name: str) -> str:
+    """The work signal a ``wanted`` sighting justifies in the pin line and the deferral reason."""
+    return "a client is waiting (pending admission)"
 
 
 __all__ = [
-    "DEFAULT_MANIFEST_NAME", "DEFAULT_TTL_SECONDS", "DemandFacts", "DemandSnapshot",
-    "MANIFEST_ABSENT", "MANIFEST_KEY", "MANIFEST_MALFORMED", "MANIFEST_OK", "MANIFEST_STALE",
-    "SCHEMA_VERSION", "manifest_path", "refresh", "reset", "snapshot",
+    "DEFAULT_MANIFEST_NAME",
+    "DEFAULT_TTL_SECONDS",
+    "MANIFEST_ABSENT",
+    "MANIFEST_KEY",
+    "MANIFEST_MALFORMED",
+    "MANIFEST_OK",
+    "MANIFEST_STALE",
+    "SCHEMA_VERSION",
+    "WANTED_TTL_SECONDS",
+    "DemandFacts",
+    "DemandSnapshot",
+    "manifest_path",
+    "note_wanted",
+    "refresh",
+    "reset",
+    "snapshot",
+    "wanted",
+    "wanted_signal",
 ]

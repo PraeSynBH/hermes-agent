@@ -116,6 +116,11 @@ def refuse_parked_route(adapter, source, profile, reply_to=None):
     name = getattr(adapter, 'name', None) or getattr(getattr(source, 'platform', None), 'value', '?')
     chat_id = getattr(source, 'chat_id', '?')
     platform = getattr(getattr(source, 'platform', None), 'value', None) or '?'
+    # Somebody is waiting on this profile: its refusal is also the demand sighting the ceiling
+    # ranks on next tick (PRX-5738), so an unserved profile with a live client stops being the one
+    # deferred in favour of an idle one.
+    from hermes_cli import gateway_multiplex_demand as demand
+    demand.note_wanted(profile)
     scope = _retryable_ingress.get()
     if scope is not None and scope.open:
         scope.refused = True

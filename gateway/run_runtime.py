@@ -15,6 +15,7 @@ import asyncio
 import logging
 from pathlib import Path
 import uuid
+from datetime import UTC
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,10 @@ def refuse_parked_scope(runner):
     from hermes_constants import get_hermes_home
     name = served_profile_name(get_hermes_home())
     if profile_parked(runner, name):
+        # A client is blocked on this profile right now: record it as live demand (PRX-5738) so the
+        # next reconcile tick ranks it into the served set instead of refusing it forever.
+        from hermes_cli import gateway_multiplex_demand as demand
+        demand.note_wanted(name)
         from gateway.parked_route_refusal import ParkedProfileRefusal
         raise ParkedProfileRefusal(name)
 
@@ -265,7 +270,7 @@ def sync_capacity_parked(runner) -> bool:
 
 def _utc_now_iso() -> str:
     from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+    return datetime.now(UTC).isoformat(timespec='seconds')
 
 
 def _served_names(runner) -> set[str]:

@@ -172,12 +172,70 @@ def apply_ceiling(serve: Sequence[tuple[str, Path]], cap: Optional[int],
         # published before this module learned about demand.
         reason = f"{CAPACITY_REASON_PREFIX} {cap} profiles per gateway (gateway.{MAX_PROFILES_KEY})"
         deferred = {name: reason for name in ranked if name not in kept_names}
+        _remember_decision(cap, ranked, deferred, demand)
     else:
         head = deferral_head(cap)
         deferred = {name: f"{head}; {cost_clause(demand, name)}"
                     for name in ranked if name not in kept_names}
-    _remember_decision(cap, ranked, deferred, demand)
+        # Who the demand rank moved across the edge, in both directions: the profiles it KEPT that
+        # the pre-SOU-3075 order would have deferred (the pins) and the profiles that order would
+        # have kept instead (what the pins cost). PRX-5738 asks for both, by name, at INFO.
+        legacy_keep = set(_legacy_order(by_name, priority)[:max(0, cap - (1 if has_default else 0))])
+        pinned = {name: demand_signal(demand, name) for name in keep
+                  if name != "default" and name not in legacy_keep}
+        _remember_decision(cap, ranked, deferred, demand, pinned=pinned,
+                           deferred_for_demand=[n for n in legacy_keep if n not in kept_names])
     return [(name, by_name[name]) for name in keep if name in by_name], deferred
+
+
+def _legacy_order(by_name: dict[str, Path], priority: Iterable[str]) -> list[str]:
+    """The pre-SOU-3075 ranking (priority list in written order, then alphabetical).
+
+    Kept as the reference the demand rank is *reported against*, never as a fallback: it is how the
+    ceiling would have cut the same roster with no demand view, which is what makes "demand kept
+    this one, that one paid for it" a fact rather than a guess.
+    """
+    names = [name for name in priority if name in by_name and name != "default"]
+    return names + sorted(name for name in by_name if name != "default" and name not in names)
+
+
+def demand_signal(demand: Any, name: str) -> str:
+    """One short phrase naming the work that justified keeping *name* (the pin line's evidence)."""
+    from hermes_cli import gateway_multiplex_demand as demand_module
+    if _demand_flag(demand, "wanted", name):
+        return demand_module.wanted_signal(name)
+    facts = _demand_facts(demand, name)
+    cron_jobs = int(getattr(facts, "cron_jobs", 0) or 0)
+    if cron_jobs:
+        return f"{cron_jobs} enabled cron job{'s' if cron_jobs != 1 else ''}"
+    agents = getattr(facts, "agents", None)
+    if agents:
+        return f"{int(agents)} Paperclip agents"
+    credentials = tuple(getattr(facts, "credentials", ()) or ())
+    if credentials:
+        return f"connects as a bot ({len(credentials)} adapter credentials)"
+    return "demand unreadable" if getattr(facts, "unreadable", ()) else "demand"
+
+
+def _demand_facts(demand: Any, name: str):
+    getter = getattr(demand, "for_profile", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter(name)
+    except Exception:  # health: allow BLE001 -- a demand view that cannot answer costs a label
+        return None
+
+
+def _demand_flag(demand: Any, flag: str, name: str) -> bool:
+    getter = getattr(demand, flag, None)
+    if not callable(getter):
+        return False
+    try:
+        return bool(getter(name))
+    except Exception:  # health: allow BLE001 -- a label never stops the decision
+        return False
+
 
 
 def deferral_head(cap: Optional[int]) -> str:
@@ -208,11 +266,16 @@ def cost_clause(demand: Any, name: str) -> str:
     unreadable = tuple(getattr(facts, "unreadable", ()) or ())
     if unreadable:
         clause += f", demand unreadable: {', '.join(str(source) for source in unreadable)}"
+    if _demand_flag(demand, "wanted", name):
+        # The one cost an operator must never have to infer: somebody is blocked on this profile.
+        from hermes_cli import gateway_multiplex_demand as demand_module
+        clause += f", {demand_module.wanted_signal(name)}"
     return clause
 
 
 def _remember_decision(cap: Optional[int], ranked: Sequence[str], deferred: dict[str, str],
-                       demand: Any) -> None:
+                       demand: Any, *, pinned: Optional[dict[str, str]] = None,
+                       deferred_for_demand: Sequence[str] = ()) -> None:
     """Stash the ordered decision for ``last_decision()`` / the runtime-status publisher."""
     global _last_decision
     source = None
@@ -228,6 +291,8 @@ def _remember_decision(cap: Optional[int], ranked: Sequence[str], deferred: dict
         "ranked": list(ranked),
         "deferred": dict(deferred),
         "demand_source": source,
+        "pinned": dict(pinned or {}),
+        "deferred_for_demand": list(deferred_for_demand),
     }
 
 
@@ -242,7 +307,10 @@ def last_decision() -> Optional[dict]:
         "ranked": list(decision["ranked"]),
         "deferred": dict(decision["deferred"]),
         "demand_source": dict(decision["demand_source"]) if decision.get("demand_source") else None,
+        "pinned": dict(decision.get("pinned") or {}),
+        "deferred_for_demand": list(decision.get("deferred_for_demand") or []),
     }
+
 
 
 def _deferral_summary(name: str, reason: str) -> str:
@@ -275,6 +343,27 @@ def remember_deferred(deferred: dict[str, str]) -> None:
     else:
         logger.info("[MULTIPLEX] gateway.%s: every profile fits on this gateway again", MAX_PROFILES_KEY)
     _last_deferred = dict(deferred)
+    _log_demand_pins(deferred)
+
+
+def _log_demand_pins(deferred: dict[str, str]) -> None:
+    """INFO: which profiles demand kept at the edge, and which profile paid for each (PRX-5738).
+
+    ``parked_profiles`` answers "who is not served"; it cannot answer the operator's actual question
+    after an outage — *why is this one still up and that one down*. So the decision reports itself:
+    the profile the pre-demand order would have deferred but demand kept, with the signal that
+    justified it, next to the idle profile that lost the slot instead. Only on a changed decision,
+    and only when demand moved the edge — a roster where the rank changes nothing logs no extra line.
+    """
+    decision = _last_decision or {}
+    pinned = decision.get("pinned") or {}
+    if not deferred or not pinned:
+        return
+    kept = ", ".join(f"'{name}' ({signal})" for name, signal in sorted(pinned.items()))
+    paid = ", ".join(f"'{name}'" for name in sorted(decision.get("deferred_for_demand") or []))
+    logger.info("[MULTIPLEX] Pinned by demand: %s kept a slot; %s deferred instead (idle at the "
+                "ceiling edge)", kept, paid or "nobody")
+
 
 
 def deferred_by_capacity() -> dict[str, str]:
@@ -292,6 +381,6 @@ def reset_memo() -> None:
 
 __all__ = [
     "CAPACITY_REASON_PREFIX", "MAX_PROFILES_KEY", "PRIORITY_KEY", "apply_ceiling", "cost_clause",
-    "deferral_head", "deferred_by_capacity", "gateway_section", "last_decision", "profile_ceiling",
-    "remember_deferred", "reset_memo", "serve_priority",
+    "deferral_head", "deferred_by_capacity", "demand_signal", "gateway_section", "last_decision",
+    "profile_ceiling", "remember_deferred", "reset_memo", "serve_priority",
 ]
