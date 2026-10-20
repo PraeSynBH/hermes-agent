@@ -37,9 +37,13 @@ open toward *serving* demand, loudly. A source that could not be READ at all is 
 profile counts as demand-bearing (fail toward serving it) and is reported ``unreadable`` — treating
 an unreadable ``.env`` as "no demand" is the bug class this module exists to remove.
 
-Cost: :func:`snapshot` is TTL-memoised on a monotonic clock and performs **no I/O** inside the TTL;
-:func:`refresh` is the authoritative read and must be called off the event loop by the reconcile
-tick (``asyncio.to_thread``), exactly like the served-set signature sweep next door.
+Cost: :func:`snapshot` only reads the last snapshot — it performs **no I/O at all** once one exists,
+because the serving path calls it per inbound route (``/p/<profile>/``) on the event loop. A full
+sweep costs ~240 ms on a 42-profile host (~80 % of it python-dotenv interpolation of every ``.env``),
+so letting the read path re-read on any clock would stall the loop for a quarter second per request
+between ticks. :func:`refresh` is the authoritative read and runs off the event loop — from the
+reconcile tick (``asyncio.to_thread``) and at boot — and that 30 s tick, not a clock in this module,
+is what bounds demand staleness.
 """
 
 from __future__ import annotations
@@ -59,10 +63,6 @@ MANIFEST_KEY = "multiplex_demand_manifest"
 DEFAULT_MANIFEST_NAME = "gateway_demand.json"
 SCHEMA_VERSION = 1
 DEFAULT_TTL_SECONDS = 900.0
-#: Monotonic lifetime of one :class:`DemandSnapshot`. A 30 s reconcile tick plus this TTL bounds
-#: demand staleness at ~35 s — inside the 60 s acceptance — while an inbound route re-reading the
-#: snapshot pays no I/O inside the window.
-SNAPSHOT_TTL_SECONDS = 5.0
 
 #: How long ONE pending-admission sighting keeps a profile ranked as demand-bearing. Bounded on
 #: purpose: a client that asked once and gave up must not pin a ceiling slot forever, so a stale
@@ -150,7 +150,6 @@ class DemandSnapshot:
 
 _LOCK = threading.Lock()
 _snapshot: Optional[DemandSnapshot] = None
-_snapshot_at: Optional[float] = None
 
 
 def _default_home() -> Path:
@@ -278,7 +277,7 @@ def refresh() -> DemandSnapshot:
     Called off the event loop from the reconcile tick (``asyncio.to_thread``). A per-source failure
     is non-fatal and per-profile; only a failure that would mislabel a profile is recorded.
     """
-    global _snapshot, _snapshot_at
+    global _snapshot
     try:
         path = manifest_path()
         state, manifest, age, error = _read_manifest(path)
@@ -327,24 +326,30 @@ def refresh() -> DemandSnapshot:
         captured_at=time.time(),
     )
     with _LOCK:
-        _snapshot, _snapshot_at = snapshot, time.monotonic()
+        _snapshot = snapshot
     return snapshot
 
 
 def snapshot() -> DemandSnapshot:
-    """The current demand view, refreshed only when the 5 s TTL has lapsed (no I/O inside it)."""
+    """The current demand view. No I/O once a snapshot exists — see the module docstring.
+
+    The reconcile tick owns freshness (:func:`refresh`, off the event loop, every 30 s), so the
+    serving path — which calls this per inbound route on the loop — only ever pays a dict read. A
+    process that has never refreshed reads once here, which is what gives a one-shot caller
+    (``hermes gateway status``, a migration preflight) real demand instead of none.
+    """
     with _LOCK:
-        current, captured = _snapshot, _snapshot_at
-    if current is not None and captured is not None and (time.monotonic() - captured) < SNAPSHOT_TTL_SECONDS:
+        current = _snapshot
+    if current is not None:
         return current
     return refresh()
 
 
 def reset() -> None:
     """Drop the memoised snapshot (tests, and an operator who wants the next read to be fresh)."""
-    global _snapshot, _snapshot_at
+    global _snapshot
     with _LOCK:
-        _snapshot, _snapshot_at = None, None
+        _snapshot = None
     _wanted.clear()
 
 
