@@ -55,8 +55,8 @@ async def test_quiet_tick_keeps_ceiling_deferred_profiles_parked(tmp_path, monke
 
     assert set(runner.session_runtime_descriptor["parked_profiles"]) == {"charlie", "delta"}
     assert set(_parked_state(home)) == {"charlie", "delta"}
-    # Since SOU-3075 the reason states the trade as well (counts only, no names); the ceiling
-    # sentence this test pins is unchanged, and the whole map is still published every tick.
+    # Since SOU-3075 the reason also states the trade (counts only); the prefix and the ceiling
+    # sentence this test pins are unchanged, and the whole map is still published every tick.
     reasons = set(_parked_state(home).values())
     assert len(reasons) == 1
     (reason,) = reasons
