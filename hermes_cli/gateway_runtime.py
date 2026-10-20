@@ -16,8 +16,16 @@ if TYPE_CHECKING:
 # Total startup deadline a client waits for a cold daemon. A cold boot imports the whole
 # runtime, seeds the skill library and warms the turn machinery: ~10-20 s on a loaded
 # 32-core CI runner with dozens of sibling boots, where 30 s tipped every attaching client
-# of a parallel e2e shard into `starting: deadline`. A minute is still a verdict, not a hang.
-DEFAULT_ENSURE_TIMEOUT = 60.0
+# of a parallel e2e shard into `starting: deadline`. A minute is still a verdict, not a hang
+# — but on this production host a minute is also SHORTER than the boot it bounds, so it was
+# never a verdict about the boot at all: measured `state/gateway.lifecycle.json`
+# create_time -> start_time is 62.09 s at 21:36:08Z and 45.69 s at 23:06:08Z under load 129
+# (12 cores). At 60 s any dispatch landing inside a real boot lost its run on a healthy
+# daemon (PRX-5625: 21 runs in 24 h, 151 host-wide, durations 69-85 s — the cap plus the
+# process overhead around it). The bound must sit ABOVE the boot cost it measures, or it
+# reports the boot as a failure. It stays a cap, not a hang: ``admit_owner`` spends it from
+# the one admission budget and a boot that outlives the budget is named as such.
+DEFAULT_ENSURE_TIMEOUT = 120.0
 
 
 @dataclass(frozen=True)

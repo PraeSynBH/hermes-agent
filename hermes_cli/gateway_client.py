@@ -70,6 +70,10 @@ GATEWAY_ADMISSION_BUDGET_S = 120.0
 # A live update fence is polled this often while an admission waits it out, so a 9-minute install
 # update (2026-10-19: 18:54-19:03Z) costs a wake-up rather than a run.
 UPDATE_FENCE_POLL_INTERVAL_S = 2.0
+# A boot in progress is re-observed this often when an ensure call expires while the owner is
+# still `starting` (a cold boot longer than the per-call cap), so the rest of the admission budget
+# is spent watching an owner that IS coming up instead of reporting it as a failure.
+BOOT_POLL_INTERVAL_S = 1.0
 # The bound on sampling the owner's loop at the moment this run dies at admission: the owner is
 # already stalling, so the probe is allowed less than the slack a healthy loop answers in
 # milliseconds, and a no-answer is reported as a floor (``owner_loop>2s``), never as healthy.
@@ -523,32 +527,58 @@ async def connect_gateway(endpoint=None, subject=None):
             raise GatewayClientError(detail) from exc
 
     async def admit_owner(home):
-        """Ensure an owner, waiting out a live update fence instead of failing at t=0.
+        """Ensure an owner, waiting out what legitimately takes time instead of failing at it.
 
-        An update owns the install for minutes (2026-10-19: 18:54-19:03Z) and every run started in
-        that window died in under a second on ``Gateway draining: update_paused`` — six of them,
-        and the survivors went on to die at the budget once the fence cleared. The fence is a wait,
-        not a verdict: poll it within this run's ONE budget and admit as soon as it clears, and name
-        the fence's owner (pid + update run) if the fence outlives the budget.
+        Two states are WAITS inside this run's one admission budget, not verdicts:
+
+        * ``update_paused`` — an update owns the install for minutes (2026-10-19: 18:54-19:03Z) and
+          every run started in that window died in under a second on
+          ``Gateway draining: update_paused`` — six of them, and the survivors went on to die at the
+          budget once the fence cleared. Poll it and admit as soon as it clears; name the fence's
+          owner (pid + update run) if the fence outlives the budget.
+        * ``starting`` — a cold boot is 45.7-62.1 s on this host (``state/gateway.lifecycle.json``),
+          and the ensure call returns ``starting: deadline`` the moment its own cap expires. That
+          is a healthy daemon coming up, and it was being reported as ``adapter_failed`` on dispatch
+          (PRX-5625: 21 runs in 24 h in this company, 151 host-wide). Keep observing it for as long
+          as the budget lasts; a boot that outlives the budget is named as a boot, not as a
+          mystery string.
         """
         nonlocal phase
         fence = None
+        boot = None
         while True:
+            # The per-attempt cap is the boot deadline (now above the measured boot cost); the
+            # whole loop is bounded by the one admission budget, so a lower cap can only cost
+            # re-observation, never a run.
             cap = left(DEFAULT_ENSURE_TIMEOUT)
             if cap <= 0:
-                if fence is None:
+                if fence is None and boot is None:
                     raise spent("Gateway connection failed; no local fallback "
                                 f"(phase={phase}, elapsed={time.monotonic() - started:.1f}s, "
                                 "admission budget spent before an owner could be ensured)")
                 break
             result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True, timeout=cap)
-            if result.reason_code != "update_paused":
-                return result
-            fence = getattr(result, "detail", None) or "update fence live"
-            if left(1.0) <= 0:
-                break
-            phase = "update-fence"
-            await asyncio.sleep(min(UPDATE_FENCE_POLL_INTERVAL_S, left(UPDATE_FENCE_POLL_INTERVAL_S)))
+            if result.reason_code == "update_paused":
+                fence = getattr(result, "detail", None) or "update fence live"
+                if left(1.0) <= 0:
+                    break
+                phase = "update-fence"
+                await asyncio.sleep(min(UPDATE_FENCE_POLL_INTERVAL_S, left(UPDATE_FENCE_POLL_INTERVAL_S)))
+                continue
+            if result.state == "starting":
+                boot = f"{result.state}: {result.reason_code or 'not_ready'}"
+                if left(1.0) <= 0:
+                    break
+                phase = "runtime-boot"
+                await asyncio.sleep(min(BOOT_POLL_INTERVAL_S, left(BOOT_POLL_INTERVAL_S)))
+                continue
+            return result
+        # The budget is gone while the owner was still coming up. That is the admission class (the
+        # owner never accepted this run), and the text says which wait ate the budget.
+        if boot is not None:
+            raise spent(f"Gateway connection failed; no local fallback (phase=runtime-boot, "
+                        f"elapsed={time.monotonic() - started:.1f}s, owner was still booting at "
+                        f"the budget: {boot}, boot deadline {DEFAULT_ENSURE_TIMEOUT:g}s)")
         # The fence outlived the budget. This is not owner starvation — an install update holds the
         # install — so the failure keeps the class a retry chain already handles (the owner is
         # draining, not starving) and spends its words on WHO held it and how long we waited.
