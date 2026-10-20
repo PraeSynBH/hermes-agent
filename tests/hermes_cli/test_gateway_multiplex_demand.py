@@ -3,8 +3,8 @@
 The ceiling used to be ranked by a hand-maintained priority list, so a profile that acquired its
 first agent or cron job stayed deferred behind one that held nothing. These pin the three demand
 sources, the manifest's staleness policy, and the two properties the hot path depends on: a snapshot
-inside its TTL performs NO I/O, and a source that cannot be read counts as demand (never as "no
-work").
+never re-reads once it exists (the serving path calls it per inbound route on the event loop), and a
+source that cannot be read counts as demand (never as "no work").
 """
 
 from __future__ import annotations
@@ -208,8 +208,14 @@ class TestManifest:
 
 
 class TestSnapshotCost:
-    def test_a_second_call_inside_the_ttl_performs_no_io(self, profile_env, monkeypatch):
-        """The serving path calls snapshot() per inbound route: inside the TTL it must read nothing."""
+    def test_snapshot_never_reads_again_however_long_it_has_been_captured(self, profile_env, monkeypatch):
+        """The serving path calls snapshot() per inbound route on the event loop: never a re-read.
+
+        A 5 s TTL only made bursts cheap — 25 s out of every 30 s tick the next inbound request paid
+        the whole sweep (~240 ms on a 42-profile host, python-dotenv interpolation included). The
+        tick owns freshness, so the read path is unconditional: a dict read or, if nothing has ever
+        been captured, one refresh.
+        """
         busy = _profile("busy")
         _write_jobs(busy, enabled=1)
         reads: list[str] = []
@@ -226,10 +232,16 @@ class TestSnapshotCost:
         first = demand.snapshot()
         performed = len(reads)
         assert performed > 0
-        second = demand.snapshot()
-
-        assert second is first
+        with monkeypatch.context() as clock:
+            # Any clock-based window has long lapsed; the read path still touches nothing.
+            clock.setattr(demand.time, "monotonic", lambda: 10 ** 9)
+            clock.setattr(demand.time, "time", lambda: 10 ** 9)
+            assert demand.snapshot() is first
         assert len(reads) == performed
+        # A change lands on the tick's refresh, and only there.
+        _write_jobs(busy, enabled=0)
+        assert demand.snapshot().has("busy") is True
+        assert demand.refresh().has("busy") is False
 
     def test_refresh_is_the_authoritative_read(self, profile_env):
         busy = _profile("busy")
