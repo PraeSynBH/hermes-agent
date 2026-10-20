@@ -212,12 +212,26 @@ def test_source_publication_leaves_external_install_launchers_alone(source_launc
     assert launcher.read_text(encoding="utf-8") == "externally owned launcher\n"
 
 
+def _trees(root):
+    """Every dependency tree this install has published.
+
+    A tree is keyed by its content, not by the checkout path (``pm.generation_store``), so it
+    lives in the shared store rather than under ``<state>/environments``: a launch that installs
+    nothing leaves this set alone, and one that installs adds exactly one tree to it.
+    """
+    from pm import generation_store
+
+    kind = generation_store.store_root() / generation_store.VENV
+    return {tree for tree in kind.iterdir()} if kind.is_dir() else set()
+
+
 def _fact(root):
     fact = Facts(runtime_facts_path(root), strict=True).get("venv")
     assert fact is not None
     selected = selected_venv(root)
     assert Path(fact["environment"]) == selected
-    assert selected.is_relative_to(install_state_dir(root) / "environments")
+    assert (selected.is_relative_to(install_state_dir(root) / "environments")
+            or selected.parent in _trees(root))
     assert (selected / "pyvenv.cfg").is_file()
     assert Path(fact["resolved_lock"]).is_file()
     probe = subprocess.run(
@@ -246,14 +260,14 @@ def test_launch_without_marker_publishes_then_skips_and_rebuilds_on_lock_change(
     assert first["extras"] == ["all"]
     assert pm.venv_is_current(project_root=root)
     facts_bytes = runtime_facts_path(root).read_bytes()
-    generations = set((install_state_dir(root) / "environments").iterdir())
+    generations = _trees(root)
     receipts = _receipts(tmp_path)
     assert receipts
 
     # A caller still in its old interpreter must re-exec, but must not sync again.
     assert venv_sync.prepare_launch(root, []) == store_python
     assert runtime_facts_path(root).read_bytes() == facts_bytes
-    assert set((install_state_dir(root) / "environments").iterdir()) == generations
+    assert _trees(root) == generations
     assert _receipts(tmp_path) == receipts, "current launch performed another sync"
 
     lock = root / "uv.lock"
@@ -301,7 +315,7 @@ def test_failed_real_sync_preserves_previous_selection_and_retries(source_launch
     pm.sync_venv(["launch-extra"], explicit=True, project_root=root)
     previous = _fact(root)
     facts_bytes = runtime_facts_path(root).read_bytes()
-    generations = set((install_state_dir(root) / "environments").iterdir())
+    generations = _trees(root)
     lock = root / "uv.lock"
     valid_lock = lock.read_bytes()
     lock.write_text("version = 1\nnot valid TOML\n", encoding="utf-8")
@@ -317,7 +331,7 @@ def test_failed_real_sync_preserves_previous_selection_and_retries(source_launch
         assert json.loads(failed.read_text(encoding="utf-8"))["outcome"] == "failed"
         assert runtime_facts_path(root).read_bytes() == facts_bytes
         assert _fact(root) == previous
-        assert set((install_state_dir(root) / "environments").iterdir()) == generations
+        assert _trees(root) == generations
         assert not pm.venv_is_current(project_root=root)
         assert all(marker.read_text(encoding="utf-8") == "legacy pending install" for marker in markers)
 

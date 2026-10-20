@@ -205,24 +205,28 @@ def _inside_checkout(candidate: str, checkout_root: Path, original_argv0: str) -
 
 
 def _is_this_checkout_managed_cli(candidate: str, checkout_root: Path) -> bool:
-    """True when *candidate* is this checkout's PM-managed console script.
+    """True when *candidate* is a PM-managed console script for this checkout.
 
-    That script lives under ``installs/<key>/environments`` and imports a
-    generated workspace that does not ship ``apps/desktop``. It sits outside
-    the checkout, so the external-primary rule would persist it and the
-    desktop launcher would exit with the GUI source missing.
+    That script lives under ``installs/<key>/environments`` -- or, since dependency trees are
+    keyed by content, in the shared tree store those states select -- and imports a generated
+    workspace that does not ship ``apps/desktop``. It sits outside the checkout, so the
+    external-primary rule would persist it and the desktop launcher would exit with the GUI
+    source missing.
     """
     try:
         path = Path(candidate).resolve()
     except OSError:
         return False
     try:
-        from pm.environments import install_state_dir
+        from pm.environments import dependency_trees_root, install_state_dir
 
-        generations = (install_state_dir(Path(checkout_root)) / "environments").resolve()
+        for root in (install_state_dir(Path(checkout_root)) / "environments", dependency_trees_root()):
+            generations = root.resolve()
+            if path == generations or generations in path.parents:
+                return True
     except (OSError, RuntimeError, ValueError):
         return False
-    return path == generations or generations in path.parents
+    return False
 
 
 def _resolve_hermes_bin_for_desktop_entry(

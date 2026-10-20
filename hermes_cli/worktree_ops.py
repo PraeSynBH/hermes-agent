@@ -1185,6 +1185,11 @@ def _reclaim_install_states(repo_root: str) -> None:
         evicted = collect_stale_install_states(installs, active=[install_state_dir(Path(repo_root))])
         if evicted:
             logger.info("Evicted %d stale dependency state dir(s) past the retention floor", len(evicted))
+        from pm.generation_store import collect_unreferenced
+
+        released = collect_unreferenced(installs)
+        if released:
+            logger.info("Released %d dependency tree(s) no checkout selects", len(released))
         collect_superseded_generations(Path(repo_root))
     except Exception:
         logger.debug("Install-state reclaim failed", exc_info=True)

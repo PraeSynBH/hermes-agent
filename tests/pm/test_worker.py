@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 import subprocess
 import shutil
@@ -521,8 +522,11 @@ def test_foreign_checkout_sync_uses_its_own_pm_generation(client, tmp_path, monk
     client.sync_venv([], project_root=foreign, plugins=Members([]), explicit=True)
     selected = selected_venv(foreign)
     assert selected != foreign / "venv"
-    assert selected.is_relative_to(runtime_facts_path(foreign).parent)
+    # Trees are content-keyed (pm.generation_store), so the environment lives in the shared
+    # store; what must not leak is the *record*: it belongs to the checkout that synced.
     assert runtime_facts_path(foreign).is_file()
+    recorded = json.loads(runtime_facts_path(foreign).read_text(encoding="utf-8"))
+    assert recorded["packages"]["venv"]["environment"] == str(selected)
     assert venv_is_current(project_root=foreign)
     assert paths.repo_root() == original_root
     assert not runtime_facts_path(original_root).exists()

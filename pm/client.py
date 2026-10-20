@@ -342,11 +342,17 @@ def ensure_environment(
 def ensure_project_environment(
     name: str, project: Path, *, extras: Sequence[str] = (), groups: Sequence[str] = (),
     root: Path | None = None, explicit: bool = False, timeout: int = 1800,
+    shared: bool = False,
 ) -> Path:
-    """Select an isolated environment of the project's locked dependencies."""
+    """Select an isolated environment of the project's locked dependencies.
+
+    *shared* keeps the environment in the content-keyed tree store
+    (``pm.generation_store``) instead of under *root*, so checkouts on identical inputs reuse
+    one tree.
+    """
     return Path(_python_operation("ensure_project_environment", {
         "name": name, "project": Path(project), "extras": list(extras), "groups": list(groups),
-        "root": root, "explicit": explicit, "timeout": timeout,
+        "root": root, "explicit": explicit, "timeout": timeout, "shared": shared,
     }))
 
 

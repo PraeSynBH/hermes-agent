@@ -137,10 +137,30 @@ def _selection(root: Path) -> dict:
         return {}
     except (OSError, ValueError) as exc:
         raise InstallError("venv", f"cannot read environment selection: {root}") from exc
-    if (not isinstance(record, dict) or not isinstance(record.get("generation"), str)
-            or not re.fullmatch(r"gen-[0-9a-f]{32}", record["generation"])):
+    if not isinstance(record, dict) or not isinstance(record.get("generation"), str):
+        raise InstallError("venv", f"invalid environment selection: {root}")
+    # A content-keyed environment lives in the shared tree store, not under this root
+    # (pm.generation_store); the record names it by absolute path.
+    shared = record.get("environment")
+    if shared is not None:
+        if not isinstance(shared, str) or not shared:
+            raise InstallError("venv", f"invalid environment selection: {root}")
+        return record
+    if not re.fullmatch(r"gen-[0-9a-f]{32}", record["generation"]):
         raise InstallError("venv", f"invalid environment selection: {root}")
     return record
+
+
+def _selected_environment(root: Path, selected: dict) -> Path:
+    """The venv a selection record names: a shared tree, or a generation under its own root."""
+    shared = selected.get("environment")
+    return Path(shared) if shared else root / selected["generation"] / "venv"
+
+
+def _shared_root() -> Path:
+    from pm.generation_store import store_root
+
+    return store_root().resolve()
 
 
 def environment_python(name: str, *, root: Path | None = None) -> Path | None:
@@ -149,8 +169,9 @@ def environment_python(name: str, *, root: Path | None = None) -> Path | None:
     selected = _selection(root)
     if not selected:
         return None
-    environment = root / selected["generation"] / "venv"
-    if not environment.resolve().is_relative_to(root.resolve()):
+    environment = _selected_environment(root, selected)
+    if not (environment.resolve().is_relative_to(root.resolve())
+            or environment.resolve().is_relative_to(_shared_root())):
         raise InstallError(name, "selected environment escapes its root")
     python = _python(environment)
     return python if python.is_file() and (environment / "pyvenv.cfg").is_file() else None
@@ -217,7 +238,7 @@ def ensure_environment(
 
 def ensure_project_environment(
     name: str, project: Path, *, extras: Sequence[str] = (), groups: Sequence[str] = (),
-    root: Path | None = None, explicit: bool = False, timeout: int = 1800,
+    root: Path | None = None, explicit: bool = False, timeout: int = 1800, shared: bool = False,
 ) -> Path:
     """Make an isolated environment of a project's LOCKED dependencies current.
 
@@ -225,6 +246,12 @@ def ensure_project_environment(
     selected application generation: this serves side environments such as the
     test suite's. The identity covers the lock and manifest bytes, so any edit
     that can change the resolved set selects a fresh generation.
+
+    *shared* puts that generation in the content-keyed tree store
+    (``pm.generation_store``) instead of under *root*, so every checkout whose test dependencies
+    hash to the same identity reuses one environment rather than building its own ~381 MB copy.
+    The checkout's record still names it, which is both the selection and the reference the
+    collector reads.
     """
     root = _environment_root(name, root)
     project = Path(project).absolute()
@@ -242,17 +269,40 @@ def ensure_project_environment(
                                  frozen=True, explicit=explicit, timeout=timeout)
 
     return _ensure_generation(name, root, {"manifests": manifests, "extras": extras, "groups": groups},
-                              build, record={"extras": extras, "groups": groups}, explicit=explicit)
+                              build, record={"extras": extras, "groups": groups}, explicit=explicit,
+                              shared_kind=f"project-{name}" if shared else None)
+
+
+def _build_shared(name: str, root: Path, kind: str, key: str, base_python: Path,
+                  build: Callable[[Path, Path], Path], *, record: dict,
+                  executable: str | None) -> Path:
+    """Build or adopt the shared tree for *key*, then record it for this checkout."""
+    from pm import generation_store
+    from pm.lock import _write
+
+    def prepare(target: Path) -> None:
+        python = build(target, base_python)
+        if executable is not None and _tool(python, executable) is None:
+            raise InstallError(name, f"installed requirements do not provide {executable!r}")
+
+    entry = generation_store.build(kind, key, prepare, checkout=root)
+    # The environment itself was flushed before its complete marker; the record that selects it
+    # is written last, exactly as the per-root layout does.
+    _write(root / "active.json", {"generation": entry.name, "environment": str(entry / "venv"),
+                                  "inputs": key, **record})
+    return _python(entry / "venv")
 
 
 def _ensure_generation(
     name: str, root: Path, inputs: dict, build: Callable[[Path, Path], Path], *, record: dict, explicit: bool,
-    executable: str | None = None,
+    executable: str | None = None, shared_kind: str | None = None,
 ) -> Path:
     """Select the generation whose inputs match, building one only when none does.
 
     Build at the final path: Windows launchers and scripts embed that path.
     The prior generation survives both successful replacement and failed builds.
+    *shared_kind* names the content-keyed store the generation belongs to
+    (``pm.generation_store``); without it the generation lives under *root*.
     """
     from pm.filesystem import lock_fd, native
     from pm._uv import _toolchain
@@ -304,6 +354,9 @@ def _ensure_generation(
             if tools is None:
                 raise InstallError(name, "PM's pinned toolchain is unavailable")
             base_python = tools[1].resolve()
+        if shared_kind is not None:
+            return _build_shared(name, root, shared_kind, identity(base_python), base_python, build,
+                                 record=record, executable=executable)
         generation = root / f"gen-{uuid.uuid4().hex}"
         generation.mkdir()
         try:

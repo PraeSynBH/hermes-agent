@@ -40,6 +40,7 @@ only the window before a starting launch announces itself through that lock.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import shutil
@@ -100,6 +101,42 @@ def orphan_install_states(installs: Path) -> list[Path]:
     return orphans
 
 
+def _json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _selected_tree(state: Path) -> Path | None:
+    """The shared content-keyed tree this state's records select, if any.
+
+    A live process leases the generation it booted into, and since dependency trees are keyed by
+    content (``pm.generation_store``) that generation can sit outside the state. Evicting a state
+    whose tree is leased would take away the record the next launch needs, so it holds the state
+    exactly as an in-state generation's lease does.
+    """
+    from pm.generation_store import store_root
+
+    shared = store_root().resolve()
+    facts = _json(state / "facts.json")
+    packages = facts.get("packages")
+    venv = packages.get("venv") if isinstance(packages, dict) else None
+    selected = [venv.get("environment") if isinstance(venv, dict) else None,
+                _json(state / "test-environment" / "active.json").get("environment")]
+    for value in selected:
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            path = Path(value).resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if path.is_relative_to(shared):
+            return path.parent
+    return None
+
+
 def _held(state: Path) -> bool:
     """True while a process may still be using this state dir: the install lock is taken or a
     generation lease is held. Any lock we cannot even open counts as held."""
@@ -122,7 +159,8 @@ def _held(state: Path) -> bool:
             for generation in generations.iterdir():
                 if generation.is_dir() and (generation / ".leases").is_dir() and leases_held(generation):
                     return True
-    return False
+    tree = _selected_tree(state)
+    return tree is not None and leases_held(tree)
 
 
 def _last_used(state: Path) -> float:

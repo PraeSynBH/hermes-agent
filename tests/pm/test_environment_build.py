@@ -713,6 +713,7 @@ def test_real_sync_retains_selection_until_commit(locked_project, tmp_path, monk
     from pm import paths
     from pm.lock import Facts
     from pm.environments import selected_venv
+    from pm.install import venv_is_current
 
     source, uv, _env = locked_project
     monkeypatch.setattr(paths, "repo_root", lambda: source)
@@ -736,10 +737,12 @@ def test_real_sync_retains_selection_until_commit(locked_project, tmp_path, monk
         assert selected_venv(source) == old
         assert paths.runtime_facts_path().read_bytes() == facts
     elif failure == "missing-cfg":
+        # A tree that lost the interpreter record is rebuilt from the same inputs, and its content
+        # key is therefore the same: what must hold is a usable environment, not a new path.
         (old / "pyvenv.cfg").unlink()
         engine.sync_venv(["chosen"], plugins=Members([]), explicit=True)
-        assert selected_venv(source) != old
         assert (selected_venv(source) / "pyvenv.cfg").is_file()
+        assert venv_is_current(project_root=source)
     else:
         monkeypatch.setattr("pm.client.sync_venv", engine.sync_venv)
         monkeypatch.setattr(extras, "available", lambda _: False)

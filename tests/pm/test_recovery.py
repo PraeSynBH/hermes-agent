@@ -16,6 +16,14 @@ from pm.runtime import runtime_environment
 from tests.pm._fixtures import _wheel
 
 
+def _published_trees() -> set[Path]:
+    """Every dependency tree this install has published (they are content-keyed, not per path)."""
+    from pm import generation_store
+
+    kind = generation_store.store_root() / generation_store.VENV
+    return set(kind.iterdir()) if kind.is_dir() else set()
+
+
 
 
 @pytest.mark.parametrize("failure", [None, "missing_distribution", "broken_module"])
@@ -190,7 +198,7 @@ def test_uncertain_profile_selection_skips_sync_but_not_admission_or_recorded_re
     old = selected_venv(core)
     before_facts = paths.runtime_facts_path().read_bytes()
     before_config = active_config.read_bytes()
-    before_generations = set((install_state_dir(core) / "environments").iterdir())
+    before_trees = set(_published_trees())
     old_lock = Path(Facts(paths.runtime_facts_path()).get("venv")["resolved_lock"]).read_bytes()
     sibling_config.write_text("plugins:\n  enabled: [unclosed\n", encoding="utf-8")
     damaged_config = sibling_config.read_bytes()
@@ -200,7 +208,7 @@ def test_uncertain_profile_selection_skips_sync_but_not_admission_or_recorded_re
     assert paths.runtime_facts_path().read_bytes() == before_facts
     assert active_config.read_bytes() == before_config
     assert selected_venv(core) == old
-    assert set((install_state_dir(core) / "environments").iterdir()) == before_generations
+    assert set(_published_trees()) == before_trees
 
     shutil.rmtree(site_packages(old) / "plugin_dep")
     engine.sync_venv(repair=True)

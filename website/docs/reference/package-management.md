@@ -111,13 +111,22 @@ which data root a process uses.
 | Shared writable tool entries | `tools/` under the resolved default Hermes root. |
 | Resumable downloads | `cache/partials/` under that root, not inside a signed payload. |
 | Per-install selection and journal | `installs/INSTALL_KEY/` under the dependency-state root. |
-| Python generations | `installs/INSTALL_KEY/environments/`. |
+| Python generations | `installs/.generations/` — one tree per content key. |
+| Legacy per-checkout generations | `installs/INSTALL_KEY/environments/` (selected by records written before trees were content-keyed). |
 | Sync and update receipts | `logs/update_receipts/` under the active home. |
 
-The install key derives from the canonical source or payload-repository path.
-Separate checkouts therefore have separate Python selections. Profiles that
-share an installation can contribute dependencies to the same environment.
-Their configuration and credentials remain profile-scoped.
+The install key derives from the canonical source or payload-repository path, so
+a checkout keeps its own selection, install lock and input stamps: that is what
+the orphan and count tiers read. The *trees* those selections name are keyed by
+content instead — `uv.lock`, the enabled extras, the pinned interpreter, the
+plugin member set — so every checkout whose inputs hash to the same key shares
+one environment, and a worktree created minutes ago adopts the tree an earlier
+launch built instead of installing a copy of it. Different inputs can never name
+the same tree, and a published tree is immutable: a repair publishes a tree of
+its own rather than writing into the one a running process may still be reading.
+A tree is removed once no checkout's record names it and no process leases it.
+Profiles that share an installation can contribute dependencies to the same
+environment. Their configuration and credentials remain profile-scoped.
 
 Do not edit facts or generation paths manually. Launchers resolve the selected
 environment before third-party imports. Processes retain their existing imports
@@ -535,7 +544,7 @@ hermes pm install chromium
 | `pm doctor` | Check installed tool identities, files, and digests against the lock. |
 | `pm repair` | Rebuild the recorded Python dependency set in a new generation, validate it, then select it. Does not update pins, features, or plugin configuration. |
 | `pm status` | Print the latest sync/update receipt as JSON, or report that no receipt exists. |
-| `pm gc` | Remove unreferenced tool-store entries, eligible download partials, unused lease-managed Python generations, and the `installs/INSTALL_KEY/` state of deleted checkouts (a worktree removed from a `.worktrees/` dir that still exists, or a clone under the data root; checkouts this process cannot see, such as a host install viewed from a container sharing the data root, are kept, as is any state whose install lock or generation lease is still held). Past that, install states are bounded by count: the four most recently used are kept and every unheld one below them is evicted even though its checkout still exists, which is what bounds a harness that keeps one worktree per task (a fixed keep count, not an idle floor — an idle floor holds every tree a burst of launches created, which is the growth itself). The one exception is a state younger than 15 minutes: a launch creates its state dir before it takes the install lock, so that window is skipped rather than raced. Eviction only costs a rebuild on that checkout's next launch. The worktree pruner that runs at startup reclaims both kinds of state dir too. |
+| `pm gc` | Remove unreferenced tool-store entries, eligible download partials, unused lease-managed Python generations, and the `installs/INSTALL_KEY/` state of deleted checkouts (a worktree removed from a `.worktrees/` dir that still exists, or a clone under the data root; checkouts this process cannot see, such as a host install viewed from a container sharing the data root, are kept, as is any state whose install lock or generation lease is still held). Past that, install states are bounded by count: the four most recently used are kept and every unheld one below them is evicted even though its checkout still exists, which is what bounds a harness that keeps one worktree per task (a fixed keep count, not an idle floor — an idle floor holds every tree a burst of launches created, which is the growth itself). The one exception is a state younger than 15 minutes: a launch creates its state dir before it takes the install lock, so that window is skipped rather than raced. Eviction only costs a rebuild on that checkout's next launch. Content-keyed trees (`installs/.generations/`) are then released once no surviving record names them and no process leases them, so the shared environment three worktrees were using survives the first two being evicted. The worktree pruner that runs at startup reclaims both kinds of state dir too. |
 
 `pm env` excludes inherited process variables, including credentials. Its
 output can still reveal local installation paths; review it before sharing.
