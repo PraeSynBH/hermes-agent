@@ -722,12 +722,22 @@ class GatewayStartupMixin:
                 )
             except Exception:
                 logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
+        alarm = getattr(self, "_loop_latency_alarm", None)
+        if alarm is None or not alarm.is_alive():
+            with _log_suppressed(logging.DEBUG, "Failed to start gateway loop latency alarm", exc_info=True):
+                # Beside the watchdog, not inside it: the watchdog stays silent by design until the
+                # loop is so far gone that it hard-exits (~90-120 s), while a 25 s stall is already a
+                # fleet-wide admission outage — three agents sat "errored" for ~90 minutes on
+                # 2026-10-19 with nothing but a human reading the board (PRX-5598).
+                from gateway.loop_latency import start_loop_latency_alarm
+                self._loop_latency_alarm = start_loop_latency_alarm()
 
     def _stop_loop_liveness_guards(self) -> None:
         """Disarm lifetime liveness guards before shutdown can load the loop — including the
         heartbeat writer, which would otherwise make a draining gateway look healthy to probes."""
         for attr, method, what in (
             ("_loop_liveness_watchdog", "stop", "stop gateway loop liveness watchdog"),
+            ("_loop_latency_alarm", "stop", "stop gateway loop latency alarm"),
             ("_loop_floor_timer_handle", "cancel", "cancel gateway loop floor timer"),
             ("_loop_heartbeat_task", "cancel", "cancel gateway loop heartbeat task"),
         ):
