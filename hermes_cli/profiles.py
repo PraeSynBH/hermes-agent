@@ -20,6 +20,11 @@ from agent.file_safety import HOME_CREDENTIAL_DIRS
 from hermes_cli.archive_safe import archive_root_dirs, make_targz, normalize_archive_parts, safe_extract_targz
 from hermes_cli.home_data_layout import PM_RUNTIME_ROOT_DIRS
 from hermes_cli.profiles_remove import _rmtree_make_writable, _rmtree_with_retry, wait_profile_unowned
+# Facade re-export: the serving decision lives in its own sibling, which owns the
+# gateway.multiplex_max_profiles ceiling. Callers keep importing it from here.
+from hermes_cli.profiles_serve import (
+    _parked_default_warned, parked_marker_path, profile_is_parked, profiles_to_serve,
+)
 from hermes_constants import (
     LOCAL_RUNTIME_ROOT_DIRS, PROFILE_ID_RE, clear_named_profile_deleted, mark_named_profile_deleted,
     named_profile_has_identity, named_profile_is_deleted, named_profile_is_live,
@@ -1119,46 +1124,6 @@ def _standalone_truthy(value: object) -> bool:
     if isinstance(value, str):
         return _bool_token(value) is True
     return bool(value)
-
-
-def parked_marker_path(home: Path) -> Path:
-    return Path(home) / "gateway.parked"
-
-
-def profile_is_parked(home: Path) -> bool:
-    """Marker contents are deliberately irrelevant, including for provisioning."""
-    return parked_marker_path(home).exists()
-
-
-_parked_default_warned: set[Path] = set()
-
-
-def profiles_to_serve(multiplex: bool, *, include_standalone: bool = False,
-                      include_parked: bool = False) -> list[tuple[str, Path]]:
-    """``(profile_name, hermes_home)`` pairs a gateway should serve — the single chokepoint
-    for "which profiles does the inbound gateway handle".
-
-    ``multiplex=False``: exactly one entry for the *active* profile (byte-for-byte the
-    historical single-profile behavior; name is ``"default"`` or the named profile's id).
-    ``multiplex=True``: default plus every live named profile under ``profiles/`` (tombstoned
-    and parked profiles skipped). Pure directory read: never creates a profile dir (#94590).
-
-    Named profiles that authored ``gateway.standalone: true`` are skipped because they opted
-    out of the host multiplexer; a ``gateway.parked`` marker (``hermes -p X gateway stop``) skips
-    a profile the host would otherwise serve. Callers enumerating INSTALLED profiles pass
-    ``include_standalone=True, include_parked=True``; serving/ticking callers pass neither."""
-    active = get_active_profile_name() or "default"
-    default = _get_default_hermes_home()
-    if profile_is_parked(default) and default not in _parked_default_warned:
-        logger.warning("Ignoring gateway.parked for the default profile; stop the host gateway instead")
-        _parked_default_warned.add(default)
-    if not multiplex:
-        return [(active, get_profile_dir(active))]
-    serve: list[tuple[str, Path]] = [("default", default)]
-    serve.extend((entry.name, entry) for entry in _iter_named_profile_dirs()
-                 if (include_standalone or not profile_is_standalone(entry))
-                 and (include_parked or not profile_is_parked(entry)))
-    return serve
 
 
 def _resolve_clone_source(clone_from: Optional[str]) -> Path:

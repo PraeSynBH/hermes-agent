@@ -1049,8 +1049,12 @@ class GatewayAdapterLifecycleMixin:
         with _log_suppressed(logging.DEBUG, "could not record served_profiles", exc_info=True):
             from gateway.status import publish_runtime_status
             from gateway.pairing import PairingStore
+            from gateway.run_runtime import sync_capacity_parked
             served = [active] + sorted(name for name, _home in profile_homes if name != active)
             self._note_served_profiles(profile_homes)
+            # A profile past gateway.multiplex_max_profiles is parked, not merely missing: publish
+            # that before the clients read this record (boot and every rescan pass through here).
+            sync_capacity_parked(self)
             for name in served:
                 if name and name not in self.pairing_stores:
                     self.pairing_stores[name] = (
