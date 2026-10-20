@@ -166,3 +166,122 @@ class TestParkedStatus:
 
         assert run_runtime.sync_capacity_parked(Runner()) is False
         assert published == []
+
+
+class _Demand:
+    """Minimal duck-typed demand view: what ``apply_ceiling`` needs, nothing more."""
+
+    def __init__(self, names, facts=None, source=None):
+        from hermes_cli.gateway_multiplex_demand import DemandFacts
+        self.names = set(names)
+        self.facts = facts or {}
+        self.source = source or {"path": "/h/gateway_demand.json", "state": "ok", "age_seconds": 3}
+        self._empty = DemandFacts(agents=0)
+
+    def has(self, name):
+        return name in self.names
+
+    def for_profile(self, name):
+        return self.facts.get(name, self._empty)
+
+    def demand_source(self):
+        return dict(self.source)
+
+
+def _facts(agents=None, cron_jobs=0, credentials=(), unreadable=()):
+    from hermes_cli.gateway_multiplex_demand import DemandFacts
+    return DemandFacts(agents=agents, cron_jobs=cron_jobs, credentials=tuple(credentials),
+                       unreadable=tuple(unreadable))
+
+
+class TestDemandRanking:
+    """SOU-3075: demand decides, priority is the tiebreak, and the legacy order is untouched."""
+
+    def test_demand_none_reproduces_the_legacy_order(self):
+        """The regression guard: every pre-SOU-3075 caller and test keeps its exact order."""
+        kept, deferred = capacity.apply_ceiling(_serve("b", "a", "c"), 3, priority=("c",))
+        assert [n for n, _ in kept] == ["default", "c", "b"]
+        assert deferred == {"a": "capacity: 3 profiles per gateway (gateway.multiplex_max_profiles)"}
+        # ... and the legacy reason text is byte-identical (no cost clause without a demand view).
+        assert capacity.apply_ceiling(_serve("a", "b"), 2)[1] == {"b": CAPACITY}
+
+    def test_demand_beats_priority(self):
+        demand = _Demand({"a"}, facts={"a": _facts(agents=3)})
+        kept, deferred = capacity.apply_ceiling(_serve("a", "z"), 2, priority=("z",), demand=demand)
+        assert [n for n, _ in kept] == ["default", "a"]
+        assert set(deferred) == {"z"}
+
+    def test_priority_orders_within_the_demand_bearing_class(self):
+        demand = _Demand({"a", "b", "c"})
+        kept, _deferred = capacity.apply_ceiling(_serve("a", "b", "c"), 3, priority=("c", "b"),
+                                                 demand=demand)
+        assert [n for n, _ in kept] == ["default", "c", "b"]
+
+    def test_a_no_demand_profile_never_outranks_a_demand_bearing_one(self):
+        demand = _Demand({"zulu"}, facts={"zulu": _facts(cron_jobs=1)})
+        kept, deferred = capacity.apply_ceiling(_serve("alpha", "zulu"), 2, demand=demand)
+        assert [n for n, _ in kept] == ["default", "zulu"]
+        assert set(deferred) == {"alpha"}
+
+    def test_the_decision_is_deterministic_under_a_shuffled_roster(self):
+        demand = _Demand({"alpha", "charlie", "echo"})
+        rosters = [["alpha", "charlie", "echo"], ["echo", "alpha", "charlie"],
+                   ["charlie", "echo", "alpha"]]
+        decisions = {tuple(n for n, _ in capacity.apply_ceiling(_serve(*roster), 3, demand=demand)[0])
+                     for roster in rosters}
+        assert decisions == {("default", "alpha", "charlie")}
+
+    def test_cap_one_serves_only_the_default_profile(self):
+        demand = _Demand({"a"})
+        kept, deferred = capacity.apply_ceiling(_serve("a", "b"), 1, demand=demand)
+        assert [n for n, _ in kept] == ["default"]
+        assert set(deferred) == {"a", "b"}
+
+    def test_a_ceiling_at_or_above_the_roster_defers_nobody(self):
+        demand = _Demand({"a"})
+        kept, deferred = capacity.apply_ceiling(_serve("a", "b"), 3, demand=demand)
+        assert [n for n, _ in kept] == ["default", "a", "b"]
+        assert deferred == {}
+
+    def test_a_roster_without_default_is_still_capped(self):
+        demand = _Demand({"b"})
+        kept, deferred = capacity.apply_ceiling([("a", Path("/h/a")), ("b", Path("/h/b"))], 1,
+                                                demand=demand)
+        assert [n for n, _ in kept] == ["b"]
+        assert set(deferred) == {"a"}
+
+
+class TestCostClause:
+    def test_the_deferral_reason_states_the_trade(self):
+        demand = _Demand({"general"}, facts={"general": _facts(agents=12, cron_jobs=0)})
+        _kept, deferred = capacity.apply_ceiling(_serve("general", "quiet"), 2,
+                                                 demand=demand)
+        reason = deferred["quiet"]
+        assert reason.startswith("capacity: 2 profiles per gateway (gateway.multiplex_max_profiles)")
+        assert "; cost: 0 Paperclip agents, 0 enabled cron jobs, 0 adapter credentials" in reason
+        assert len(reason) <= 500
+
+    def test_an_unknown_agent_count_is_never_rendered_as_zero(self):
+        """Plan §3.3: with no manifest read, the cost says `unknown`, never `0 agents`."""
+        demand = _Demand(set(), facts={"quiet": _facts(agents=None, cron_jobs=3)},
+                         source={"path": None, "state": "absent", "age_seconds": None})
+        _kept, deferred = capacity.apply_ceiling(_serve("quiet"), 1, demand=demand)
+        assert "Paperclip agent demand unknown, 3 enabled cron jobs" in deferred["quiet"]
+        assert "0 Paperclip agents" not in deferred["quiet"]
+
+    def test_an_unreadable_source_is_reported_in_the_reason(self):
+        demand = _Demand({"broken"}, facts={"broken": _facts(unreadable=("cron",))})
+        _kept, deferred = capacity.apply_ceiling(_serve("broken"), 1, demand=demand)
+        assert "demand unreadable: cron" in deferred["broken"]
+
+    def test_the_last_decision_is_published_for_the_runtime(self):
+        demand = _Demand({"a"}, facts={"a": _facts(agents=1)})
+        capacity.apply_ceiling(_serve("a", "b"), 2, demand=demand)
+        decision = capacity.last_decision()
+        assert decision["ceiling"] == 2
+        assert decision["ranked"] == ["default", "a", "b"]
+        assert set(decision["deferred"]) == {"b"}
+        assert decision["demand_source"]["state"] == "ok"
+        # A copy: the published record must not alias the module's cache.
+        decision["ranked"].append("mutated")
+        assert capacity.last_decision()["ranked"] == ["default", "a", "b"]

@@ -994,6 +994,12 @@ class GatewayAdapterLifecycleMixin:
                 logger.info("profile '%s' is parked (gateway.parked); not served by this gateway", name)
         connected = 0
         claimed = self._primary_resource_claims(active)
+        # Demand feeds the ceiling's ranking; read it once, off the loop, before the boot set is
+        # recorded (which publishes the first serving decision).
+        from hermes_cli import gateway_multiplex_capacity
+        if gateway_multiplex_capacity.profile_ceiling() is not None:
+            from hermes_cli import gateway_multiplex_demand
+            await asyncio.to_thread(gateway_multiplex_demand.refresh)
         profile_homes = _multiplex_profile_homes(self.config)
         self._served_profile_signatures = {}
         transient_failed = set()
@@ -1049,12 +1055,14 @@ class GatewayAdapterLifecycleMixin:
         with _log_suppressed(logging.DEBUG, "could not record served_profiles", exc_info=True):
             from gateway.status import publish_runtime_status
             from gateway.pairing import PairingStore
-            from gateway.run_runtime import sync_capacity_parked
+            from gateway.run_runtime import publish_serving_decision, sync_capacity_parked
             served = [active] + sorted(name for name, _home in profile_homes if name != active)
             self._note_served_profiles(profile_homes)
             # A profile past gateway.multiplex_max_profiles is parked, not merely missing: publish
-            # that before the clients read this record (boot and every rescan pass through here).
+            # that before the clients read this record (boot and every rescan pass through here),
+            # then publish the decision itself — boot must never leave ``serving_decision`` absent.
             sync_capacity_parked(self)
+            publish_serving_decision(self)
             for name in served:
                 if name and name not in self.pairing_stores:
                     self.pairing_stores[name] = (

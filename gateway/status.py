@@ -30,7 +30,7 @@ from gateway.status_inline_source import (
 from hermes_constants import _get_platform_default_hermes_home, get_hermes_home, get_process_hermes_home
 from hermes_cli._subprocess_compat import pid_exists_stdlib
 from gateway.status_lock_dir import unusable_lock_dir, unusable_lock_dir_recovered
-from utils import atomic_json_write
+from gateway.status_json import _read_json_file, _unlink_quietly, _write_json_file
 
 if sys.platform == "win32":
     import msvcrt
@@ -832,39 +832,6 @@ def _build_runtime_status_record() -> dict[str, Any]:
     }
 
 
-def _read_json_file(path: Path, *, bare_pid_ok: bool = False) -> Optional[dict[str, Any]]:
-    """JSON object at ``path``, or None when absent/empty/unreadable/invalid. ``bare_pid_ok`` also
-    accepts legacy bare-integer PID files as ``{"pid": N}``."""
-    try:
-        raw = path.read_text(encoding="utf-8-sig").strip()
-    except (OSError, UnicodeDecodeError):
-        # OSError: file vanished or permission flipped between exists() and
-        # read. UnicodeDecodeError: file holds non-UTF-8 / binary garbage
-        # (a truncated or clobbered status file). Either way it's unusable.
-        return None
-    if not raw:
-        return None
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        payload = None
-        if bare_pid_ok:
-            with contextlib.suppress(ValueError):
-                payload = int(raw)
-    if bare_pid_ok and isinstance(payload, int):
-        return {"pid": payload}
-    return payload if isinstance(payload, dict) else None
-
-
-def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
-    atomic_json_write(path, payload, indent=None, separators=(",", ":"))
-
-
-def _unlink_quietly(path: Path) -> None:
-    with contextlib.suppress(OSError):
-        path.unlink(missing_ok=True)
-
-
 def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
     return _read_json_file(pid_path or _get_pid_path(), bare_pid_ok=True)
 
@@ -1091,7 +1058,8 @@ def _prepare_runtime_status_update(
     active_agents: Any = _UNSET, active_work: Any = _UNSET, platform: Any = _UNSET, platform_state: Any = _UNSET,
     error_code: Any = _UNSET, error_message: Any = _UNSET, needs_attention: Any = _UNSET,
     retrying_since: Any = _UNSET, served_profiles: Any = _UNSET, session_store: Any = _UNSET,
-    parked_profiles: Any = _UNSET, multiplex_standalone_reason: Any = _UNSET,
+    parked_profiles: Any = _UNSET, serving_decision: Any = _UNSET,
+    multiplex_standalone_reason: Any = _UNSET,
     platform_metrics: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None,
@@ -1131,6 +1099,10 @@ def _prepare_runtime_status_update(
             ("served_profiles", served_profiles, lambda v: list(v or [])),
             # Profiles the multiplexer could not serve, name -> reason; clients fail fast on them.
             ("parked_profiles", parked_profiles, lambda v: {str(k): str(r) for k, r in dict(v or {}).items()}),
+            # The multiplexer's published serving decision (ranking order, deferrals with their
+            # cost, demand source health, holds). The host check reads this file, never the socket.
+            ("serving_decision", serving_decision,
+             lambda v: copy.deepcopy(v) if isinstance(v, dict) else None),
             ("multiplex_standalone_reason", multiplex_standalone_reason, lambda v: str(v) if v else None),
             ("session_store", session_store, _coerce_session_store),
         ))

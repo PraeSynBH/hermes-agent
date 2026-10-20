@@ -121,3 +121,29 @@ def test_start_decisions_do_not_turn_uncertainty_into_another_owner():
         assert next_start_action(observation) == expected
     with pytest.raises(ValueError, match="unknown runtime state"):
         next_start_action(RuntimeObservation("invalid"))
+
+
+def test_a_capacity_park_is_a_terminal_verdict_carrying_the_cost(tmp_path):
+    """A profile over the ceiling must fail fast with its cost, not wait out the admission deadline.
+
+    ``ensure_gateway_runtime`` turns this verdict into ``profile_parked`` in seconds (SOU-3075 §5),
+    so the reason published under ``parked_profiles`` has to survive the read intact — including
+    the cost clause that tells the client what the deferral costs.
+    """
+    from hermes_cli.gateway_runtime import _parked_by_multiplexer
+
+    reason = ("capacity: 15 profiles per gateway (gateway.multiplex_max_profiles) — this profile is "
+              "deferred; cost: 12 Paperclip agents, 3 enabled cron jobs, 0 adapter credentials")
+    discovery = _parked_by_multiplexer({"parked_profiles": {"devops": reason}},
+                                      tmp_path / "devops")
+
+    assert discovery.state == "inaccessible"
+    assert discovery.reason_code == "profile_parked"
+    assert "cost: 12 Paperclip agents, 3 enabled cron jobs, 0 adapter credentials" in discovery.detail
+
+
+def test_a_profile_absent_from_parked_profiles_keeps_the_ordinary_verdict(tmp_path):
+    from hermes_cli.gateway_runtime import _parked_by_multiplexer
+
+    assert _parked_by_multiplexer({"parked_profiles": {"other": "capacity: 1 profiles"}},
+                                 tmp_path / "devops") is None

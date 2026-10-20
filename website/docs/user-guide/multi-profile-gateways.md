@@ -760,22 +760,83 @@ Set a hard ceiling in the default profile's `config.yaml`:
 ```yaml
 gateway:
   multiplex_max_profiles: 12          # default profile + 11 named; unset = no ceiling
-  multiplex_serve_priority: [cfo, cto] # named profiles that keep a slot first
+  multiplex_serve_priority: [cfo, cto] # tiebreak between profiles with equal demand
+  multiplex_demand_manifest: /Users/me/.hermes/gateway_demand.json  # optional; the default
 ```
 
 - The **default profile is always served**; `multiplex_max_profiles: 1` means
   "the default only", never "no gateway".
-- Slots past the default go to `multiplex_serve_priority` in the order written, then
-  alphabetically. Without a priority list the choice is deterministic but arbitrary, so
-  write one on a host where the ceiling will actually bite.
+- Slots go to profiles **ranked by live demand**, not by a hand list: a profile that owns
+  Paperclip agents, an enabled cron job, or an adapter credential in its `.env` is served
+  before one that holds nothing. `multiplex_serve_priority` is only the tiebreak *inside*
+  those two classes (and the name breaks the remaining ties), so a priority entry can never
+  keep a demand-free profile ahead of one with live work.
+- There are **no weights**: a profile with one enabled cron job ranks level with one that
+  owns nineteen agents. A score would flip the served set on every job edit, and its weights
+  would be indefensible; the over-subscribed case is reported instead (below).
 - A profile past the ceiling is **not served by that process at all** — no adapters, no
   session authority, no threads, `/p/<profile>/` not answered — and is published under
-  `parked_profiles` in `gateway_state.json` with a `capacity:` reason, so a client routing
-  to it gets a terminal verdict instead of waiting out its deadline.
+  `parked_profiles` in `gateway_state.json` with a `capacity:` reason that states the cost
+  (`cost: 12 Paperclip agents, 0 enabled cron jobs, 0 adapter credentials`), so a client
+  routing to it gets a terminal verdict instead of waiting out its deadline. Its cron jobs
+  still tick (`profiles_to_tick` deliberately ignores the ceiling); adapters, ingress,
+  `/p/<profile>/` and admission stop.
 - The ceiling never affects what is **installed**: `hermes profile list`, `hermes gateway
   status` and every `include_parked`/`include_standalone` enumeration still see the whole
   roster. Raise the ceiling (or extend the priority list) and the rest is hot-served on the
   next rescan, like any other roster change; lower it and the excess is parked the same way.
+- **No bounce is needed for a demand or priority change.** The 30-second rescan re-reads
+  demand and applies the new order; a profile that acquires work is hot-served, and one that
+  loses it is parked, with the gateway's pid unchanged. A restart is only owed for a code
+  change, never for ranking.
+
+#### Where demand comes from
+
+| source | what it reads | owned by |
+|---|---|---|
+| cron store | enabled jobs in `profiles/<name>/cron/jobs.json` | core |
+| credentials | adapter credentials in `profiles/<name>/.env` (the same key table `hermes profile clone` uses) | core |
+| manifest | `gateway.multiplex_demand_manifest` — agents that wake a profile from outside Hermes | a host-side collector |
+
+The manifest is a generic, schema-versioned host input; core never reads another product's
+database. Default location: `<default home>/gateway_demand.json`, written atomically:
+
+```json
+{
+  "schema": 1,
+  "written_at": "2026-10-20T20:45:12Z",
+  "source": "paperclip",
+  "ttl_seconds": 900,
+  "profiles": {
+    "devops":  {"agents": 2, "busy": 1, "blocked_admission_15m": 6, "names": ["Post-Deployment Monitor"]},
+    "general": {"agents": 12, "busy": 0, "blocked_admission_15m": 0, "names": []}
+  }
+}
+```
+
+An unreadable `.env` or a corrupt `cron/jobs.json` counts as **demand** for that profile and is
+reported as `demand=unreadable` — failing toward serving it, because "unreadable" must never be
+read as "no work". The manifest's own health is published too, and its rules are deliberate:
+
+| manifest state | ranking uses | reported as |
+|---|---|---|
+| absent | cron + credentials only | `absent`; cost lines say `Paperclip agent demand unknown`, never `0 agents` |
+| older than `ttl_seconds` | the last known values | `stale`, with the age; deferred lines are tagged `demand=stale` |
+| malformed / wrong `schema` | cron + credentials only | `malformed`, with the reason |
+
+#### The decision is published, not inferred
+
+Every rescan rewrites `serving_decision` in `gateway_state.json` (change-gated, so a stable
+decision costs no writes): the ceiling, the ranking order with each profile's counts, every
+deferral with its cost, the manifest's health, and any **hold**. `~/.paperclip/bin/check-gateway-serving.sh`
+reads that file (never the control socket, so it works on a wedged gateway) and fails when a
+demand-bearing profile is deferred, when the manifest is absent or unreadable, or when a hold
+outlives ten minutes.
+
+A profile that would be evicted by a demand flip while it holds live work — a turn in flight,
+a `/bg` agent, an admitted-but-unstarted task — keeps its slot for that cycle and is published
+under `holding` with `since` and the profile waiting for it. The wait is visible on the same
+tick; the swap completes on the first tick after the holder goes idle.
 
 A second gateway **process** on the same host does not help: it halves each process's thread
 count but not the host's, and it doubles the process-wide baseline. If one node cannot hold
