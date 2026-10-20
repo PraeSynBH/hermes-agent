@@ -49,7 +49,10 @@ from hermes_state_guard import (
     _STATE_DB_GUARD_BYPASS_ENV, _in_test_context, _is_production_state_db, _real_platform_state_root,
     _register_test_instance, _set_last_init_error, get_last_init_error,
 )
-from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for
+from hermes_state_readpool import (
+    _READ_POOL_MAX, _calling_on_event_loop, _proc_fd_targets, _read_budget_for,
+    defer_read_conn_close,
+)
 from hermes_state_sessions import SessionSessionsMixin
 from hermes_state_fts import SessionFtsSetupMixin, load_fts5_cjk_extension
 from hermes_state_portability import SessionPortabilityMixin
@@ -911,7 +914,19 @@ class SessionDB(
 
     def _close_read_conn(self, conn) -> None:
         """Close a pooled read connection and release its permit even when the close fails (withholding
-        it would narrow the read path forever). Over-releasing the BoundedSemaphore raises ValueError."""
+        it would narrow the read path forever). Over-releasing the BoundedSemaphore raises ValueError.
+
+        On an event-loop thread the close is handed to the read pool's closer thread (PRA-6546): ``close()``
+        runs under ``sqlite_safe_read``'s process-global ``_live_lock``, so one slow close on the shared
+        gateway's loop stalls every coroutine and every other thread's connection open/close behind it. The
+        permit travels with the handoff and is released after the real close, so the ceilings still bound
+        descriptors; off a loop thread (CLI, workers, tests) this closes inline exactly as before."""
+        if _calling_on_event_loop():
+            defer_read_conn_close(lambda: self._close_read_conn_inline(conn))
+            return
+        self._close_read_conn_inline(conn)
+
+    def _close_read_conn_inline(self, conn) -> None:
         try:
             self._close_conn_logged(conn, "read-conn")
         finally:

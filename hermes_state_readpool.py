@@ -6,11 +6,12 @@ their permit and are reclaimable across peers on the same path."""
 import errno
 import logging
 import os
+import queue
 import threading
 import time
 import weakref
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 if TYPE_CHECKING:  # pragma: no cover
     from hermes_state import SessionDB
@@ -75,6 +76,45 @@ def _calling_on_event_loop() -> bool:
     except RuntimeError:
         return False
     return True
+
+
+# Pooled read connections are closed on this one thread when the caller is on an event loop (PRA-6546).
+# ``close()`` runs under ``sqlite_safe_read``'s process-global ``_live_lock``, so a close that lands on the
+# gateway's loop stalls every coroutine AND every other thread's connection open/close behind it; the
+# read-pool eviction that was sampled holding the loop (PRA-6517) is one instance of that, and the drain in
+# ``SessionDB.close()`` is another. A close is bookkeeping (pop from the pool) plus one syscall, so a single
+# thread is enough.
+_close_jobs: "queue.SimpleQueue[Callable[[], None]]" = queue.SimpleQueue()
+_closer_thread: Optional[threading.Thread] = None
+_closer_lock = threading.Lock()
+CLOSER_THREAD_NAME = "state-read-conn-closer"
+
+
+def defer_read_conn_close(job: Callable[[], None]) -> None:
+    """Hand one pooled read connection's close to the process's single closer thread.
+
+    *job* must close the connection and then release its permits — in that order, because a permit that is
+    freed while the descriptor still lives lets the pool overshoot its ceiling. That keeps the queue
+    implicitly bounded: every queued close still holds a permit, and permits are the ceiling.
+    """
+    global _closer_thread
+    with _closer_lock:
+        thread = _closer_thread
+        if thread is None or not thread.is_alive():
+            thread = threading.Thread(target=_closer_loop, name=CLOSER_THREAD_NAME, daemon=True)
+            _closer_thread = thread
+            thread.start()
+    _close_jobs.put(job)
+
+
+def _closer_loop() -> None:
+    while True:
+        job = _close_jobs.get()
+        try:
+            job()
+        except Exception:  # one bad close must not end the only drain and strand every permit behind it
+            logger.warning("deferred read-conn close failed; its permit stays held", exc_info=True)
+
 
 # Read opens refused for low descriptor headroom — the only visible signal the
 # guard fires. Guarded by _read_budgets_lock.
