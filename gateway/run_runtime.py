@@ -15,6 +15,7 @@ import asyncio
 import logging
 from pathlib import Path
 import uuid
+from datetime import UTC
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +266,7 @@ def sync_capacity_parked(runner) -> bool:
 
 def _utc_now_iso() -> str:
     from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+    return datetime.now(UTC).isoformat(timespec='seconds')
 
 
 def _served_names(runner) -> set[str]:
@@ -274,7 +275,7 @@ def _served_names(runner) -> set[str]:
         try:
             return set(getter())
         except Exception:  # health: allow BLE001 -- fall back to the live bookkeeping below
-            pass
+            logger.debug('served_profile_names() failed; reading the served-homes map', exc_info=True)
     return set(getattr(runner, '_served_profile_homes', None) or {})
 
 
@@ -325,14 +326,25 @@ def publish_serving_decision(runner) -> bool:
     written once and boot always writes (the memo starts empty in a new process). Returns True when
     a write was published.
     """
-    from gateway.status import publish_runtime_status, runtime_status_snapshot
+    from gateway.status import (
+        _get_runtime_status_writer, publish_runtime_status, read_runtime_status,
+    )
     record = serving_decision_record(runner)
     key = {field: value for field, value in record.items() if field != 'decided_at'}
-    published = runtime_status_snapshot().get('serving_decision')
-    if isinstance(published, dict) and {field: value for field, value in published.items()
-                                        if field != 'decided_at'} == key:
-        return False
-    publish_runtime_status(serving_decision=record)
+    # The gate reads what is PUBLISHED, not what this caller last wrote: another writer (or a lost
+    # file) can clear the record between two identical decisions, and a gate memoised only in the
+    # caller would never republish it — exactly the live host's ``parked_profiles: {}`` (§0 finding
+    # 2). A write that is still in the status writer's queue is not a missing record, so the
+    # writer's own settlement is what suppresses a duplicate: everything else publishes.
+    published = (read_runtime_status() or {}).get('serving_decision')
+    if isinstance(published, dict):
+        if {field: value for field, value in published.items() if field != 'decided_at'} == key:
+            return False
+    else:
+        queued = getattr(runner, '_serving_decision_generation', None)
+        if queued is not None and _get_runtime_status_writer().settled(queued) is None:
+            return False  # our own write has not reached the file yet
+    runner._serving_decision_generation = publish_runtime_status(serving_decision=record)
     return True
 
 

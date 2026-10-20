@@ -43,7 +43,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
 
@@ -70,10 +70,10 @@ class DemandFacts:
 
     agents: Optional[int] = None
     cron_jobs: int = 0
-    credentials: Tuple[str, ...] = ()
+    credentials: tuple[str, ...] = ()
     blocked_admission_15m: int = 0
     #: Source ids (``cron``, ``env``) that could not be read for this profile.
-    unreadable: Tuple[str, ...] = ()
+    unreadable: tuple[str, ...] = ()
 
     def has_demand(self) -> bool:
         """An unreadable source fails toward SERVING the profile (F7 in the plan)."""
@@ -103,7 +103,7 @@ class DemandSnapshot:
     manifest_path: Optional[Path] = None
     manifest_age_seconds: Optional[float] = None
     manifest_error: Optional[str] = None
-    unknown_profiles: Tuple[str, ...] = ()
+    unknown_profiles: tuple[str, ...] = ()
     captured_at: float = 0.0
 
     def for_profile(self, name: str) -> DemandFacts:
@@ -173,12 +173,12 @@ def _read_manifest(path: Path):
         return MANIFEST_MALFORMED, {}, None, "manifest has no 'profiles' object"
     written_at = data.get("written_at")
     try:
-        written = datetime.fromisoformat(str(written_at).replace("Z", "+00:00"))
+        written = datetime.fromisoformat(str(written_at))  # 3.11+ accepts the trailing Z
     except ValueError:
         return MANIFEST_MALFORMED, {}, None, f"manifest written_at {written_at!r} is not an ISO timestamp"
     if written.tzinfo is None:
-        written = written.replace(tzinfo=timezone.utc)
-    age = max(0.0, (datetime.now(timezone.utc) - written).total_seconds())
+        written = written.replace(tzinfo=UTC)
+    age = max(0.0, (datetime.now(UTC) - written).total_seconds())
     parsed: dict[str, tuple[int, int]] = {}
     for name, entry in profiles.items():
         if not isinstance(entry, dict):
@@ -322,7 +322,18 @@ def reset() -> None:
 
 
 __all__ = [
-    "DEFAULT_MANIFEST_NAME", "DEFAULT_TTL_SECONDS", "DemandFacts", "DemandSnapshot",
-    "MANIFEST_ABSENT", "MANIFEST_KEY", "MANIFEST_MALFORMED", "MANIFEST_OK", "MANIFEST_STALE",
-    "SCHEMA_VERSION", "manifest_path", "refresh", "reset", "snapshot",
+    "DEFAULT_MANIFEST_NAME",
+    "DEFAULT_TTL_SECONDS",
+    "MANIFEST_ABSENT",
+    "MANIFEST_KEY",
+    "MANIFEST_MALFORMED",
+    "MANIFEST_OK",
+    "MANIFEST_STALE",
+    "SCHEMA_VERSION",
+    "DemandFacts",
+    "DemandSnapshot",
+    "manifest_path",
+    "refresh",
+    "reset",
+    "snapshot",
 ]

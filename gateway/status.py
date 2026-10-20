@@ -30,7 +30,7 @@ from gateway.status_inline_source import (
 from hermes_constants import _get_platform_default_hermes_home, get_hermes_home, get_process_hermes_home
 from hermes_cli._subprocess_compat import pid_exists_stdlib
 from gateway.status_lock_dir import unusable_lock_dir, unusable_lock_dir_recovered
-from utils import atomic_json_write
+from gateway.status_json import _read_json_file, _unlink_quietly, _write_json_file
 
 if sys.platform == "win32":
     import msvcrt
@@ -832,39 +832,6 @@ def _build_runtime_status_record() -> dict[str, Any]:
     }
 
 
-def _read_json_file(path: Path, *, bare_pid_ok: bool = False) -> Optional[dict[str, Any]]:
-    """JSON object at ``path``, or None when absent/empty/unreadable/invalid. ``bare_pid_ok`` also
-    accepts legacy bare-integer PID files as ``{"pid": N}``."""
-    try:
-        raw = path.read_text(encoding="utf-8-sig").strip()
-    except (OSError, UnicodeDecodeError):
-        # OSError: file vanished or permission flipped between exists() and
-        # read. UnicodeDecodeError: file holds non-UTF-8 / binary garbage
-        # (a truncated or clobbered status file). Either way it's unusable.
-        return None
-    if not raw:
-        return None
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        payload = None
-        if bare_pid_ok:
-            with contextlib.suppress(ValueError):
-                payload = int(raw)
-    if bare_pid_ok and isinstance(payload, int):
-        return {"pid": payload}
-    return payload if isinstance(payload, dict) else None
-
-
-def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
-    atomic_json_write(path, payload, indent=None, separators=(",", ":"))
-
-
-def _unlink_quietly(path: Path) -> None:
-    with contextlib.suppress(OSError):
-        path.unlink(missing_ok=True)
-
-
 def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
     return _read_json_file(pid_path or _get_pid_path(), bare_pid_ok=True)
 
@@ -1188,17 +1155,6 @@ def write_runtime_status(
     # timed-out update is still written by the background writer, so its transition happened.
     _emit_runtime_status_transition(previous_payload, payload)
     return writer.wait(generation, timeout=wait_timeout)
-
-
-def runtime_status_snapshot() -> dict[str, Any]:
-    """The process's canonical status payload as published RIGHT NOW (in-memory copy, no file read).
-
-    A change gate must know what is *published*, not what this caller last wrote: a record can be
-    cleared by another writer (or lost with the file) between two identical decisions, and a gate
-    memoised only in the caller would never republish it (SOU-3075 §0 finding 2).
-    """
-    with _runtime_status_state_lock:
-        return copy.deepcopy(_runtime_status_state or {})
 
 
 def publish_runtime_status(**fields: Any) -> int:

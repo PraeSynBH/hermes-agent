@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 
 import pytest
@@ -55,7 +55,7 @@ def _write_manifest(home: Path, profiles: dict, *, schema: int = 1, age_seconds:
     if raw is not None:
         path.write_text(raw, encoding="utf-8")
         return path
-    written = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    written = datetime.now(UTC) - timedelta(seconds=age_seconds)
     path.write_text(json.dumps({
         "schema": schema,
         "written_at": written.isoformat(timespec="seconds").replace("+00:00", "Z"),
