@@ -9,6 +9,7 @@ root — no launcher→worker chains left holding ``.pyd`` locks.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -169,6 +170,72 @@ def _ledger_path() -> Path:
         return Path(get_hermes_home()) / LEDGER_FILENAME
 
 
+def _lock_handle(handle) -> None:
+    """Take an exclusive OS lock on the sidecar handle: ``flock``, or a byte lock on Windows."""
+    if os.name == "nt":
+        import msvcrt
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:  # msvcrt can only lock a byte that exists
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        return
+    import fcntl
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_handle(handle) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _ledger_file_lock(path: Path):
+    """Cross-PROCESS exclusion for the ledger read-prune-write, held on a sidecar ``flock``.
+
+    ``_LEDGER_LOCK`` is a ``threading.Lock`` — it serializes one interpreter. Two processes
+    registering at the same moment (a gateway booting while agent shells start) each read the
+    roster, append their own entry and write the whole array back, so whichever writes second
+    erases the other's entry. The victim is invisible afterwards: measured on this host
+    2026-10-20, the ledger held 20 entries and NOT ONE ``gateway`` while six gateways were
+    running, and every ledger-driven reaper needs the entry to prove an orphan — without it
+    ``spawner_is_dead`` answers ``None``, which no reaper may act on (PRA-6594).
+
+    Best-effort on purpose: a lock that cannot be taken (an exotic filesystem, a Windows
+    ``msvcrt`` retry timeout) must never make registration fail, so the write proceeds
+    unserialized exactly as it did before. Callers hold ``_LEDGER_LOCK`` first — thread lock
+    outside, file lock inside, so a process never queues its own threads on the same flock.
+    """
+    lock_path = path.with_name(path.name + ".lock")
+    handle = None
+    try:
+        from hermes_constants import mkdir_under_hermes_home
+
+        mkdir_under_hermes_home(lock_path.parent)
+        handle = lock_path.open("a+b")
+        _lock_handle(handle)
+    except OSError:
+        if handle is not None:
+            handle.close()
+        handle = None
+        logger.debug("spawn ledger lock unavailable; registering unserialized", exc_info=True)
+    try:
+        yield
+    finally:
+        if handle is not None:
+            _unlock_handle(handle)
+            handle.close()
+
+
 def _read_ledger(path: Path) -> Optional[list[dict]]:
     """Entries list, ``[]`` for empty/missing, ``None`` for CORRUPT (never silently an empty roster).
 
@@ -319,13 +386,14 @@ def _new_entry(
 def _append_entry(entry: LedgerEntry) -> bool:
     """Prune dead entries and append ``entry`` — the ONLY ledger write path.
 
-    Serialized under ``_LEDGER_LOCK`` with an atomic tmp+replace; no writer touches the file
-    outside this function.
+    Serialized under ``_LEDGER_LOCK`` (threads) AND ``_ledger_file_lock`` (processes) with an
+    atomic tmp+replace; no writer touches the file outside this function. The flock is what keeps
+    a concurrent registration from another process from erasing this one.
 
     See #91660.
     """
     path = _ledger_path()
-    with _LEDGER_LOCK:
+    with _LEDGER_LOCK, _ledger_file_lock(path):
         entries = _read_ledger_or_quarantine(path) or []
         # Drop malformed entries, our own stale entry, and provably dead pids.
         pruned = [
