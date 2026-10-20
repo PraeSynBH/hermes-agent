@@ -404,13 +404,8 @@ def _apply_local_recovery(authority, refs, settle):
             track_mutation(authority, settle_viewer_close(authority, sid))
 
 
-def recover_local_sessions(authority, *, schedule=False):
-    """Sync form, for a caller already ON the owner loop (``_apply_local_recovery`` creates tasks)."""
-    _apply_local_recovery(authority, *_recover_local_store(authority, schedule))
-
-
 async def recover_local_sessions_offloop(authority, *, schedule=False):
-    """``recover_local_sessions`` with its store work on a worker thread.
+    """Recover every local receipt with the store work on a worker thread.
 
     Every local receipt costs several synchronous SQLite reads (the receipt, its session row, the
     lineage tip, its admissions), so this is one query per receipt times the profile's session
