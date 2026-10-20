@@ -52,7 +52,7 @@ def test_ensure_waits_for_real_control_owner_without_claiming_pending_is_ready(t
         unstall = threading.Event()  # set at teardown so the stalled handler thread exits
         def identify():
             if stalled:
-                unstall.wait(30)  # outlives the caller's deadline: a stalled owner is 'starting', never ready
+                unstall.wait(30)  # outlives the caller's deadline: a silent owner is a control timeout
             return payload
         server = GatewayControlServer(home, verb_handlers={"identify": identify})
         assert await server.start()
@@ -68,8 +68,13 @@ def test_ensure_waits_for_real_control_owner_without_claiming_pending_is_ready(t
             result = await asyncio.to_thread(runtime.ensure_gateway_runtime, home, timeout=3.0)
             assert result.state == "inaccessible" and result.reason_code == "profile_mismatch"
             stalled = True
+            before = time.monotonic()
             result = await asyncio.to_thread(runtime.ensure_gateway_runtime, home, timeout=3.0)
-            assert result.state == "starting" and result.reason_code == "deadline"
+            # An owner that took the request and never answered is NOT a boot (PRX-5725): it keeps
+            # its own verdict so the run record says which fault to fix.
+            assert result.state == "inaccessible" and result.reason_code == "control_timeout"
+            assert "did not answer identify" in (result.detail or "")
+            assert time.monotonic() - before < 6
             assert not (home / "logs").exists()
         finally:
             unstall.set()

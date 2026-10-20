@@ -27,6 +27,14 @@ if TYPE_CHECKING:
 # the one admission budget and a boot that outlives the budget is named as such.
 DEFAULT_ENSURE_TIMEOUT = 120.0
 
+# What ONE observation may spend of the admission budget before the caller decides again. An absent
+# owner costs a lock read, but an owner that ACCEPTED the connection and then went silent inherited
+# the whole remaining budget inside a single ``identify``, and the wait was reported as a boot: 183
+# runs in 5 h died at elapsed=120.0-120.1 s, phase=runtime-boot, while the same daemon admitted a
+# lone caller in 0.5-1.3 s (PRX-5725). Bounded here and retried by the ensure loop inside the same
+# budget, a stall costs a probe instead of the run.
+PROBE_TIMEOUT = 2.0
+
 
 @dataclass(frozen=True)
 class GatewayEndpoint:
@@ -206,6 +214,45 @@ def _parked_by_multiplexer(payload: dict, home: Path) -> GatewayDiscovery | None
     return GatewayDiscovery("inaccessible", reason_code="profile_parked", detail=str(reason)[:500] or None)
 
 
+def boot_evidence(home: str | Path) -> str | None:
+    """``create_time -> start_time`` of the last owner boot on *home*, for a boot verdict (PRX-5725).
+
+    ``state/gateway.lifecycle.json`` stamps the process creation time and the moment the owner
+    claimed the home, so "still booting at the budget" can say how much of that budget a real boot
+    needed on this host instead of sending the reader to the logs. None when the home never wrote
+    one (a profile whose owner never got as far as claiming it).
+    """
+    import json
+    from datetime import UTC, datetime
+    try:
+        record = json.loads((Path(home) / "state" / "gateway.lifecycle.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    create, claimed = record.get("create_time"), record.get("started_at")
+    if isinstance(create, bool) or not isinstance(create, (int, float)):
+        return None
+    if not isinstance(claimed, str) or not claimed:
+        return None
+    try:
+        boot_seconds = datetime.fromisoformat(claimed).timestamp() - float(create)
+        born = datetime.fromtimestamp(float(create), UTC).isoformat(timespec="seconds")
+    except (ValueError, OverflowError, OSError):
+        return None
+    if not math.isfinite(boot_seconds) or boot_seconds < 0:
+        return None
+    return f"lifecycle create_time {born} -> start_time {claimed} = {boot_seconds:.1f}s"
+
+
+def _control_timeout_detail(home: Path, timeout: float) -> str:
+    """Name a control channel that took the request and never answered it (bounded, no peer data)."""
+    owner = _owner_pid(home)
+    who = f"owner pid {owner}" if owner is not None else "no owner pid recorded"
+    return (f"control timeout: the socket at {home} accepted the connection and did not answer "
+            f"identify in {timeout:.1f}s ({who}); the owner is not booting, it is not answering")
+
+
 def _refused_owner_verdict(exc: PermissionError) -> GatewayDiscovery | None:
     """The named refusal when the client proved the boundary from the control pipe, else None."""
     from gateway.runtime_bootstrap_windows import RefusedOwner
@@ -241,8 +288,53 @@ def _served_by_multiplexer(home: Path, *, timeout: float) -> GatewayDiscovery | 
         return None
     result = _endpoint(payload, home, control_home=root)
     if result.state == "inaccessible" and result.reason_code == "profile_mismatch":
-        return _parked_by_multiplexer(payload, home)  # else: the multiplexer does not serve this profile
+        return (_parked_by_multiplexer(payload, home)  # the multiplexer refused it by name
+                or _not_served_by_live_multiplexer(payload, home, root))
     return result
+
+
+def _not_served_by_live_multiplexer(payload: dict, home: Path, root: Path) -> GatewayDiscovery | None:
+    """A profile the boot policy says this host serves, which the LIVE multiplexer does not list.
+
+    The multiplexer's ``identify`` is the authority on this boot's served set: it is settled at
+    boot, and a profile it could not load is published under ``parked_profiles``. So a READY
+    multiplexer that omits *home* never adds it, and waiting for the entry is the "boot" that was
+    never a boot (PRX-5725: ``general``/``devops``/``troopmaster``/``fundraising``, 35 of 183 lost
+    runs, each spending the full budget twice). A ``gateway.standalone: true`` secondary (policy
+    ``False``) keeps its own start path, and a home that owns a live gateway of its own keeps the
+    control-timeout verdict instead — that owner is wedged, not unserved.
+    """
+    if payload.get("state") != "ready":
+        return None  # a multiplexer still booting has not settled its set
+    from hermes_cli.gateway_runtime_multiplex import multiplexer_serves_home
+    if multiplexer_serves_home(home) is None or _home_owns_its_own_owner(home, root):
+        return None
+    served = _served_profile_names(payload)
+    listed = ", ".join(served) or "none"
+    return GatewayDiscovery(
+        "inaccessible", reason_code="profile_not_served",
+        detail=(f"{home.name} is not in the {len(served)} profiles the multiplexer at {root} "
+                f"serves ({listed}) and has no gateway of its own, so admission can never "
+                f"complete: give its home an identity marker (config.yaml/.env/SOUL.md) and "
+                f"restart the multiplexer, or run it with gateway.standalone: true")[:500])
+
+
+def _served_profile_names(payload: dict) -> list[str]:
+    """The served homes' names, shortest useful spelling, sorted and deduped (for a verdict)."""
+    homes = payload.get("served_profiles")
+    if not isinstance(homes, list):
+        return []
+    return sorted({Path(str(p["home"])).name for p in homes
+                   if isinstance(p, dict) and isinstance(p.get("home"), str) and p["home"]})
+
+
+def _home_owns_its_own_owner(home: Path, root: Path) -> bool:
+    """Whether *home* has a provable gateway of its own (never the multiplexer answering for it)."""
+    pid = _owner_pid(home)
+    if pid is None:
+        return False
+    from gateway.status import _live_pid_from_record, _read_json_file
+    return pid != _live_pid_from_record(_read_json_file(root / "gateway.pid", bare_pid_ok=True))
 
 
 _NATIVE_WINDOWS = os.name == "nt"
@@ -318,7 +410,11 @@ def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0)
                 return GatewayDiscovery(state, reason_code="foreign_stale_lock", detail=detail)
         return GatewayDiscovery(state)
     except TimeoutError:
-        return GatewayDiscovery("inaccessible", reason_code="control_timeout")
+        # An owner that ACCEPTED the connection and never answered is a control timeout, never a
+        # boot: name it, with the owner it belongs to and how long identify went unanswered, so a
+        # lost run says which fault to fix without a log read (PRX-5725).
+        return GatewayDiscovery("inaccessible", reason_code="control_timeout",
+                                detail=_control_timeout_detail(home, timeout))
     except DiscoveryError as exc:
         # The code stays bounded; the detail names the local node, its owner or mode, and the fix.
         return GatewayDiscovery("inaccessible", reason_code=exc.reason, detail=exc.bounded_detail(500))
@@ -405,11 +501,14 @@ _REPLACE_FAILED_DETAIL = "an older Hermes gateway still owns this profile after 
 _RETIRING = frozenset({"idle_exit", "replaced"})
 
 
-def _observe_replacing_stale(home: Path, deadline: float, replaced: set[Path]) -> GatewayDiscovery:
+def _observe_replacing_stale(home: Path, probe_timeout: float, deadline: float,
+                             replaced: set[Path]) -> GatewayDiscovery:
     """Discovery, except that a gateway an older Hermes left on this home is stopped once (like
-    ``hermes gateway stop``) and reported as retiring; a refusal keeps ``incompatible`` + its remedy."""
-    from hermes_cli.gateway_runtime_service import remaining
-    observed = discover_gateway_endpoint(home, timeout=remaining(deadline))
+    ``hermes gateway stop``) and reported as retiring; a refusal keeps ``incompatible`` + its remedy.
+
+    *probe_timeout* bounds the observation itself (``PROBE_TIMEOUT``, never the whole remaining
+    budget): a silent owner must cost one probe, not the run."""
+    observed = discover_gateway_endpoint(home, timeout=probe_timeout)
     if observed.state != "incompatible" or observed.reason_code != "runtime_protocol":
         return observed
     if home in replaced:
@@ -458,7 +557,16 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
     # start the replacement this call owes the client.
     retiring = False
     replaced: set[Path] = set()
+    # The one named verdict for an owner that took the connection and stopped answering. It is not
+    # a boot, so it never becomes "starting"; it is retried while the budget lasts and reported if
+    # it outlives it (PRX-5725).
+    stalled: GatewayDiscovery | None = None
     delay = 0.025
+
+    def probe_timeout() -> float:
+        """One observation's share of the budget — bounded, so no single identify can spend it all."""
+        return min(PROBE_TIMEOUT, remaining(deadline))
+
     # The install-root marker also covers profiles.
     fence_homes = {home, get_process_hermes_home(), get_default_hermes_root()}
     try:
@@ -468,9 +576,16 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
             # Poll BEFORE discovering: an exit observed first, then "absent", cannot be a child that
             # published its owner a moment later. A winning racer shows up as starting/ready instead.
             status = child.poll() if child is not None else None
-            observed = _observe_replacing_stale(home, deadline, replaced)
+            observed = _observe_replacing_stale(home, probe_timeout(), deadline, replaced)
             if observed.reason_code == "control_timeout":
-                return GatewayDiscovery("starting", reason_code="deadline")
+                # Keep the named verdict and re-probe: a stall shorter than the budget is a retry,
+                # and one that outlives it is reported as the control timeout it is.
+                stalled = observed
+                time.sleep(min(delay, remaining(deadline)))
+                delay = min(delay * 1.5, 0.05)
+                continue
+            # This observation answered, so a silence seen earlier is not what the budget was spent on.
+            stalled = None
             if observed.state == "draining" and observed.reason_code in _RETIRING:
                 retiring, requested, child = True, False, None
                 time.sleep(min(0.1, remaining(deadline)))
@@ -508,7 +623,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
                     target = host
                     service = discover_existing_gateway_service(target, deadline=deadline)
                 # Runtime locks settle races remaining after this second probe.
-                observed = discover_gateway_endpoint(home, timeout=remaining(deadline))
+                observed = discover_gateway_endpoint(home, timeout=probe_timeout())
                 if observed.state != "absent":
                     continue
                 if service is not None:
@@ -523,7 +638,8 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
             # within ~50 ms instead of up to 250 ms later on every cold start.
             delay = min(delay * 1.5, 0.05)
     except TimeoutError:
-        return GatewayDiscovery("starting", reason_code="deadline")
+        # The budget is gone. If the owner spent it silent, that is the verdict — not a boot.
+        return stalled or GatewayDiscovery("starting", reason_code="deadline")
     except RuntimeStartError as exc:
         return GatewayDiscovery(exc.state, reason_code=exc.reason)
     except PermissionError:

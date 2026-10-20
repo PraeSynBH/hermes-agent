@@ -146,6 +146,48 @@ def test_a_boot_that_outlives_the_budget_is_named_as_a_boot(monkeypatch):
     assert caught.value.reason == "gateway_admission_timeout"
 
 
+def test_a_boot_verdict_carries_the_boot_it_waited_on(monkeypatch):
+    """A boot that outlives the budget says what the boot cost, from ``gateway.lifecycle.json``.
+
+    Otherwise "still booting" is unfalsifiable for the reader: on this host a real boot is 26.9-62.1 s
+    and the deadline is 120 s, so a boot verdict needs its own ``create_time -> start_time`` (AC2 of
+    PRX-5725).
+    """
+    import json
+    from pathlib import Path
+
+    from hermes_cli import gateway_client, gateway_runtime
+    from hermes_constants import get_hermes_home
+
+    home = Path(get_hermes_home())
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "state" / "gateway.lifecycle.json").write_text(json.dumps({
+        "phase": "running", "create_time": 1792519657.06,
+        "started_at": "2026-10-20T18:08:03.918183+00:00"}), encoding="utf-8")
+    clock = _Clock()
+    monkeypatch.setattr(gateway_client, "time", SimpleNamespace(monotonic=clock.monotonic,
+                                                                time=time.time, sleep=time.sleep))
+    monkeypatch.setattr(gateway_client, "BOOT_POLL_INTERVAL_S", 0.0, raising=False)
+    monkeypatch.setattr(gateway_client, "admission_budget_seconds", lambda: 120.0)
+
+    def ensure(home, *, idle_exit=False, timeout=None):
+        clock.advance(60.0)
+        return _discovery(gateway_runtime, "starting", reason_code="deadline")
+
+    monkeypatch.setattr(gateway_runtime, "ensure_gateway_runtime", ensure)
+
+    async def run():
+        async with gateway_client.connect_gateway():
+            raise AssertionError("a boot that outlives the budget must not admit")
+
+    with pytest.raises(gateway_client.GatewayAdmissionTimeout) as caught:
+        asyncio.run(run())
+    line = str(caught.value)
+    assert "phase=runtime-boot" in line and "still booting" in line
+    assert "create_time 2026-10-20T18:07:37+00:00" in line, line
+    assert "start_time 2026-10-20T18:08:03.918183+00:00" in line and "= 26.9s" in line, line
+
+
 def test_the_boot_deadline_sits_above_the_measured_boot():
     """The constant that bounds a boot must be longer than the boot it bounds.
 

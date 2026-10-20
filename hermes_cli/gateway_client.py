@@ -477,8 +477,8 @@ async def connect_gateway(endpoint=None, subject=None):
     rather than the socket identity; only a peer the owner already trusts may name one."""
     from websockets.asyncio.client import connect
     from hermes_constants import get_hermes_home
-    from hermes_cli.gateway_runtime import (DEFAULT_ENSURE_TIMEOUT, attachable, ensure_gateway_runtime,
-                                            gateway_profile_home)
+    from hermes_cli.gateway_runtime import (DEFAULT_ENSURE_TIMEOUT, attachable, boot_evidence,
+                                            ensure_gateway_runtime, gateway_profile_home)
     from urllib.parse import urlsplit
 
     remote = "" if endpoint is not None else os.environ.get("HERMES_TUI_GATEWAY_URL", "").strip()
@@ -579,9 +579,12 @@ async def connect_gateway(endpoint=None, subject=None):
         # The budget is gone while the owner was still coming up. That is the admission class (the
         # owner never accepted this run), and the text says which wait ate the budget.
         if boot is not None:
+            # Only a real boot reaches here now: a silent owner is its own verdict (control_timeout)
+            # and no longer borrows this name. Say how long this host's boot actually took.
+            evidence = f"; {boot_evidence(home)}" if home is not None and boot_evidence(home) else ""
             raise spent(f"Gateway connection failed; no local fallback (phase=runtime-boot, "
                         f"elapsed={time.monotonic() - started:.1f}s, owner was still booting at "
-                        f"the budget: {boot}, boot deadline {DEFAULT_ENSURE_TIMEOUT:g}s)")
+                        f"the budget: {boot}, boot deadline {DEFAULT_ENSURE_TIMEOUT:g}s{evidence})")
         # The fence outlived the budget. This is not owner starvation — an install update holds the
         # install — so the failure keeps the class a retry chain already handles (the owner is
         # draining, not starving) and spends its words on WHO held it and how long we waited.
