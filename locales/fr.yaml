@@ -1941,6 +1941,21 @@ slash:
   quit:
     description: "Quitter la CLI (--delete supprime aussi l'historique de session)"
 cli:
+  modern:
+    thought_for: "Réflexion pendant {seconds}s"
+    thought: "Réflexion"
+    working: "En cours…"
+    preparing: "Préparation de {what}…"
+    hint_steer: "orienter"
+    hint_queue: "mettre en file"
+    hint_interrupt: "interrompre"
+    hint_stop: "arrêter"
+    hint_commands: "commandes"
+    hint_files: "fichiers"
+    hint_shell: "shell"
+    placeholder_busy_steer: "tapez pour orienter ce tour · Tab le met en file pour après"
+    placeholder_busy_interrupt: "tapez pour rediriger ce tour · Tab le met en file pour après"
+    placeholder_busy_queue: "tapez pour mettre un message en file après ce tour"
   billing:
     load_failed: "{label} : {error}"
     load_failed_label: "Facturation indisponible"
@@ -2505,6 +2520,7 @@ cli:
     queue_heading: "File d'attente · {count} en file · /queue list{controls}"
     more_queued: "+{count} de plus"
     transcript_unavailable: "Transcription en direct pas encore disponible."
+    control_pending: "Envoi…"
     steer_prompt: "Orienter : "
     roster_empty: "Aucun sous-agent ni processus en arrière-plan en cours. Les résultats arrivent dans la conversation."
     entry_gone: "Cette entrée n'est plus active."
@@ -2643,6 +2659,14 @@ cli:
     move_out_of_range: "Déplacement hors limites de la file. Taille actuelle : {size}"
     moved: "Élément {source} de la file déplacé vers {destination}."
     usage_add: "Usage : /queue add <prompt>"
+    gateway_refused: "Le gateway ne l'a pas mis en file : {error}. Rien n'a été mis en file ; renvoyez-le à la fin du tour."
+    submit_unknown: "Le gateway n'a pas répondu ({error}) ; le prompt est peut-être déjà en file. Vérifiez /queue list avant de le renvoyer."
+    move_gateway_fifo: "Le gateway exécute les prompts en file dans l'ordre d'envoi ; modifiez ou supprimez-en un à la place."
+    remove_refused: "Impossible de retirer l'élément {index} de la file : {error}"
+    edit_refused: "Impossible de modifier l'élément {index} de la file : {error}"
+    already_started: "L'élément {index} de la file a déjà démarré ; il s'exécute tel qu'envoyé."
+    started_stopped: "L'élément {index} de la file avait déjà démarré ; le gateway l'a arrêté."
+    change_unknown: "Le gateway n'a pas répondu pour l'élément {index} de la file ({error}) ; vérifiez /queue list avant de réessayer."
   reload:
     env_reloaded: ".env rechargé ({count} variable(s) mise(s) à jour)"
   steer:

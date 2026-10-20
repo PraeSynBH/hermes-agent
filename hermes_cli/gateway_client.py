@@ -111,6 +111,9 @@ GATEWAY_STARTUP_RPC_DEADLINE_S = 120.0
 # question ("how long may the loop stall") for the mint. A genuinely dead owner is not slow, it
 # is refused or FIN'd, which fails this immediately rather than at the deadline.
 GATEWAY_WS_OPEN_TIMEOUT_S = 30.0
+# A typed ``--api-key`` on a resume that the owner does not bind (``rebind_launch_key``): every CLI says this.
+RESUME_KEY_MISMATCH = ("--api-key on resume must be the key this session was launched with "
+                       "(a session launched without --api-key keeps its profile credentials).")
 # Canonical ``/compress`` answers only after the summary call(s) and the commit: a long session's
 # summary routinely takes more than 30 s (``auxiliary.compression.timeout`` defaults to 120 s per
 # request, ``compression.context_total_ceiling_seconds`` to 600 s). Same budget as Desktop's

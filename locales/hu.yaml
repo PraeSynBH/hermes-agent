@@ -1706,6 +1706,21 @@ slash:
   quit:
     description: "Kilépés a CLI-ből (a --delete a munkamenet előzményeit is törli)"
 cli:
+  modern:
+    thought_for: "{seconds} mp-ig gondolkodott"
+    thought: "Gondolkodott"
+    working: "Dolgozik…"
+    preparing: "{what} előkészítése…"
+    hint_steer: "terelés"
+    hint_queue: "sorba"
+    hint_interrupt: "megszakítás"
+    hint_stop: "leállítás"
+    hint_commands: "parancsok"
+    hint_files: "fájlok"
+    hint_shell: "shell"
+    placeholder_busy_steer: "írj, hogy tereld ezt a kört · Tab sorba állítja utánra"
+    placeholder_busy_interrupt: "írj, hogy átirányítsd ezt a kört · Tab sorba állítja utánra"
+    placeholder_busy_queue: "írj, hogy üzenetet állíts sorba e kör utánra"
   billing:
     load_failed: "{label}: {error}"
     load_failed_label: "Nem sikerült betölteni a számlázást"
@@ -2249,6 +2264,7 @@ cli:
     queue_heading: "Sor · {count} sorban · /queue list{controls}"
     more_queued: "+{count} további"
     transcript_unavailable: "Élő átirat még nem érhető el."
+    control_pending: "Küldés…"
     steer_prompt: "Irányítás: "
     roster_empty: "Nincs élő alügynök vagy háttérfolyamat. Az eredmények a beszélgetésben érkeznek."
     entry_gone: "Ez a bejegyzés már nem élő."
@@ -2387,6 +2403,14 @@ cli:
     move_out_of_range: "A mozgatás kívül esik a soron. Jelenlegi méret: {size}"
     moved: "A(z) {source}. sorelem áthelyezve ide: {destination}."
     usage_add: "Használat: /queue add <prompt>"
+    gateway_refused: "Az átjáró nem állította sorba: {error}. Semmi sem került sorba; küldd újra, amikor a kör véget ér."
+    submit_unknown: "Az átjáró nem válaszolt ({error}), így lehet, hogy a prompt már sorban van. Nézd meg a /queue list kimenetét, mielőtt újra elküldöd."
+    move_gateway_fifo: "Az átjáró a sorban álló promptokat küldési sorrendben futtatja; inkább szerkessz vagy távolíts el egyet."
+    remove_refused: "Nem sikerült eltávolítani a(z) {index}. sorelemet: {error}"
+    edit_refused: "Nem sikerült szerkeszteni a(z) {index}. sorelemet: {error}"
+    already_started: "A(z) {index}. sorelem már elindult; úgy fut, ahogy elküldték."
+    started_stopped: "A(z) {index}. sorelem már elindult; az átjáró leállította."
+    change_unknown: "Az átjáró nem válaszolt a(z) {index}. sorelemről ({error}); nézd meg a /queue list kimenetét, mielőtt újra próbálod."
   reload:
     env_reloaded: ".env újratöltve ({count} változó frissült)"
   steer:
