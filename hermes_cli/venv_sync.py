@@ -130,7 +130,8 @@ def sync(project_root: Path | None = None, *, check: bool = False) -> dict:
 def collect_superseded_generations(project_root: Path) -> None:
     """Collect what a publish just superseded, as the Docker boot already does.
 
-    Without this only a manual `hermes pm gc` reclaimed old environments. Safe
+    The startup prune pass (``worktree_ops._reclaim_install_states``) collects on the
+    same rules, so this is the boot-after-sync fast path, not the only timer. Safe
     right after a sync: the collectors skip leased, selected and day-young
     generations and yield to any in-flight install instead of waiting.
     """
