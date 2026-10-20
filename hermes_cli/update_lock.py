@@ -694,6 +694,67 @@ def _read_marker(path: Path) -> _Marker | None:
     return _parse_marker(raw, mtime=mtime)
 
 
+# A live claim whose marker has not been touched for this long is not installing anything:
+# ``hermes update`` claims the marker before it knows whether the checkout moves at all, so the
+# claim alone covers a fetch, a parked prompt and a no-op run. Every launch that honors the claim
+# as "an update owns the install" therefore refused admission for that whole span (PRX-5605:
+# ``update_paused`` 07:47→15:01, 118 heartbeat runs, nothing to install). The updater touches the
+# marker from the commit point on (``start_activity_heartbeat``), so a real update keeps its fence
+# for as long as it actually mutates.
+UPDATE_FENCE_IDLE_SECONDS = 10 * 60
+ACTIVITY_HEARTBEAT_SECONDS = 60
+
+# The running updater's heartbeat thread, and the event that stops it (set by ``stop_heartbeat``).
+_HEARTBEAT: dict = {"thread": None, "stop": None, "path": None}
+
+
+def marker_activity_fresh(path: Path, *, idle: float = UPDATE_FENCE_IDLE_SECONDS) -> bool:
+    """True when *path* was touched within *idle* seconds — an update that is working, not idling.
+
+    Only meaningful for a marker whose owner is alive: a dead owner's marker is reclaimed, never
+    aged out, so this never decides that on its own.
+    """
+    try:
+        touched = path.stat().st_mtime
+    except OSError:
+        return False
+    return time.time() - touched <= idle
+
+
+def start_activity_heartbeat(path: Path | None = None) -> None:
+    """Touch the marker every ``ACTIVITY_HEARTBEAT_SECONDS`` until the update finishes.
+
+    Called once the updater is about to mutate the checkout (the commit point, immediately before
+    the first tree move): from there on a launch must stay fenced however long the sync, build or
+    fleet restart takes. Touching mtime leaves the body — the identity every other implementation
+    judges — untouched. Idempotent, never raises.
+    """
+    marker = path or update_marker_path()
+    if _HEARTBEAT["thread"] is not None and _HEARTBEAT["path"] == str(marker):
+        return
+    stop_heartbeat()
+    stop = threading.Event()
+
+    def _beat() -> None:
+        while not stop.wait(ACTIVITY_HEARTBEAT_SECONDS):
+            try:
+                os.utime(marker)
+            except OSError:
+                return  # released under us: nothing left to keep fenced
+
+    thread = threading.Thread(target=_beat, name="hermes-update-heartbeat", daemon=True)
+    thread.start()
+    _HEARTBEAT.update({"thread": thread, "stop": stop, "path": str(marker)})
+
+
+def stop_heartbeat() -> None:
+    """Stop the heartbeat thread (the marker is released by the claim, not by us)."""
+    stop = _HEARTBEAT.pop("stop", None)
+    _HEARTBEAT.update({"thread": None, "path": None})
+    if stop is not None:
+        stop.set()
+
+
 def _tmp_sibling(path: Path) -> Path:
     return path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
 
@@ -1569,6 +1630,7 @@ class UpdateLock:
                 _CLAIMS[key] = _CLAIMS.get(key, 1) - 1
                 if _CLAIMS[key] <= 0:
                     _CLAIMS.pop(key, None)
+                    stop_heartbeat()
                     _release_marker(self.path)
         except OSError as exc:
             logger.debug("Could not release update marker %s: %s", self.path, exc)

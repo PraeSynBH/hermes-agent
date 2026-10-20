@@ -328,6 +328,12 @@ def _update_fenced(homes) -> bool:
     malformed one while the checkout lock is held (a killed update's tree still runs). A dead
     marker over a free lock is a killed update: it never blocks a launch.
 
+    A live owner fences only while its marker is being touched: ``hermes update`` claims it before
+    it knows whether the checkout moves at all, and a claim held through a slow fetch, a parked
+    prompt or a no-op run is not an update anyone needs to wait out (PRX-5605: ~7 h of refusals
+    with nothing to install). The updater touches the marker from the commit point on
+    (``update_lock.start_activity_heartbeat``), so a real update keeps its fence.
+
     Read-only: a client never clears the updater's fence; the launch-time reclaim
     (``update_lock.read_live_update``) and the next update remove a dead marker. A marker that
     exists but cannot be read is unjudgeable and fences.
@@ -347,7 +353,12 @@ def _update_fenced(homes) -> bool:
             continue
         except OSError:
             return True
-        if update_lock.judge_marker(raw)[0] in {"live", "ours"} or update_lock.checkout_lock_held():
+        if update_lock.judge_marker(raw)[0] in {"live", "ours"}:
+            if update_lock.marker_activity_fresh(path):
+                return True
+        # Whatever the claim says, a held checkout lock is a tree being written (a killed
+        # update's completion, build or git still runs) and is never raced.
+        if update_lock.checkout_lock_held():
             return True
     return False
 

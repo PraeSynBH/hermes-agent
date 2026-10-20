@@ -215,6 +215,13 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
         if key in os.environ:
             env[key] = os.environ[key]
+    # dotenvx logs "◇ injected env (N) from .env" on the CLI's stdout by default, which is an MCP
+    # server's JSON-RPC channel: every banner is an unframeable message and the SDK drops the
+    # session (PRX-5605: "Failed to parse JSONRPC message ... input_value='◇ injected env (0)…'"
+    # every ~5 s). A stdio server has no use for the banner, and a server config that wants it can
+    # still set these in its own ``env`` below.
+    env.setdefault("DOTENV_CONFIG_QUIET", "true")
+    env.setdefault("DOTENV_QUIET", "true")
     if user_env:
         # An entry rendered from one whole ``${VAR}`` that is unset (or empty) counts as absent, so
         # a plugin can forward an optional var without the child seeing the literal placeholder.

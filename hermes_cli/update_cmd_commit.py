@@ -186,6 +186,10 @@ def arm_commit_point(git_cmd, root: Path, expected_sha: str, **move) -> str | No
     from hermes_cli.update_cmd_posix_pause import pause_at_commit_point
     if refused := pause_at_commit_point():
         return refused
+    # This update is now mutating the tree: keep its claim's fence alive for as long as the sync,
+    # build and fleet restart take. Until here the claim fenced nothing on its own (PRX-5605).
+    from hermes_cli.update_lock import start_activity_heartbeat
+    start_activity_heartbeat()
     try:
         arm_commit_obligations(root, expected_sha)
         arm_tree_move(git_cmd, root, **move)

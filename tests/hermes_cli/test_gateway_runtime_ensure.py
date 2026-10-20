@@ -10,6 +10,9 @@ import time
 
 import pytest
 
+from tests.waiting import wait_until
+
+
 def test_unmanaged_runtime_drops_session_config_bypass_flags(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import gateway_runtime_start as start
@@ -184,6 +187,53 @@ def test_update_fence_follows_update_lock_judgement(tmp_path, monkeypatch):
     marker.write_text(f"{os.getpid()}\n{int(time.time())}\nct:{process_create_time():.3f}\n", encoding="utf-8")
     assert runtime._update_fenced({tmp_path})
     assert marker.is_file()  # read-only: a client never clears the updater's fence
+
+
+def test_a_live_but_idle_update_claim_does_not_fence_admissions(tmp_path, monkeypatch):
+    """PRX-5605: `hermes update` claims the marker before it knows whether anything moves.
+
+    A live owner that has touched nothing for longer than UPDATE_FENCE_IDLE_SECONDS is not
+    installing anything (a slow fetch, a parked prompt, a no-op run), so its claim must not refuse
+    admissions — that is the ~7 h `update_paused` stall. A claim being touched still fences, and a
+    held checkout lock fences whatever the claim says.
+    """
+    from hermes_cli import gateway_runtime as runtime, update_lock
+    from hermes_cli.update_lock import process_create_time
+
+    marker = tmp_path / update_lock.MARKER_NAME
+    marker.write_text(f"{os.getpid()}\n{int(time.time())}\nct:{process_create_time():.3f}\n",
+                      encoding="utf-8")
+    assert runtime._update_fenced({tmp_path})  # a fresh claim (an update just started)
+
+    stale = time.time() - update_lock.UPDATE_FENCE_IDLE_SECONDS - 60
+    os.utime(marker, (stale, stale))
+    monkeypatch.setattr(update_lock, "checkout_lock_held", lambda *a, **k: False)
+    assert not runtime._update_fenced({tmp_path})
+    assert marker.is_file()  # read-only: aging the fence out never reclaims the claim
+
+    # A tree being written by ANY process still fences: a killed update's completion, build or git.
+    monkeypatch.setattr(update_lock, "checkout_lock_held", lambda *a, **k: True)
+    assert runtime._update_fenced({tmp_path})
+
+
+def test_activity_heartbeat_keeps_a_mutating_update_fenced(tmp_path, monkeypatch):
+    """From the commit point on the updater touches the marker, so a long sync/build stays fenced."""
+    from hermes_cli import update_lock
+
+    marker = tmp_path / update_lock.MARKER_NAME
+    marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+    stale = time.time() - update_lock.UPDATE_FENCE_IDLE_SECONDS - 60
+    os.utime(marker, (stale, stale))
+    assert not update_lock.marker_activity_fresh(marker)
+
+    monkeypatch.setattr(update_lock, "ACTIVITY_HEARTBEAT_SECONDS", 0.05)
+    update_lock.start_activity_heartbeat(marker)
+    try:
+        assert wait_until(lambda: update_lock.marker_activity_fresh(marker), timeout=5.0,
+                          what="the heartbeat touches the marker")
+        assert marker.read_text(encoding="utf-8").startswith(f"{os.getpid()}\n")  # body untouched
+    finally:
+        update_lock.stop_heartbeat()
 
 
 @pytest.mark.platforms("linux")
