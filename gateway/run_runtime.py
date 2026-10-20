@@ -246,11 +246,12 @@ def sync_capacity_parked(runner) -> bool:
     this cycle, so it is never published as parked; the newcomer waiting on it gets the holder's
     name appended to its reason instead.
     """
+    from hermes_cli.gateway_multiplex_capacity import CAPACITY_REASON_PREFIX
     parked = parked_profile_map(runner)
     wanted = capacity_deferrals(runner)
     changed = False
     for name in [n for n, reason in parked.items()
-                 if str(reason).startswith('capacity:') and n not in wanted]:
+                 if str(reason).startswith(CAPACITY_REASON_PREFIX) and n not in wanted]:
         parked.pop(name, None)
         changed = True
     for name, reason in wanted.items():

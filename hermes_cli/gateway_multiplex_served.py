@@ -43,6 +43,54 @@ def recorded_served_profiles(default_root: Optional[Path] = None) -> Optional[li
     return [str(p) for p in served] if isinstance(served, list) else None
 
 
+def recorded_unserved_profiles(default_root: Optional[Path] = None) -> dict[str, str]:
+    """``{profile: reason}`` the LIVE default multiplexer does not serve — its own published verdict.
+
+    A profile past ``gateway.multiplex_max_profiles`` gets no adapters and no inbound routing on
+    that process, so every run dispatched to it fails admission (``profile_not_served``); a profile
+    whose session store could not be opened is parked the same way. Empty when the gateway serves
+    everything, and for a stopped/absent gateway: a dead record's verdict is history (PRX-5734).
+    """
+    from hermes_constants import get_default_hermes_root
+    from gateway.status import read_runtime_status, runtime_status_pid_is_live
+    if live_default_gateway_pid() is None:
+        return {}
+    runtime = read_runtime_status((default_root or get_default_hermes_root()) / "gateway_state.json")
+    if not runtime_status_pid_is_live(runtime or {}):
+        return {}
+    parked = (runtime or {}).get("parked_profiles")
+    return {str(k): str(v) for k, v in parked.items()} if isinstance(parked, dict) else {}
+
+
+def unserved_profile_lines(parked: dict[str, str]) -> list[str]:
+    """Status block for ``parked``: one line per reason, then the remedy for a ceiling deferral.
+    Empty when nothing is unserved, so a healthy host prints nothing."""
+    if not parked:
+        return []
+    from hermes_cli.gateway_multiplex_capacity import CAPACITY_REASON_PREFIX
+    by_reason: dict[str, list[str]] = {}
+    for name, reason in parked.items():
+        by_reason.setdefault(str(reason or "not served"), []).append(str(name))
+    lines = ["", "Profiles this gateway does NOT serve (runs dispatched to them cannot be admitted):"]
+    for reason, names in sorted(by_reason.items()):
+        lines.append(f"  ⚠ {len(names)} unserved — {reason}")
+        lines.append(f"      {', '.join(sorted(names))}")
+    if any(reason.startswith(CAPACITY_REASON_PREFIX) for reason in by_reason):
+        lines.append("  Raise gateway.multiplex_max_profiles (each served profile costs ~7 threads)")
+        lines.append("  or move the profile up gateway.multiplex_serve_priority to keep it served.")
+    return lines
+
+
+def print_served_set_notices() -> None:
+    """``hermes gateway status``: the standalone boot-guard box, then every profile the live
+    multiplexer does not serve. Both are read from the live record; neither prints when clean."""
+    from hermes_cli.gateway_multiplex_mode import recorded_standalone_warning_lines
+    for line in recorded_standalone_warning_lines():
+        print(line)
+    for line in unserved_profile_lines(recorded_unserved_profiles()):
+        print(line)
+
+
 def multiplexer_served_secondaries() -> list[str]:
     """Named profiles the live default multiplexer serves (excludes ``default``); empty when none."""
     return [p for p in (recorded_served_profiles() or []) if p and p != "default"]

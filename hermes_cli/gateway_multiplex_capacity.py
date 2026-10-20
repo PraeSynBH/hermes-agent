@@ -40,9 +40,14 @@ logger = logging.getLogger(__name__)
 MAX_PROFILES_KEY = "multiplex_max_profiles"
 PRIORITY_KEY = "multiplex_serve_priority"
 
-#: ``(path, mtime_ns, size)`` of the config.yaml the cached gateway section was read from. The reader
-#: sits on the hot serving path (``profiles_to_serve`` runs per inbound route and per rescan), so a
-#: raw config read per call is not affordable; a re-stat per call is.
+#: Prefix every ceiling park reason carries. The reason is how the rest of the gateway tells a
+#: PROVISIONAL deferral (this config, this tick — a raised ceiling serves the profile again) from a
+#: terminal park (unusable store, home owned elsewhere) that only an explicit rescan retries.
+CAPACITY_REASON_PREFIX = "capacity:"
+
+#: ``(path, mtime_ns, size)`` of the config.yaml the cached gateway section was read from. The
+#: reader sits on the hot serving path (``profiles_to_serve`` runs per inbound route and per
+#: rescan), so a raw config read per call is not affordable; a re-stat per call is.
 _CONFIG_MEMO: dict[str, tuple[tuple[int, int], dict]] = {}
 
 _last_deferred: dict[str, str] = {}
@@ -165,7 +170,7 @@ def apply_ceiling(serve: Sequence[tuple[str, Path]], cap: Optional[int],
     if demand is None:
         # Legacy deferral text: unchanged so a host without a demand view publishes exactly what it
         # published before this module learned about demand.
-        reason = f"capacity: {cap} profiles per gateway (gateway.{MAX_PROFILES_KEY})"
+        reason = f"{CAPACITY_REASON_PREFIX} {cap} profiles per gateway (gateway.{MAX_PROFILES_KEY})"
         deferred = {name: reason for name in ranked if name not in kept_names}
     else:
         head = deferral_head(cap)
@@ -177,7 +182,7 @@ def apply_ceiling(serve: Sequence[tuple[str, Path]], cap: Optional[int],
 
 def deferral_head(cap: Optional[int]) -> str:
     """The ``capacity: …`` prefix every deferral reason starts with (the check matches on it)."""
-    return (f"capacity: {cap} profiles per gateway (gateway.{MAX_PROFILES_KEY}) — "
+    return (f"{CAPACITY_REASON_PREFIX} {cap} profiles per gateway (gateway.{MAX_PROFILES_KEY}) — "
             f"this profile is deferred")
 
 
@@ -286,7 +291,7 @@ def reset_memo() -> None:
 
 
 __all__ = [
-    "MAX_PROFILES_KEY", "PRIORITY_KEY", "apply_ceiling", "cost_clause", "deferral_head",
-    "deferred_by_capacity", "gateway_section",
-    "last_decision", "profile_ceiling", "remember_deferred", "reset_memo", "serve_priority",
+    "CAPACITY_REASON_PREFIX", "MAX_PROFILES_KEY", "PRIORITY_KEY", "apply_ceiling", "cost_clause",
+    "deferral_head", "deferred_by_capacity", "gateway_section", "last_decision", "profile_ceiling",
+    "remember_deferred", "reset_memo", "serve_priority",
 ]

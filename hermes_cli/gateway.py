@@ -1642,11 +1642,11 @@ def _print_gateway_process_mismatch(snapshot: GatewayRuntimeSnapshot) -> None:
         print("  can refuse to start another copy until this process stops.")
 
 
-def _print_multiplex_standalone_reason() -> None:
-    """The boot guard kept an unset-default gateway standalone: say so in status, with the remedy."""
-    from hermes_cli.gateway_multiplex_mode import recorded_standalone_warning_lines
-    for line in recorded_standalone_warning_lines():
-        print(line)
+def _print_served_set_notices() -> None:
+    """Status notices about the served set: the standalone boot guard, and every profile the live
+    multiplexer does not serve (ceiling deferrals, unusable stores) with the reason."""
+    from hermes_cli.gateway_multiplex_served import print_served_set_notices
+    print_served_set_notices()
 
 
 def _print_served_ingress_urls(profile: str | None = None) -> None:
@@ -5615,7 +5615,7 @@ def _cmd_status(args):
             _gw_windows().status(deep=deep)
         _print_gateway_process_mismatch(snapshot)
         report_incompatible_owner(())
-        _print_multiplex_standalone_reason()
+        _print_served_set_notices()
         _print_served_ingress_urls()
     else:
         pids = list(snapshot.gateway_pids)
@@ -5625,7 +5625,7 @@ def _cmd_status(args):
             print(f"✓ Gateway is running (PID: {', '.join(map(str, pids))})")
             print("  (Running manually, not as a system service)")
             _print_runtime_health()
-            _print_multiplex_standalone_reason()
+            _print_served_set_notices()
             _print_served_ingress_urls()
             print()
             _print_lines(*_STATUS_RUNNING_HINTS[_status_host_kind()])
@@ -5634,7 +5634,7 @@ def _cmd_status(args):
             # argv is deliberately unmatched, #123881, and there is no gateway.pid) — #125390.
             print(f"✓ Gateway is running (supervised by {snapshot.manager})")
             _print_runtime_health()
-            _print_multiplex_standalone_reason()
+            _print_served_set_notices()
             _print_served_ingress_urls()
         else:
             print("✗ Gateway is not running")
