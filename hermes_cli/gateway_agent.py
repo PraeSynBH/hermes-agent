@@ -93,6 +93,7 @@ class GatewayAgent:
     def __init__(self, *, session_db=None, session_id=None, model=None, provider=None, base_url=None,
                  api_mode=None, max_iterations=90, quiet_mode=True, tool_progress_mode="all",
                  reasoning_config=None, service_tier=None, clarify_callback=None, connection_callback=None,
+                 connection_update_callback=None,
                  reasoning_callback=None, thinking_callback=None, tool_progress_callback=None,
                  tool_start_callback=None, tool_complete_callback=None, stream_delta_callback=None,
                  tool_gen_callback=None, notice_callback=None, notice_clear_callback=None,
@@ -114,7 +115,10 @@ class GatewayAgent:
         self.quiet_mode = quiet_mode
         self._service_tier = None
         self.clarify_callback = clarify_callback
+        # The manage_connections card: the gateway runs the operation and streams connection.request /
+        # connection.update; the card answers through connection_respond / connection_retry.
         self.connection_callback = connection_callback
+        self.connection_update_callback = connection_update_callback
         self._reasoning_callback = None
         self._show_reasoning_sent = None
         self.thinking_callback = thinking_callback
@@ -166,6 +170,8 @@ class GatewayAgent:
         # todo snapshot (``_set_todos``), read by the pet's done-plan beat.
         from tools.todo_tool import TodoStore
         self._todo_store = TodoStore()
+        # Part of the _compress_context seam: it sets the owner's report here and compress_now reads it.
+        self.compression_summary = None
         self._generation = None
         self._admission = None
         self._turn = None  # a turn a later one replaced stops taking frames
@@ -349,6 +355,20 @@ class GatewayAgent:
         return True
 
     # -- session identity ----------------------------------------------------------------------
+    @property
+    def _todo_store(self):
+        return self._todos
+
+    @_todo_store.setter
+    def _todo_store(self, store):
+        """Main swaps in a fresh ``TodoStore`` after /new, /resume and /branch move ``session_id`` (and the
+        constructor builds one): it starts with the gateway's snapshot of that session, so a resumed
+        plan is there before its next ``todo.updated``."""
+        self._todos = store
+        snapshot = self._state().todo_state
+        if snapshot:
+            self._set_todos(snapshot)
+
     @property
     def session_id(self):
         return self._session_id
@@ -593,7 +613,10 @@ class GatewayAgent:
                           force=True, verbatim_tail=None, **_kw):
         """Main's manual ``/compress`` seam (``compress_now``) as ``session.mutate compress``: the
         gateway summarizes and commits; the returned transcript is the gateway's compacted history.
-        ``verbatim_tail`` rows are stamped as stored, so ``compress_now`` does not rejoin them."""
+        ``verbatim_tail`` rows are stamped as stored, so ``compress_now`` does not rejoin them.
+        The gateway's own report (``summary``: flags and note (with the reason)) is kept for ``compress_now``;
+        a ``noop`` answer (a failed summary or nothing removable) committed nothing, so the history,
+        the tail and the compression count stay as they were."""
         from agent.context_compressor import _DB_PERSISTED_MARKER
         from agent.conversation_compression import COMPACTION_STATUS
         from hermes_cli.gateway_client import COMPRESS_RPC_TIMEOUT
@@ -604,11 +627,16 @@ class GatewayAgent:
             payload["partial"] = True
             payload["keep_last"] = max(1, sum(1 for m in verbatim_tail if m.get("role") == "user"))
         self._emit_print(COMPACTION_STATUS)
+        self.compression_summary = None
         snapshot = self.connection.call("session.resume", session_id=self.session_id)
-        self.connection.call("session.mutate", timeout=COMPRESS_RPC_TIMEOUT, session_id=self.session_id,
-                             request_id=uuid.uuid4().hex, expected_revision=snapshot["revision"],
-                             expected_generation=snapshot["execution_generation"],
-                             operation="compress", payload=payload)
+        result = self.connection.call("session.mutate", timeout=COMPRESS_RPC_TIMEOUT, session_id=self.session_id,
+                                      request_id=uuid.uuid4().hex, expected_revision=snapshot["revision"],
+                                      expected_generation=snapshot["execution_generation"],
+                                      operation="compress", payload=payload) or {}
+        if isinstance(result.get("summary"), dict):
+            self.compression_summary = result["summary"]
+        if result.get("status") == "noop":
+            return list(messages), system_message
         for row in verbatim_tail or ():
             row[_DB_PERSISTED_MARKER] = True
         after = self.connection.call("session.resume", session_id=self.session_id)
@@ -870,6 +898,7 @@ class GatewayAgent:
             if row.get("status") == "unknown":
                 return lost  # its completion was the one the hole lost: no other is owed
             turn.gapped |= row.get("status") != "queued"  # one still queued lost nothing
+            self._restore_connection_card(snapshot.get("pending_connection"))
             for prompt in snapshot.get("prompts") or []:
                 if row.get("status") == "started" and prompt.get("execution_generation") == row.get("execution_generation") \
                         and prompt.get("prompt_id") not in turn.answered and not stop():
@@ -927,6 +956,12 @@ class GatewayAgent:
     def _on_tool_generating(self, payload, stream_callback, starts):
         if self.tool_gen_callback is not None:
             self.tool_gen_callback(payload.get("name"))
+
+    def _on_tool_progress(self, payload, stream_callback, starts):
+        if self.tool_progress_callback is not None:
+            self.tool_progress_callback("tool.progress", payload.get("name"), payload.get("message"), None,
+                                        tool_call_id=payload.get("tool_id"), progress=payload.get("progress"),
+                                        total=payload.get("total"), percent=payload.get("percent"))
 
     def _on_tool_start(self, payload, stream_callback, starts):
         self._close_segment(starts)
@@ -1072,6 +1107,33 @@ class GatewayAgent:
         self.connection.call("clarify.respond", session_id=self.session_id,
                              execution_generation=payload.get("execution_generation", self._generation),
                              prompt_id=payload.get("prompt_id"), answer=str(answer))
+
+    def _on_connection_request(self, payload, stream_callback, starts):
+        if self.connection_callback is not None:
+            self.connection_callback(payload)
+
+    def _on_connection_update(self, payload, stream_callback, starts):
+        if self.connection_update_callback is not None:
+            self.connection_update_callback(payload)
+
+    def _restore_connection_card(self, pending):
+        """After a replay gap, the resume snapshot's open operation: (re)open the card from it, or
+        close a stale card when none remains (the gap may have eaten the request or the settle)."""
+        if pending:
+            if self.connection_callback is not None:
+                self.connection_callback(pending)
+        elif self.connection_update_callback is not None:
+            self.connection_update_callback({"settled": True})
+
+    def connection_respond(self, op_id, result):
+        """The card's answer to the gateway's open operation (``connection.respond``); returns its result."""
+        return self.connection.call("connection.respond", op_id=op_id, result=result,
+                                    owner={"type": "session", "session_id": self.session_id})
+
+    def connection_retry(self, name):
+        """The card's Try again on a failed or expired row: the gateway re-mints it on the open operation."""
+        return self.connection.call("connectors.connect", connectors=[name], reconnect=True,
+                                    owner={"type": "session", "session_id": self.session_id})
 
     def _answer_request(self, frame):
         """A gateway server→client request (``sudo``, ``secret``, ``clarify``): main's own modal
@@ -1362,6 +1424,7 @@ _HANDLERS = {
     "message.delta": GatewayAgent._on_delta,
     "message.interim": GatewayAgent._on_interim,
     "tool.generating": GatewayAgent._on_tool_generating,
+    "tool.progress": GatewayAgent._on_tool_progress,
     "tool.start": GatewayAgent._on_tool_start,
     "tool.complete": GatewayAgent._on_tool_complete,
     "todo.updated": GatewayAgent._on_todo,
@@ -1378,4 +1441,6 @@ _HANDLERS = {
     "review.summary": GatewayAgent._on_review_summary,
     "approval.request": GatewayAgent._on_approval,
     "clarify.request": GatewayAgent._on_clarify,
+    "connection.request": GatewayAgent._on_connection_request,
+    "connection.update": GatewayAgent._on_connection_update,
 }
