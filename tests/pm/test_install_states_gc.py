@@ -1,7 +1,7 @@
 """Dependency state of a deleted checkout is reclaimed; state anything live could still read, or
 whose checkout this process merely cannot see, is kept (``pm/install_states.py``). Past the
-retention floor, state whose checkout still exists is evicted once unused -- a harness that keeps a
-worktree per issue leaves those behind forever."""
+count cap, state whose checkout still exists is evicted once nothing runs from it -- a harness that
+keeps a worktree per issue leaves those behind forever."""
 
 from __future__ import annotations
 
@@ -117,8 +117,8 @@ def test_partly_removed_orphan_keeps_its_record_until_retried(tmp_path):
     assert collect_orphan_install_states(installs) == [state] and not state.exists()
 
 
-def test_stale_states_past_the_retention_floor_are_evicted_oldest_first(tmp_path):
-    """A checkout that keeps existing is not evidence of use: past the floor, keep the newest few."""
+def test_states_past_the_count_cap_are_evicted_oldest_first(tmp_path):
+    """A checkout that keeps existing is not evidence of use: keep the newest few by last use."""
     installs = tmp_path / "installs"
     # The checkouts still exist: that is the whole case the deletion tiers never fire on.
     states = []
@@ -128,8 +128,8 @@ def test_stale_states_past_the_retention_floor_are_evicted_oldest_first(tmp_path
         states.append(_state(installs, f"k{n}", checkout, used_ago=72 * 3600 - n * 3600))
 
     # Ranked by last use: the two that went unused longest ago fall off, the newest four stay.
-    assert stale_install_states(installs, keep=4, min_age_seconds=48 * 3600) == [states[1], states[0]]
-    evicted = collect_stale_install_states(installs, keep=4, min_age_seconds=48 * 3600)
+    assert stale_install_states(installs, keep=4) == [states[1], states[0]]
+    evicted = collect_stale_install_states(installs, keep=4)
 
     assert evicted == [states[1], states[0]]
     assert all(not state.exists() for state in states[:2])
@@ -137,15 +137,39 @@ def test_stale_states_past_the_retention_floor_are_evicted_oldest_first(tmp_path
     assert not list(installs.glob(".evicting-*"))
 
 
-def test_state_used_within_the_floor_survives_the_count_cap(tmp_path):
-    """The count cap bounds a host; the age floor is what keeps it from rebuilding live work."""
-    installs = tmp_path / "installs"
-    for n in range(3):
-        _state(installs, f"k{n}", tmp_path / "wt", used_ago=3600)
+def test_the_count_cap_is_not_charged_against_an_idle_floor(tmp_path):
+    """The bound must bite within the hour: a burst of launches is what this tier exists for.
 
-    assert stale_install_states(installs, keep=1, min_age_seconds=48 * 3600) == []
-    assert collect_stale_install_states(installs, keep=1, min_age_seconds=48 * 3600) == []
-    assert sorted(p.name for p in installs.iterdir()) == ["k0", "k1", "k2"]
+    A floor wide enough to keep warm states (a day or two) also holds every tree a campaign created
+    in that window, so a host launching every ~40 min would carry dozens of them -- the growth the
+    count is supposed to stop, moved a day out instead of removed.
+    """
+    installs = tmp_path / "installs"
+    (tmp_path / "wt").mkdir()
+    states = [_state(installs, f"k{n}", tmp_path / "wt", used_ago=(40 - n * 10) * 60)
+              for n in range(5)]
+
+    # Used 40, 30, 20 minutes ago and kept only four deep: the oldest goes in this same pass.
+    assert stale_install_states(installs, keep=4) == [states[0]]
+    assert collect_stale_install_states(installs, keep=4) == [states[0]]
+
+
+def test_a_state_younger_than_the_grace_survives_the_pass(tmp_path):
+    """A state dir appears before its install lock: the grace is the one window the lock cannot cover.
+
+    Ranking by last use keeps a brand-new state anyway; the grace is what holds one whose stamp is
+    not readable yet (it ranks last) or that a pass meets where no keep window exists at all.
+    """
+    installs = tmp_path / "installs"
+    (tmp_path / "wt").mkdir()
+    older = [_state(installs, f"k{n}", tmp_path / "wt", used_ago=(n + 1) * 3600) for n in range(2)]
+    starting = _state(installs, "new", tmp_path / "wt", used_ago=60)
+
+    assert stale_install_states(installs, keep=0) == older
+    assert collect_stale_install_states(installs, keep=0) == older
+    assert starting.is_dir()
+    # Past the grace with nothing holding it, the next pass takes it.
+    assert collect_stale_install_states(installs, keep=0, grace_seconds=0) == [starting]
 
 
 def test_the_state_this_process_runs_from_is_never_evicted(tmp_path):
@@ -158,8 +182,7 @@ def test_the_state_this_process_runs_from_is_never_evicted(tmp_path):
     stale = _state(installs, "k1", checkouts["wt-a"], used_ago=90 * 3600)
     recent = _state(installs, "k2", checkouts["wt-b"], used_ago=80 * 3600)
 
-    evicted = collect_stale_install_states(installs, keep=1, min_age_seconds=48 * 3600,
-                                           active=[active])
+    evicted = collect_stale_install_states(installs, keep=1, active=[active])
 
     assert evicted == [stale]
     assert active.is_dir() and recent.is_dir() and not stale.exists()
@@ -179,14 +202,13 @@ def test_held_stale_state_is_kept_until_its_owner_exits(tmp_path):
     fds.append(os.open(lease_dir / "reader", os.O_CREAT | os.O_RDWR, 0o600))
     assert all(lock_fd(fd, wait=False) for fd in fds)
     try:
-        assert collect_stale_install_states(installs, keep=0, min_age_seconds=48 * 3600) == [spare]
+        assert collect_stale_install_states(installs, keep=0) == [spare]
         assert installing.is_dir() and running.is_dir()
     finally:
         for fd in fds:
             os.close(fd)
     # Owners gone: the next pass evicts them, and nothing else.
-    assert sorted(p.name for p in collect_stale_install_states(installs, keep=0,
-                                                              min_age_seconds=48 * 3600)) == ["k1", "k2"]
+    assert sorted(p.name for p in collect_stale_install_states(installs, keep=0)) == ["k1", "k2"]
 
 
 @pytest.mark.platforms("posix")
@@ -200,7 +222,7 @@ def test_partly_removed_eviction_keeps_no_install_key(tmp_path):
     (stuck / "pyvenv.cfg").write_text("", encoding="utf-8")
     stuck.chmod(0o500)
     try:
-        assert collect_stale_install_states(installs, keep=0, min_age_seconds=48 * 3600) == [state]
+        assert collect_stale_install_states(installs, keep=0) == [state]
         assert not state.exists()
         assert list(installs.glob(".evicting-*"))
     finally:
@@ -208,7 +230,7 @@ def test_partly_removed_eviction_keeps_no_install_key(tmp_path):
             for path in leftover.rglob("*"):
                 if path.is_dir():
                     path.chmod(0o700)
-    assert collect_stale_install_states(installs, keep=0, min_age_seconds=48 * 3600) == []
+    assert collect_stale_install_states(installs, keep=0) == []
     assert not list(installs.glob(".evicting-*"))
 
 

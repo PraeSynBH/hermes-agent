@@ -25,12 +25,16 @@ the proof, and a live run still holds the lock or a lease.
 Deletion evidence does not bound a host whose checkouts *stay*: a harness that keeps one worktree
 per issue at a stable path (``~/paperclip/<issue>-wt``), or a developer's long-lived clone outside
 the data root, records a checkout that exists forever, so the tiers above never fire and every one
-of them pins a full environment. That tail is bounded by age and count instead: keep the newest
-:data:`KEPT_INSTALL_STATES` states seen within :data:`STALE_INSTALL_STATE_AGE` and evict the rest.
-Evicting a state is safe rather than destructive -- the next launch in that checkout materialises a
-fresh one -- and a state only counts as evictable when nothing still runs from it: a process that
-booted in the checkout holds a generation lease for its lifetime
-(:func:`pm.environments.activate_dependencies`), and an install in flight holds the install lock.
+of them pins a full environment. That tail is bounded by count instead: keep the newest
+:data:`KEPT_INSTALL_STATES` states by last use and evict the rest. Evicting a state is safe rather
+than destructive -- the next launch in that checkout materialises a fresh one -- and a state only
+counts as evictable when nothing still runs from it: a process that booted in the checkout holds a
+generation lease for its lifetime (:func:`pm.environments.activate_dependencies`), and an install
+in flight holds the install lock. That is why the count is the whole bound: an idle floor wide
+enough to keep a state warm across days would also hold every state a burst of launches created,
+which is the growth this tier exists to stop (a host launching once per ~40 min would carry ~70
+trees, ~50 GB, before a 48 h floor let any of them go). :data:`EVICTION_GRACE` therefore covers
+only the window before a starting launch announces itself through that lock.
 """
 
 from __future__ import annotations
@@ -48,8 +52,11 @@ logger = logging.getLogger(__name__)
 
 #: States kept regardless of age (the runtime checkout, the trees a campaign is working in).
 KEPT_INSTALL_STATES = 4
-#: How long a state must have gone unused before eviction may touch it at all.
-STALE_INSTALL_STATE_AGE = 48 * 3600.0
+#: Race guard, not a freshness policy. A launch creates its state dir before it takes the install
+#: lock, so a pass that ran in that window could take a state whose owner has not announced itself
+#: yet; every later moment of a state's life is provable through the lock or a generation lease.
+#: Any wider floor is charged against the count bound: it holds each launch's tree that long.
+EVICTION_GRACE = 15 * 60.0
 
 
 def system_temp_root() -> Path:
@@ -123,7 +130,7 @@ def _last_used(state: Path) -> float:
 
     ``inputs/`` is rewritten on every install *and* no-op sync, so a cache hit that writes nothing
     else still moves it. A state with no ``inputs/`` is pre-record or half-built; its own mtime is
-    the only signal, and a fresh one is young enough to be kept by the age floor either way.
+    the only signal, and a fresh one is inside the eviction grace either way.
     """
     for marker in (state / "inputs", state / "facts.json", state):
         try:
@@ -134,13 +141,15 @@ def _last_used(state: Path) -> float:
 
 
 def stale_install_states(installs: Path, *, keep: int = KEPT_INSTALL_STATES,
-                         min_age_seconds: float = STALE_INSTALL_STATE_AGE,
+                         grace_seconds: float = EVICTION_GRACE,
                          active: Iterable[Path] = ()) -> list[Path]:
-    """States of checkouts that still exist but have gone unused, past the newest *keep*.
+    """States of checkouts that still exist, past the newest *keep* by last use.
 
     Ordered by last use, so the ties a host accumulates during one campaign fall off oldest first.
     *active* (the state the calling process runs from) is never a candidate: evicting it under a
-    live interpreter is the one removal no lease would necessarily prevent.
+    live interpreter is the one removal no lease would necessarily prevent. Only *keep* holds a
+    state here -- the count is the bound -- so a state younger than *grace_seconds* is skipped
+    solely to cover a launch that has created its dir but not yet taken the install lock.
     """
     if not installs.is_dir():
         return []
@@ -152,7 +161,7 @@ def stale_install_states(installs: Path, *, keep: int = KEPT_INSTALL_STATES,
         return []
     now = time.time()
     ranked = sorted(states, key=_last_used, reverse=True)
-    return [state for state in ranked[max(keep, 0):] if now - _last_used(state) >= min_age_seconds]
+    return [state for state in ranked[max(keep, 0):] if now - _last_used(state) >= grace_seconds]
 
 
 def _sweep_evictions(installs: Path) -> None:
@@ -166,9 +175,9 @@ def _sweep_evictions(installs: Path) -> None:
 
 
 def collect_stale_install_states(installs: Path, *, keep: int = KEPT_INSTALL_STATES,
-                                 min_age_seconds: float = STALE_INSTALL_STATE_AGE,
+                                 grace_seconds: float = EVICTION_GRACE,
                                  active: Iterable[Path] = ()) -> list[Path]:
-    """Evict unheld stale states beyond the retention floor; returns the states evicted.
+    """Evict unheld states past the newest *keep*; returns the states evicted.
 
     Each state is renamed out of its install-key name before it is removed. A removal that stops
     part-way (an open file on Windows, a read-only dir) therefore leaves nothing that still looks
@@ -179,7 +188,7 @@ def collect_stale_install_states(installs: Path, *, keep: int = KEPT_INSTALL_STA
     if not installs.is_dir():
         return removed
     _sweep_evictions(installs)
-    for state in stale_install_states(installs, keep=keep, min_age_seconds=min_age_seconds,
+    for state in stale_install_states(installs, keep=keep, grace_seconds=grace_seconds,
                                       active=active):
         if _held(state):
             logger.debug("stale install state %s is still held; skipped", state.name)
