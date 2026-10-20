@@ -30,13 +30,21 @@ SPAWN_ENV_VAR = "HERMES_SPAWN"
 _TAG_VERSION = "v1"
 LEDGER_FILENAME = "spawn-ledger.json"
 
+#: Purposes of processes that exist ONLY to serve the spawner that created them: a stdio MCP
+#: helper, a browser-harness daemon a browser_exec call caused to start, a private cua-driver
+#: serve daemon. None has an independent reason to outlive its spawner, so a provably dead
+#: spawner is the WHOLE reap proof (no second liveness fact, unlike serve/dashboard/gateway).
+#: Every spawn site that starts one registers it through :func:`register_child` with one of these
+#: purpose strings; the fence below is what makes the startup reconciler cover it (PRA-6594/6601).
+HELPER_PURPOSES = frozenset({"mcp-helper", "browser-harness-daemon", "cua-driver-daemon"})
+
 #: Purposes a reaper may treat as "safe to kill when the owner is gone".
 #: Interactive processes (chat, REPLs) are deliberately NOT in this set.
-REAPABLE_PURPOSES = frozenset({"serve", "dashboard", "gateway", "mcp-helper"})
+REAPABLE_PURPOSES = frozenset({"serve", "dashboard", "gateway"}) | HELPER_PURPOSES
 
 #: Host-role owners a fresh backend may reap on a HELD_BY_OTHER conflict (#121964): the
-#: serve/dashboard/gateway subset. The mcp-helper rung stays owned by reap_orphaned_mcp_helpers.
-_BACKEND_OWNER_PURPOSES = REAPABLE_PURPOSES - {"mcp-helper"}
+#: serve/dashboard/gateway subset. The helper rung stays owned by the proven-helper sweep.
+_BACKEND_OWNER_PURPOSES = REAPABLE_PURPOSES - HELPER_PURPOSES
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -651,50 +659,54 @@ def reap_orphaned_mcp_helpers(*, project_root: Optional[Path] = None, kill_fn=No
 
     Ledger-driven startup-sweep rung (not cmdline-heuristic): a helper is reaped ONLY when it has a
     live ``mcp-helper`` entry for THIS install AND ``spawner_is_dead`` is ``True`` — never
-    ``None``/unprovable, never a live spawner.
+    ``None``/unprovable, never a live spawner. The startup reconciler runs the same sweep over
+    every :data:`HELPER_PURPOSES` member.
     """
     return [
         record["pid"]
-        for record in _reap_proven_mcp_helpers(project_root=project_root, kill_fn=kill_fn)
+        for record in _reap_proven_helpers(project_root=project_root, kill_fn=kill_fn,
+                                           purposes=frozenset({"mcp-helper"}))
     ]
 
 
-def _reap_proven_mcp_helpers(*, project_root: Optional[Path] = None, kill_fn=None) -> list[dict]:
+def _reap_proven_helpers(*, project_root: Optional[Path] = None, kill_fn=None,
+                         purposes: frozenset = HELPER_PURPOSES) -> list[dict]:
     """Reap the proven-orphan helpers, one ``{pid, purpose, hermes_home}`` record per kill."""
     reaped: list[dict] = []
-    for entry in _mcp_helper_orphans(project_root=project_root):
+    for entry in _helper_orphans(project_root=project_root, purposes=purposes):
         try:
             if kill_fn is not None:
                 kill_fn(entry["pid"])
-            elif not _reap_mcp_helper_process(entry):
+            elif not _reap_helper_process(entry):
                 continue  # PID reused since registration
             logger.info(
-                "reconciled orphaned mcp-helper pid=%s home=%s spawner=%s",
-                entry["pid"], _home_of(entry), entry.get("spawner_pid"),
+                "reconciled orphaned %s pid=%s home=%s spawner=%s",
+                entry.get("purpose"), entry["pid"], _home_of(entry), entry.get("spawner_pid"),
             )
-            reaped.append({"pid": entry["pid"], "purpose": "mcp-helper", "hermes_home": _home_of(entry)})
+            reaped.append({"pid": entry["pid"], "purpose": entry.get("purpose"), "hermes_home": _home_of(entry)})
         except Exception:
-            logger.debug("mcp-helper orphan reap failed for %s", entry, exc_info=True)
+            logger.debug("helper orphan reap failed for %s", entry, exc_info=True)
     return reaped
 
 
-def _mcp_helper_orphans(*, project_root: Optional[Path] = None) -> list[dict]:
-    """Live ``mcp-helper`` entries for THIS install whose recorded spawner is provably dead."""
+def _helper_orphans(*, project_root: Optional[Path] = None,
+                    purposes: frozenset = HELPER_PURPOSES) -> list[dict]:
+    """Live ``purposes`` entries for THIS install whose recorded spawner is provably dead."""
     try:
         entries = ledger_entries(project_root=project_root)
     except Exception:
-        logger.debug("could not read the spawn ledger for mcp-helper orphans", exc_info=True)
+        logger.debug("could not read the spawn ledger for helper orphans", exc_info=True)
         return []
     own_pid = os.getpid()
     return [
         entry for entry in entries
-        if entry.get("purpose") == "mcp-helper"
+        if entry.get("purpose") in purposes
         and isinstance(entry.get("pid"), int) and entry["pid"] > 0 and entry["pid"] != own_pid
         and spawner_is_dead(entry) is True
     ]
 
 
-def _reap_mcp_helper_process(entry: dict) -> bool:
+def _reap_helper_process(entry: dict) -> bool:
     """Terminate one proven-orphan helper; ``False`` when the PID's incarnation moved on."""
     import psutil
 
@@ -733,8 +745,9 @@ def reconcile_orphans(*, kill_fn=None, reparented_fn=None) -> list[dict]:
     * ``serve`` / ``dashboard`` — the home claims no live backend for it: reparented to init, no
       valid Desktop SSH ``backend.lock.json``, and past the lock-write grace
       (:func:`_reparented_orphan`, the rung #121964 already uses for backend owners);
-    * ``mcp-helper`` — strict ``spawner_is_dead``: a stdio helper has no independent reason to
-      outlive its spawner.
+    * every :data:`HELPER_PURPOSES` member (``mcp-helper``, ``browser-harness-daemon``,
+      ``cua-driver-daemon``) — strict ``spawner_is_dead``: a helper process exists only to serve
+      the spawner that started it, so it has no independent reason to outlive it.
 
     Never this process, never a live spawner, never an unprovable entry (``None``), never an
     interactive purpose. Returns one ``{pid, purpose, hermes_home}`` record per reap; never raises.
@@ -767,7 +780,7 @@ def reconcile_orphans(*, kill_fn=None, reparented_fn=None) -> list[dict]:
         record = _reap_reconciled(entry, kill_fn)
         if record is not None:
             reaped.append(record)
-    reaped.extend(_reap_proven_mcp_helpers(kill_fn=kill_fn))
+    reaped.extend(_reap_proven_helpers(kill_fn=kill_fn))
     return reaped
 
 

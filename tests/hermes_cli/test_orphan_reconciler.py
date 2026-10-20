@@ -128,6 +128,43 @@ def test_the_reconciler_covers_gateways_and_mcp_helpers_too(ledger):
 
 
 @pytest.mark.platforms("posix")
+def test_every_helper_purpose_is_covered_by_the_same_spawner_death_proof(ledger):
+    """A detached browser-harness daemon and a private cua-driver serve outlive their spawner the
+    same way a stdio MCP helper does, so they share one fence: dead spawner → residue, live → hands
+    off. Purpose strings are the contract between the spawn site and this sweep (PRA-6601)."""
+    from hermes_cli.process_identity import HELPER_PURPOSES, reconcile_orphans
+
+    write, sleeper, dead_spawner = ledger
+    orphans = {purpose: sleeper() for purpose in sorted(HELPER_PURPOSES)}
+    live_child = sleeper()
+    write(*[_entry(proc.pid, "/h/g", spawner_pid=dead_spawner(), purpose=purpose)
+             for purpose, proc in orphans.items()],
+          _entry(live_child.pid, "/h/g", spawner_pid=os.getpid(), purpose="browser-harness-daemon"))
+    reaped = reconcile_orphans(reparented_fn=lambda pid: True)
+    assert sorted(record["pid"] for record in reaped) == sorted(proc.pid for proc in orphans.values())
+    assert {record["purpose"] for record in reaped} == set(HELPER_PURPOSES)
+    for proc in orphans.values():
+        proc.wait(timeout=15)  # a real SIGTERM reached each one
+        assert proc.poll() is not None
+    assert live_child.poll() is None
+
+
+@pytest.mark.platforms("posix")
+def test_the_mcp_helper_sweep_stays_scoped_to_mcp_helpers(ledger):
+    """``reap_orphaned_mcp_helpers`` is a public, narrower entry point: widening the reconciler's
+    fence must not turn it into a general helper reaper callers did not ask for."""
+    from hermes_cli.process_identity import reap_orphaned_mcp_helpers
+
+    write, sleeper, dead_spawner = ledger
+    daemon, helper = sleeper(), sleeper()
+    write(_entry(daemon.pid, "/h/g", spawner_pid=dead_spawner(), purpose="browser-harness-daemon"),
+          _entry(helper.pid, "/h/g", spawner_pid=dead_spawner(), purpose="mcp-helper"))
+    assert reap_orphaned_mcp_helpers() == [helper.pid]
+    helper.wait(timeout=15)
+    assert daemon.poll() is None
+
+
+@pytest.mark.platforms("posix")
 def test_a_corrupt_ledger_reaps_nothing_and_never_raises(ledger):
     from hermes_cli import process_identity as pi
 

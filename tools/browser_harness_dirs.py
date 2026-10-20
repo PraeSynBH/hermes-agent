@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -25,6 +26,9 @@ _LINUX_SOCKET_DIR_BUDGET = 107 - len("/bu-.sock") - 64
 
 # The env keys that, with BU_NAME, identify one harness daemon (a served profile's dirs are its own).
 HARNESS_DIR_KEYS = ("BH_RUNTIME_DIR", "BH_RUNTIME_DIR_SHARED", "BH_TMP_DIR", "BH_TMP_DIR_SHARED")
+
+# browser_harness/_ipc.py::_NAME_RE — a BU_NAME that fails it never reaches a socket/pid path.
+_BU_NAME_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 
 
 def daemon_identity(env: dict) -> tuple[str, ...]:
@@ -98,6 +102,38 @@ def socket_fit_runtime_dir(runtime: str, base: str, tag: str) -> str:
         if fits_socket_budget(short, budget) and claim_private_dir(short):
             return short
     return runtime
+
+
+def daemon_pid_path(env: dict) -> Optional[Path]:
+    """``<runtime dir>/<stem>.pid`` of the daemon a call with ``env`` addresses — the file
+    ``browser_harness._ipc.pid_path`` writes, mirrored here so Hermes can read it WITHOUT importing
+    the package in the child's environment (the spawn ledger needs the daemon's pid from the parent).
+
+    Rules mirrored from ``browser_harness._ipc`` (0.1.13): the runtime dir is ``BH_RUNTIME_DIR``,
+    else ``BH_TMP_DIR``, else ``<harness home>/runtime``; the file stem is bare ``bu`` when
+    ``BH_RUNTIME_DIR`` isolates the dir, else ``bu-<BU_NAME>``. ``None`` when neither the dir nor a
+    home to derive it from is resolvable from ``env`` — the caller then simply records nothing.
+    """
+    name = env.get("BU_NAME") or "default"
+    if not _BU_NAME_RE.match(name):
+        return None
+    # ``_ipc`` merges BH_RUNTIME_DIR and BH_TMP_DIR into one module-level dir: a caller that set
+    # EITHER isolates the dir, and the stems stay bare for a single-client dir.
+    explicit = env.get("BH_RUNTIME_DIR") or env.get("BH_TMP_DIR")
+    runtime = explicit
+    if not runtime:
+        home = env.get("BH_HOME") or env.get("BROWSER_HARNESS_HOME")
+        if not home:
+            if env.get("XDG_CONFIG_HOME"):
+                home = os.path.join(env["XDG_CONFIG_HOME"], "browser-harness")
+            elif env.get("HOME"):
+                home = os.path.join(env["HOME"], ".config", "browser-harness")
+            else:
+                return None
+        runtime = os.path.join(home, "runtime")
+    isolated = bool(explicit) and env.get("BH_RUNTIME_DIR_SHARED") != "1"
+    stem = "bu" if isolated else f"bu-{name}"
+    return Path(runtime).expanduser() / f"{stem}.pid"
 
 
 def claim_private_dir(path: str) -> bool:

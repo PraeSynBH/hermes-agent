@@ -252,6 +252,12 @@ jobs:
       - name: Forbid config.yaml writers that bypass the comment-preserving writer
         run: python scripts/check_config_yaml_writers.py
 
+      # A stub server bound to a literal port collides with a stub leaked by an earlier run
+      # (PRA-6601). `:0` makes the leftover harmless; `# stub-port: ok — <why>` marks a test whose
+      # subject IS port reuse.
+      - name: Require ephemeral ports in test stub servers
+        run: python scripts/ci/check_test_stub_ports.py
+
       # The OS lanes import only files carrying the matching marker, so a test that fakes
       # macOS (is_macos -> True, sys.platform -> "darwin") without `platforms("macos")` is green on
       # Linux over a faked branch and never runs on macOS (#111866, tests/AGENTS.md § Don't fake the host OS).
