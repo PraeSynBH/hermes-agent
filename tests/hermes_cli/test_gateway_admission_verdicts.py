@@ -171,6 +171,86 @@ def test_a_standalone_profile_still_starts_its_own_owner(tmp_path, monkeypatch):
     assert spawned == [home.resolve()]
 
 
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("aliased", [True, False], ids=["lock-aliases-multiplexer", "home-owns-its-owner"])
+def test_runtime_unserved_is_not_fooled_by_a_borrowed_lock(tmp_path, monkeypatch, aliased):
+    """The `agent`/`designer` window: a served profile gets *unserved* while work is queued.
+
+    Its ``gateway.lock`` names the multiplexer's own pid (hermes_home rewritten, flock held by the
+    owner), so "the lock is held" looks like a boot in progress for as long as the unserving lasts —
+    144 runs on 2026-10-20 (07:09-10:05, `agent`) burned 240 s each on it. A lock that names the
+    multiplexer is not an owner of its own, so this must be `profile_not_served`; a home with a real
+    owner of its own must keep its control-timeout/start path.
+    """
+    from gateway.control_socket import GatewayControlServer
+    from hermes_cli import gateway_runtime as runtime
+
+    root = tmp_path / ".hermes"
+    root.mkdir(mode=0o700)
+    (root / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\n", encoding="utf-8")
+    home = root / "profiles" / "agent"
+    home.mkdir(parents=True, mode=0o700)
+    (home / "config.yaml").write_text("model: {default: m}\n", encoding="utf-8")
+    borrowed, genuine = os.getpid(), os.getpid() + 1_000_000
+    (root / "gateway.pid").write_text(json.dumps({"pid": borrowed}), encoding="utf-8")
+    # The seam: a live gateway process cannot be synthesized here, so the identity probe is replaced
+    # and only the pid it reports is exercised (the ownership decision itself is real).
+    monkeypatch.setattr(runtime, "_owner_pid", lambda path: borrowed if aliased else genuine)
+    from hermes_cli import gateway_runtime_service as service, gateway_runtime_start as start
+    spawned: list[Path] = []
+    monkeypatch.setattr(service, "discover_existing_gateway_service", lambda *a, **k: None)
+    monkeypatch.setattr(start, "spawn_unmanaged_gateway", lambda target, **k: spawned.append(Path(target)))
+
+    async def probe():
+        payload = {"runtime_protocol": 1, "state": "ready",
+                   "served_profiles": [{"profile_id": str(root), "home": str(root)}]}
+        server = GatewayControlServer(root, verb_handlers={"identify": lambda: payload})
+        assert await server.start()
+        try:
+            return await asyncio.to_thread(runtime.ensure_gateway_runtime, home, timeout=1.0)
+        finally:
+            await server.stop()
+
+    result = asyncio.run(probe())
+    if aliased:
+        assert (result.state, result.reason_code) == ("inaccessible", "profile_not_served")
+        assert "agent" in (result.detail or "")
+        assert spawned == [], "a borrowed lock must not send this home down the boot/start path"
+    else:
+        assert result.reason_code != "profile_not_served", "this owner is wedged, not unserved"
+
+
+def test_a_garbage_ticket_grant_is_an_admission_error_not_a_traceback(monkeypatch):
+    """The owner answering the ticket verb with garbage must not kill the run with a bare traceback.
+
+    11 fleet runs on 2026-10-20 died as ``Traceback ... DiscoveryError: invalid_control_response``:
+    no phase, no class, so no retry chain could classify them (PRX-5725).
+    """
+    from types import SimpleNamespace
+
+    from hermes_cli import gateway_client, gateway_runtime
+    from hermes_cli.gateway_runtime_discovery import DiscoveryError
+
+    endpoint = SimpleNamespace(api_origin="http://127.0.0.1:1", profile_id="p", instance_id="i",
+                               code_sha="0b10", control_home=None)
+    monkeypatch.setattr(gateway_runtime, "ensure_gateway_runtime",
+                        lambda *a, **k: gateway_runtime.GatewayDiscovery("ready", endpoint=endpoint))
+
+    def garbage(*args, **kwargs):
+        raise DiscoveryError("invalid_control_response")
+
+    monkeypatch.setattr(gateway_client, "_session_ticket", garbage)
+
+    async def run():
+        async with gateway_client.connect_gateway():
+            raise AssertionError("a garbage grant must not admit the run")
+
+    with pytest.raises(gateway_client.GatewayClientError) as caught:
+        asyncio.run(run())
+    line = str(caught.value)
+    assert "phase=session-ticket" in line and "invalid_control_response" in line, line
+
+
 def test_boot_evidence_names_create_time_and_start_time(tmp_path):
     """A boot verdict can say how long this host's boot took, from the lifecycle ledger (AC2)."""
     from hermes_cli import gateway_runtime as runtime

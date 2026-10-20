@@ -519,10 +519,16 @@ async def connect_gateway(endpoint=None, subject=None):
     async def mint(home, target, **kwargs):
         """The ticket mint, filed under admission when it runs out (it used to escape as a bare
         ``TimeoutError`` before the try below, so the class token never reached the dead run)."""
+        from hermes_cli.gateway_runtime_discovery import DiscoveryError
+
         try:
             return await asyncio.to_thread(_session_ticket, home, target, **kwargs,
                                            timeout=left(GATEWAY_SESSION_TICKET_DEADLINE_S))
-        except (OSError, TimeoutError) as exc:
+        # ``DiscoveryError``: the owner answered the ticket verb with something that is not a grant
+        # (``_identify_response``). It used to escape this call as a bare traceback — 11 fleet runs on
+        # 2026-10-20 died with ``Traceback ... DiscoveryError: invalid_control_response`` and no
+        # phase, so no retry chain could classify them (PRX-5725).
+        except (OSError, TimeoutError, DiscoveryError) as exc:
             detail = (f"Gateway connection failed; no local fallback (phase=session-ticket, "
                       f"elapsed={time.monotonic() - started:.1f}s, {type(exc).__name__}: {exc})")
             if isinstance(exc, TimeoutError) or left(1.0) <= 0:
