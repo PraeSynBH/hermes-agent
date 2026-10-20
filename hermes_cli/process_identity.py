@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import platform
+import signal
 import sys
 import threading
 import time
@@ -707,23 +708,48 @@ def _helper_orphans(*, project_root: Optional[Path] = None,
 
 
 def _reap_helper_process(entry: dict) -> bool:
-    """Terminate one proven-orphan helper; ``False`` when the PID's incarnation moved on."""
+    """Terminate one proven-orphan helper; ``False`` when the PID's incarnation moved on.
+
+    POSIX signals the helper's process GROUP when the helper leads one (every helper here is
+    started with ``start_new_session``, so its pgid is its own pid): a helper's children — a harness
+    daemon's browser, a stub's server — must go with it, and a helper that is really a
+    ``while true; do …; done`` restart wrapper only bounces on a single SIGTERM (PRA-6601). The
+    leader check is the safety fence: if the pgid is anyone else's, only this pid is signalled.
+    """
     import psutil
 
     proc = psutil.Process(entry["pid"])
     if not _same_incarnation(proc, entry.get("create_time")):
         return False
     # Windows: descendants (npx.cmd → node.exe) have no pgid to group-kill and reparent with
-    # ParentId=null when the direct child exits first (#61059), so reap the whole tree. On POSIX
-    # the killpg-based sweep already reaches them.
+    # ParentId=null when the direct child exits first (#61059), so reap the whole tree.
     if _IS_WINDOWS:
         _kill_process_tree_windows(proc)
+        return True
+    try:
+        own_group = os.getpgid(entry["pid"]) == entry["pid"]
+    except OSError:
+        own_group = False
+
+    def _signal(number: int) -> None:
+        if not own_group:
+            return
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(entry["pid"], number)  # windows-footgun: ok — POSIX branch only
+
+    if own_group:
+        _signal(signal.SIGTERM)
     else:
         proc.terminate()
-        try:
-            proc.wait(timeout=2.0)
-        except psutil.TimeoutExpired:
-            proc.kill()
+    try:
+        proc.wait(timeout=2.0)
+    except psutil.TimeoutExpired:
+        pass  # a wrapper that bounces on SIGTERM, or a leader that ignores it: escalate below
+    # Escalate to the GROUP even after the leader is gone: a restart wrapper's successor, or a
+    # daemon's browser, is still in the group and would otherwise be an orphan of an orphan.
+    _signal(signal.SIGKILL)
+    if not own_group and proc.is_running():
+        proc.kill()
     return True
 
 

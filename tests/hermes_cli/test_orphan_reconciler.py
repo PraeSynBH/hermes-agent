@@ -165,6 +165,31 @@ def test_the_mcp_helper_sweep_stays_scoped_to_mcp_helpers(ledger):
 
 
 @pytest.mark.platforms("posix")
+def test_a_helper_that_bounces_on_sigterm_is_reaped_through_its_process_group(ledger):
+    """A helper is often a wrapper: `while true; do <server>; done` restarts its child within a
+    second, so a single SIGTERM to the leader only bounces the workload. The reap must reach the
+    helper's own process GROUP — and only when that group is provably the helper's own."""
+    from hermes_cli.process_identity import reconcile_orphans
+
+    write, _sleeper, dead_spawner = ledger
+    # The leader ignores SIGTERM and keeps a child in ITS group: only a group kill ends this.
+    wrapper = subprocess.Popen(
+        ["/bin/sh", "-c", "trap '' TERM; /bin/sleep 300 & wait"],
+        start_new_session=True,
+    )
+    try:
+        write(_entry(wrapper.pid, "/h/one", spawner_pid=dead_spawner(), purpose="browser-harness-daemon"))
+        reaped = reconcile_orphans(reparented_fn=lambda pid: True)
+        assert [record["pid"] for record in reaped] == [wrapper.pid]
+        wrapper.wait(timeout=15)
+        assert wrapper.poll() == -9  # SIGKILL, not the ignored SIGTERM
+    finally:
+        if wrapper.poll() is None:
+            wrapper.kill()
+            wrapper.wait(timeout=15)
+
+
+@pytest.mark.platforms("posix")
 def test_a_corrupt_ledger_reaps_nothing_and_never_raises(ledger):
     from hermes_cli import process_identity as pi
 
