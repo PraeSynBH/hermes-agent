@@ -410,7 +410,7 @@ async def serve_profile_runtime(runner, name, home):
     queued native rows are recovered once its adapters connect (``recover_served_native_rows``)."""
     from gateway.session_authorities import owner_scope
     from gateway.session_hosted_service import _ensure_hosted_service, start_ready_hosted_services
-    from gateway.session_local_recovery import recover_local_sessions
+    from gateway.session_local_recovery import recover_local_sessions_offloop
     from gateway.platforms.webhook_ingress import recover_webhook_finalizations
     home = await asyncio.to_thread(Path(home).resolve)
     registry = runner.session_authorities
@@ -429,7 +429,9 @@ async def serve_profile_runtime(runner, name, home):
         with owner_scope(authority):
             _drop_retired_local_adapter(authority)
             await recover_bot_mailbox(authority)
-            recover_local_sessions(authority, schedule=True)
+            # Store reads off the loop: a profile with thousands of local receipts is 13.7 s of
+            # synchronous SQLite (45-122 s loaded), and this runs while the loop serves the others.
+            await recover_local_sessions_offloop(authority, schedule=True)
             await recover_webhook_finalizations(authority)
             _recover_published_api_turns(runner, authority)
         if getattr(runner, 'session_control_server', None) is not None:
@@ -571,12 +573,12 @@ async def recover_gateway_native_sessions(runner):
         return {}
     from gateway.session_hosted_service import ensure_hosted_service
     await ensure_hosted_service(runner)
-    from gateway.session_local_recovery import recover_local_sessions
+    from gateway.session_local_recovery import recover_local_sessions_offloop
     from gateway.platforms.webhook_ingress import recover_webhook_finalizations
     results = {}
     for authority in authorities:
         with owner_scope(authority):
-            recover_local_sessions(authority, schedule=True)
+            await recover_local_sessions_offloop(authority, schedule=True)
             await recover_webhook_finalizations(authority)
         results.update(await recover_profile_native_sessions(runner, authority))
     return results

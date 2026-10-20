@@ -363,23 +363,61 @@ def local_receipt_ids(authority):
             'SELECT key FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',))]
 
 
-def recover_local_sessions(authority, *, schedule=False):
+def _recover_local_store(authority, schedule):
+    """Restore every local receipt and read its admissions; return what the owner loop must schedule.
+
+    ``(refs, settle_sids)``: sessions whose turn is queued (``schedule`` only), and the last-viewer
+    closes of a hard-killed owner that need ``settle_viewer_close``. Pure store work — no task is
+    created here, so this half can run on a worker thread.
+    """
+    refs = []
     for sid in local_receipt_ids(authority):
         try:
             ref = restore_local_session(authority, sid)
             pending = list_session_admissions(authority.db, session_id=sid)
             if schedule and pending and not any(row['status'] == 'unknown' for row in pending):
-                authority._schedule(ref)
+                refs.append(ref)
         except (_ReceiptRefused, _CatchUpPending):
             continue  # logged: the check that refused it, or the catch-up handed to a worker
         except RuntimeStoreError as exc:
             logging.getLogger(__name__).warning('Local session %s paused: %s', sid, exc.reason)
+    settle = []
     if schedule:
         # A last-viewer close the previous owner stopped before completing (#134889 LC-6b).
-        from gateway.session_viewer_close import rearm_persisted_closes, settle_viewer_close
-        from gateway.session_runtime_workers import track_mutation
+        from gateway.session_viewer_close import rearm_persisted_closes
         for sid in rearm_persisted_closes(authority):
-            authority._schedule(SessionRef(authority.profile_id, sid))
+            refs.append(SessionRef(authority.profile_id, sid))
             if any(row['status'] == 'unknown' for row in list_session_admissions(authority.db, session_id=sid)):
                 # A hard-killed owner's turn: the drain pauses on it, so the close resolves it.
-                track_mutation(authority, settle_viewer_close(authority, sid))
+                settle.append(sid)
+    return refs, settle
+
+
+def _apply_local_recovery(authority, refs, settle):
+    """Schedule what ``_recover_local_store`` prepared. Loop-only: each call creates a task."""
+    for ref in refs:
+        authority._schedule(ref)
+    if settle:
+        from gateway.session_viewer_close import settle_viewer_close
+        from gateway.session_runtime_workers import track_mutation
+        for sid in settle:
+            track_mutation(authority, settle_viewer_close(authority, sid))
+
+
+def recover_local_sessions(authority, *, schedule=False):
+    """Sync form, for a caller already ON the owner loop (``_apply_local_recovery`` creates tasks)."""
+    _apply_local_recovery(authority, *_recover_local_store(authority, schedule))
+
+
+async def recover_local_sessions_offloop(authority, *, schedule=False):
+    """``recover_local_sessions`` with its store work on a worker thread.
+
+    Every local receipt costs several synchronous SQLite reads (the receipt, its session row, the
+    lineage tip, its admissions), so this is one query per receipt times the profile's session
+    count — 3.5k receipts took 13.7 s of query time on an idle host and 45-122 s on a loaded one,
+    and on the owner loop that is a stall of every profile the loop serves (PRX-5717: a hot-serve
+    of five profiles stalled the gateway four times). The ContextVar scope of the caller travels
+    with ``to_thread``, so the worker reads under the owning profile's scope; only the task
+    scheduling comes back to the loop.
+    """
+    _apply_local_recovery(authority, *(await asyncio.to_thread(_recover_local_store, authority, schedule)))

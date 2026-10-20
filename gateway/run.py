@@ -1660,21 +1660,18 @@ def _multiplex_profile_homes(config: object) -> list[tuple[str, Path]]:
 
 
 def _cron_tick_profile_homes(config: object) -> list[tuple[str, Path]]:
-    """Profile homes the in-process ticker visits: the served set PLUS the process-active
-    profile: ``profiles_to_serve`` lists default + every live named profile, but a ``--profile
-    <name>`` gateway's own profile may sit outside ``profiles/`` (custom HERMES_HOME). One host
-    process ticks all of them regardless of ``gateway.multiplex_profiles``. Adapter startup
-    already skips ``active``."""
-    from hermes_cli.profiles import get_active_profile_name, get_profile_dir
+    """Profile homes the in-process ticker visits: every store, NEVER the capacity-capped served set.
 
-    homes = _multiplex_profile_homes(config)
-    active = get_active_profile_name() or "default"  # launch profile, pre-identity (ticker boot)
-    if any(name == active for name, _home in homes):
-        return homes
-    try:
-        return homes + [(active, get_profile_dir(active))]
-    except Exception:
-        return homes
+    ``gateway.multiplex_max_profiles`` gates adapters and session authority, not cron, so taking the
+    tick set from that reservation left every deferred profile's jobs in a store no ticker visited
+    (PRX-5717; ``profiles_to_tick`` owns the enumeration and the reasoning). The reservation and the
+    launch profile are passed for a home outside ``profiles/`` — a ``--profile <name>`` gateway.
+    Adapter startup already skips ``active``.
+    """
+    from hermes_cli.profiles import get_active_profile_name, profiles_to_tick
+
+    return profiles_to_tick(True, reserved=_multiplex_profile_homes(config),
+                           active=get_active_profile_name() or "default")
 
 
 def _cron_profile_gate(name: str, home: Path) -> bool:

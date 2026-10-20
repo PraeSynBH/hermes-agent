@@ -59,7 +59,7 @@ async def adopt_before_restore(authority, sid, *, tracked=True):
 
 
 async def adopt_local_compressions(authority):
-    """Boot and hot-profile recovery: every receipt's due catch-up, before ``recover_local_sessions``."""
+    """Boot and hot-profile recovery: every receipt's due catch-up, before ``recover_local_sessions_offloop``."""
     from gateway.session_local_recovery import local_receipt_ids
     for sid in local_receipt_ids(authority):
         await adopt_before_restore(authority, sid, tracked=False)

@@ -133,8 +133,12 @@ def remember_deferred(deferred: dict[str, str]) -> None:
     if deferred == _last_deferred:
         return
     if deferred:
+        # Name what still works as well as what stops: an operator reading only this line used to
+        # conclude cron was dead host-wide and reorder the priority list to "fix" it (PRX-5717).
         logger.warning(
-            "[MULTIPLEX] gateway.%s leaves %d profile(s) unserved on this gateway: %s",
+            "[MULTIPLEX] gateway.%s leaves %d profile(s) unserved on this gateway: %s "
+            "(no adapters, no inbound routing; their cron jobs ARE still ticked, delivery falls "
+            "back to a routed adapter or fails closed)",
             MAX_PROFILES_KEY, len(deferred), ", ".join(sorted(deferred)))
     else:
         logger.info("[MULTIPLEX] gateway.%s: every profile fits on this gateway again", MAX_PROFILES_KEY)
