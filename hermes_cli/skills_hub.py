@@ -919,12 +919,37 @@ def _install_skill(identifier: str, category: str, force: bool, c: Console, skip
         _invalid_path(c, bundle, exc, q_path)
         attempt["failure_class"] = "invalid_bundle"
         return bundle, failed, False
+    _assert_no_self_links(install_dir, c)
     from tools.skills_hub import SKILLS_DIR
     c.print(f"[bold green]Installed:[/] {install_dir.resolve().relative_to(Path(SKILLS_DIR).resolve()).as_posix()}")
     c.print(f"[dim]Files: {', '.join(bundle.files.keys())}[/]\n")
     _announce_blueprint(c, bundle.name)
     _finish_change(c, invalidate_cache, "Skill will be available", "activate")
     return bundle, None if existing else "success", True
+
+
+def _assert_no_self_links(install_dir, console) -> None:
+    """Post-install assertion: nothing under *install_dir* may resolve back into it.
+
+    A bundle (or the temp dance that materialises it) can leave an entry pointing at the
+    directory that holds it — ``<skill>/.sou2124-tmp -> <skill>``. Every ``followlinks`` scan of
+    the skills tree then re-enters that dir forever (PRX-5605: 8,229 parse warnings in one second,
+    gateway main thread CPU-bound). The install is the one moment the shape can be attributed, so
+    it is removed here and named, never carried into the profile's skills dir.
+    """
+    from agent.skill_utils import iter_skill_dir_cycles
+
+    cycles = list(iter_skill_dir_cycles(install_dir))
+    removed = []
+    for path in cycles:
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed.append(path.name)
+    if removed:
+        console.print(f"[yellow]Removed {len(removed)} self-referential link(s) the bundle carried: "
+                      f"{', '.join(removed)}[/]")
 
 
 def _print_tier1_advisory(skill_dir, console) -> None:
