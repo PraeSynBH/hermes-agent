@@ -115,7 +115,9 @@ def test_desktop_ticker_gates_on_profile_gateway_running(tmp_path, monkeypatch, 
     homes = [("default", tmp_path / "default"), ("ops", tmp_path / "ops")][:profile_count]
     running = {homes[-1][1]}
     monkeypatch.setattr(
-        "hermes_cli.profiles.profiles_to_serve", lambda multiplex=False: list(homes)
+        # The ticker enumerates every store (PRX-5717), not the capacity-capped served set: the
+        # ceiling gates adapters, and a deferred profile's cron jobs still have to fire.
+        "hermes_cli.profiles.profiles_to_tick", lambda multiplex=False: list(homes)
     )
     monkeypatch.setattr(
         "hermes_cli.profiles._check_gateway_running", lambda home: home in running
