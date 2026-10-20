@@ -141,12 +141,12 @@ def sync_capacity_parked(runner) -> bool:
     enumeration just made (``profiles_to_serve`` → ``remember_deferred``), so this only publishes
     it, and un-parks the ones a raised ceiling brought back. Returns True when the map changed.
     """
-    from hermes_cli.gateway_multiplex_capacity import deferred_by_capacity
+    from hermes_cli.gateway_multiplex_capacity import CAPACITY_REASON_PREFIX, deferred_by_capacity
     parked = parked_profile_map(runner)
     deferred = deferred_by_capacity()
     changed = False
     for name in [n for n, reason in parked.items()
-                 if str(reason).startswith('capacity:') and n not in deferred]:
+                 if str(reason).startswith(CAPACITY_REASON_PREFIX) and n not in deferred]:
         parked.pop(name, None)
         changed = True
     for name, reason in deferred.items():

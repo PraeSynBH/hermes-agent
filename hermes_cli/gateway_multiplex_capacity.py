@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 MAX_PROFILES_KEY = "multiplex_max_profiles"
 PRIORITY_KEY = "multiplex_serve_priority"
 
+#: Prefix every ceiling park reason carries. The reason is how the rest of the gateway tells a
+#: PROVISIONAL deferral (this config, this tick — a raised ceiling serves the profile again) from a
+#: terminal park (unusable store, home owned elsewhere) that only an explicit rescan retries.
+CAPACITY_REASON_PREFIX = "capacity:"
+
 #: ``(path, mtime_ns, size)`` of the config.yaml the cached ceiling was read from. The reader sits on
 #: the hot serving path (``profiles_to_serve`` runs per inbound route and per rescan), so a raw
 #: config read per call is not affordable; a re-stat per call is.
@@ -122,7 +127,7 @@ def apply_ceiling(serve: Sequence[tuple[str, Path]], cap: Optional[int],
     order += [name for name, _home in pairs if name != "default" and name not in order]
     keep = (["default"] if "default" in by_name else []) + order[:max(0, cap - (1 if "default" in by_name else 0))]
     kept_names = set(keep)
-    reason = f"capacity: {cap} profiles per gateway (gateway.{MAX_PROFILES_KEY})"
+    reason = f"{CAPACITY_REASON_PREFIX} {cap} profiles per gateway (gateway.{MAX_PROFILES_KEY})"
     deferred = {name: reason for name, _home in pairs if name not in kept_names}
     return [(name, by_name[name]) for name in keep if name in by_name], deferred
 
@@ -157,6 +162,6 @@ def reset_memo() -> None:
 
 
 __all__ = [
-    "MAX_PROFILES_KEY", "PRIORITY_KEY", "apply_ceiling", "deferred_by_capacity",
+    "CAPACITY_REASON_PREFIX", "MAX_PROFILES_KEY", "PRIORITY_KEY", "apply_ceiling", "deferred_by_capacity",
     "profile_ceiling", "remember_deferred", "reset_memo", "serve_priority",
 ]

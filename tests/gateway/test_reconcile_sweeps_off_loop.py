@@ -58,7 +58,7 @@ async def test_reconcile_sweeps_never_run_on_the_event_loop(tmp_path, monkeypatc
     runner._served_profile_signatures = {
         "default": real_signature(home), "worker": real_signature(profile), "ghost": real_signature(ghost)}
 
-    async def _unserve(name, home):
+    async def _unserve(name, home, *, reason=""):
         return None
 
     runner._unserve_profile = _unserve

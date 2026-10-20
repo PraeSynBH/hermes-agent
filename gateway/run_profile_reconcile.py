@@ -215,10 +215,19 @@ class GatewayProfileReconcileMixin:
             self._profile_own_gateway_warned = blocked
             self._profile_probe_timeout_warned = timed_out
             sigs = self._served_profile_signatures or {}
-            from gateway.run_runtime import unpark_profile
-            for name in [n for n in self._parked_profile_names() if n not in listed]:
+            from gateway.run_runtime import parked_profile_map, sync_capacity_parked, unpark_profile
+            from hermes_cli.gateway_multiplex_capacity import CAPACITY_REASON_PREFIX
+            parks = dict(parked_profile_map(self))
+            # A ceiling deferral is THIS tick's config talking, not a failed attempt: it must not
+            # block a re-serve once the ceiling (or the priority order) makes room, so it is
+            # excluded from the ``parked`` filter below and re-derived by the fold at the end of
+            # the tick. Every other park (unusable store, home owned elsewhere, config refusal) is
+            # a verdict a rescan must retry — unparked only once the profile directory is gone.
+            capacity_parked = {n for n, why in parks.items()
+                               if str(why).startswith(CAPACITY_REASON_PREFIX)}
+            for name in [n for n in parks if n not in listed and n not in capacity_parked]:
                 unpark_profile(self, name)
-            parked = self._parked_profile_names()
+            parked = set(self._parked_profile_names()) - capacity_parked
             # The watcher never re-parks the same profile every cycle; a creator's explicit signal does.
             retry_parked = reason == "control-socket"
             added = [n for n in live if n not in known and n != active and (retry_parked or n not in parked)]
@@ -230,8 +239,14 @@ class GatewayProfileReconcileMixin:
                 _serve_signatures, {n: live[n] for n in candidates})
             changed = [n for n in candidates if current_sigs[n] != sigs.get(n)]
             current = {n: h for n, h in live.items() if n in known or n == active}
-            return await self._apply_profile_changes(
+            result = await self._apply_profile_changes(
                 current, added, removed, changed, reason=reason, live=live, result=result)
+            # Publish this tick's verdict even when it applied no diff: ``parked_profiles`` is the
+            # record a client fails fast on and `hermes gateway status` prints, and a quiet tick
+            # used to leave an older (or empty) one in place while profiles were in fact unserved
+            # (PRX-5734). A no-op fold is a dict compare.
+            sync_capacity_parked(self)
+            return result
 
     async def _apply_profile_changes(self, current, added, removed, changed, *, reason,
                                      live=None, result=None):
@@ -249,8 +264,18 @@ class GatewayProfileReconcileMixin:
         sigs = self._served_profile_signatures or {}
         if not (added or removed or changed):
             return {**result, "served_profiles": self.served_profile_names()}
+        from hermes_cli.gateway_multiplex_capacity import MAX_PROFILES_KEY, deferred_by_capacity
+        deferred = deferred_by_capacity()
         for name in removed:
-            await self._unserve_profile(name, known[name])
+            # An unserving that a client will feel must say WHY, in the one place an operator looks
+            # besides the state file: a ceiling deferral is a config choice with a remedy, and it
+            # used to be indistinguishable from a deleted profile (PRX-5734).
+            why = (f"gateway.{MAX_PROFILES_KEY} defers it ({deferred[name]}) — raise the ceiling or "
+                   "move it up gateway.multiplex_serve_priority to keep it served") if name in deferred \
+                else "its profile directory is gone"
+            log = logger.warning if name in deferred else logger.info
+            log("[MULTIPLEX] No longer serving profile '%s' — %s", name, why)
+            await self._unserve_profile(name, known[name], reason=why)
             result["removed"].append(name)
         for name in list(added):
             reason_ = await self._serve_profile_runtime(name, live[name])
@@ -388,7 +413,7 @@ class GatewayProfileReconcileMixin:
             except Exception:
                 logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
 
-    async def _unserve_profile(self, name: str, home: Path) -> None:
+    async def _unserve_profile(self, name: str, home: Path, *, reason: str = "") -> None:
         """Stop and unroute one profile: cancel its reconnects, tear down its adapters, drop its
         bookkeeping and release this process's handles into its home so the deleter's rmtree succeeds.
         The releasing process is not always the deleter (#130244): under multiplexing THIS gateway
@@ -467,7 +492,8 @@ class GatewayProfileReconcileMixin:
                     await asyncio.to_thread(release_profile_log_handlers, home)
             finally:
                 release_profile_home(self, home)
-            logger.info("[MULTIPLEX] Profile '%s' unserved — %d adapter(s) stopped and unrouted", name, len(adapters))
+            logger.info("[MULTIPLEX] Profile '%s' unserved — %d adapter(s) stopped and unrouted%s",
+                        name, len(adapters), f" ({reason})" if reason else "")
 
 
 def _profile_lifecycle_verb(runner, *, serve: bool):
@@ -486,7 +512,7 @@ def _profile_lifecycle_verb(runner, *, serve: bool):
             if not serve:
                 if name not in known:
                     return {"error": f"profile '{name}' is not served"}
-                await runner._unserve_profile(name, known.pop(name))
+                await runner._unserve_profile(name, known.pop(name), reason="stopped on request")
                 runner._record_served_profiles(active, list(known.items()))
                 return {"unserved": name, "served_profiles": runner.served_profile_names()}
             installed = dict(profiles_to_serve(True, include_parked=True))
