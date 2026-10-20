@@ -566,6 +566,56 @@ def reap_orphaned_backend_owner(
     return pid
 
 
+def _live_gateways_by_home() -> dict[str, list[dict]]:
+    """Ledger entries that PROVE a live gateway, grouped by the home each one serves."""
+    by_home: dict[str, list[dict]] = {}
+    for entry in ledger_entries(verified_only=True):
+        home = str(entry.get("hermes_home") or "")
+        if entry.get("purpose") == "gateway" and home:
+            by_home.setdefault(home, []).append(entry)
+    return by_home
+
+
+def reap_superseded_gateways(*, kill_fn=None) -> list[int]:
+    """Kill gateways a NEWER live gateway for the same home has already replaced.
+
+    A detached gateway's dead spawner proves nothing on its own: ``spawn_unmanaged_gateway``
+    detaches by design (the client exits), and the messaging gateway is meant to survive the app
+    (gateway/AGENTS.md). ``ppid=1`` plus a dead spawner is the *healthy* shape of an auto-started
+    daemon. The orphan signature is duplication — two live gateways claiming one home, which the
+    runtime's own exclusive ownership fence exists to prevent — so only then is the older one
+    residue.
+
+    Never touched: this process, a home with a single live gateway, an unprovable entry
+    (``ledger_entries(verified_only=True)`` needs a live ``(pid, create_time)`` pair) and any
+    entry whose spawner is alive — a launchd/systemd/Desktop-supervised gateway always has one,
+    so the supervised gateway is never a candidate however old it is. Returns the reaped pids.
+    """
+    reaped: list[int] = []
+    own = os.getpid()
+    for entries in _live_gateways_by_home().values():
+        if len(entries) < 2:
+            continue
+        entries.sort(key=lambda e: (float(e.get("registered_at") or 0.0), int(e.get("pid") or 0)))
+        for older in entries[:-1]:
+            pid = older.get("pid")
+            if not isinstance(pid, int) or pid <= 0 or pid == own:
+                continue
+            if spawner_is_dead(older) is not True:
+                continue  # supervised, or unprovable → never touch
+            try:
+                if kill_fn is not None:
+                    kill_fn(pid)
+                elif not _terminate_then_kill(pid, older.get("create_time")):
+                    continue
+            except Exception:
+                logger.debug("superseded gateway reap failed for %s", older, exc_info=True)
+                continue
+            logger.info("reaped superseded gateway pid %s in %s", pid, older.get("hermes_home"))
+            reaped.append(pid)
+    return reaped
+
+
 def reap_orphaned_mcp_helpers(*, project_root: Optional[Path] = None, kill_fn=None) -> list[int]:
     """Kill ledger-registered stdio MCP helpers whose spawner is provably dead.
 

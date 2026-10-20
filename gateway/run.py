@@ -5132,7 +5132,15 @@ def main():
         from hermes_cli.stdio import configure_windows_stdio
         configure_windows_stdio()
 
-    for _step in (_register_identity, _arm_watchdog, _utf8_stdio):
+    def _reap_superseded_orphans() -> None:
+        # Two live gateways on one home means the older one lost its client and kept running
+        # (PRA-6594's detached-predecessor residue). Runs after _register_identity so this process
+        # is the newest entry; proof-only, so a supervised gateway or a lone detached daemon is
+        # never a candidate.
+        from hermes_cli.process_identity import reap_superseded_gateways
+        reap_superseded_gateways()
+
+    for _step in (_register_identity, _reap_superseded_orphans, _arm_watchdog, _utf8_stdio):
         _best_effort(_step)
 
     # pm startup contract (PATH provisioning for the store's tools), then
