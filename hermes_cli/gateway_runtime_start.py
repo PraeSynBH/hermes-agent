@@ -29,6 +29,13 @@ DAEMON_STRIPPED_ENV = (
     # A terminal's shell under a systemd service (gnome-terminal-server, a user unit) carries these; the
     # unmanaged daemon would then identify as "systemd" and maintenance would refuse it as supervised.
     "INVOCATION_ID", "JOURNAL_STREAM",
+    # Same class, launchd: a client running under THIS host's `ai.hermes.gateway` job (launchd stamps
+    # XPC_SERVICE_NAME on the job process, the stderr wrapper re-exports it as HERMES_LAUNCHD_LABEL for
+    # the grandchild, so every agent shell inherits both) passes the markers on. The daemon is not part
+    # of that job, so keeping them made `_detect_supervisor()` answer "launchd": `--idle-exit` logged
+    # "not armed: supervised by launchd" and the auto-started gateway outlived its client forever
+    # (the 13-orphan class), while `/restart` would exit 75 for a job that restarts a different process.
+    "XPC_SERVICE_NAME", "HERMES_LAUNCHD_LABEL", "LAUNCHD_SOCKET",
 )
 
 
