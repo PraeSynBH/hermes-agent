@@ -323,3 +323,39 @@ def _read_budget_for(db_path) -> _PathReadBudget:
             budget = _PathReadBudget()
             _read_budgets[key] = budget
         return budget
+
+
+def handle_census(*, limit: int = 64) -> dict:
+    """Live SessionDB handles per database path, with the call site that opened each.
+
+    ``lsof`` counts descriptors, not owners: a multiplexed gateway's ``state.db`` fd lines
+    mix live handles with SQLite's unix-VFS reuse list (a closed connection's descriptor can
+    stay parked on the inode while a peer holds POSIX locks — see
+    ``tests/hermes_state/test_session_db_read_conn_pool.py``), so an fd count alone cannot say
+    which subsystem holds a redundant handle, or whether a duplicate is real at all. The only
+    bound on writer handles is not opening them (``_HANDLES_PER_PATH_WARN``), and the warning
+    fires once per path. This answers "who opened these, and how many are live" from inside
+    the serving process, where the answer exists.
+    """
+    rows = []
+    with _read_budgets_lock:
+        budgets = list(_read_budgets.items())
+    for key, budget in budgets:
+        with budget._lock:
+            members = list(budget._members)
+        handles = []
+        for member in members:
+            if getattr(member, "_conn", None) is None:
+                continue
+            handles.append({
+                "site": getattr(member, "_creation_site", "unknown"),
+                "read_only": bool(getattr(member, "read_only", False)),
+            })
+        if handles:
+            rows.append({"path": key, "handles": handles})
+    rows.sort(key=lambda row: (-len(row["handles"]), row["path"]))
+    return {
+        "paths": len(rows),
+        "handles": sum(len(row["handles"]) for row in rows),
+        "detail": rows[:limit],
+    }

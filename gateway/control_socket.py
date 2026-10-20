@@ -181,8 +181,15 @@ def build_identify_payload() -> dict[str, Any]:
 def build_status_payload() -> dict[str, Any]:
     """Default ``status`` answer — current runtime status, answered live."""
     from gateway.status import read_runtime_status
-    return {**(read_runtime_status() or {}), "protocol": CONTROL_PROTOCOL_VERSION,
-            "answered_at": time.time(), "answering_pid": os.getpid()}
+    payload: dict[str, Any] = {**(read_runtime_status() or {}), "protocol": CONTROL_PROTOCOL_VERSION,
+                               "answered_at": time.time(), "answering_pid": os.getpid()}
+    with contextlib.suppress(Exception):
+        # Live SessionDB handle census (PRA-6500): lsof counts descriptors, not owners, and a
+        # multiplexed gateway's duplicates have to be attributed to the subsystem that opened them
+        # before they can be pooled away.
+        from hermes_state_readpool import handle_census
+        payload["state_db_handles"] = handle_census()
+    return payload
 
 
 class GatewayControlServer:

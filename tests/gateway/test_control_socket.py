@@ -474,3 +474,27 @@ def test_windows_pipe_query_is_bounded_when_the_peer_never_answers(home: Path, m
         assert time.monotonic() - start < 2.0
     finally:
         released.set()
+
+
+# ---------------------------------------------------------------------------
+# Live status: the SessionDB handle census (PRA-6500)
+# ---------------------------------------------------------------------------
+
+def test_status_payload_carries_the_live_state_db_handle_census(home: Path, monkeypatch, tmp_path: Path):
+    """``lsof`` counts descriptors, not owners; the live status answer names the opening site."""
+    from gateway.control_socket import build_status_payload
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    path = tmp_path / "state.db"
+    db = SessionDB(db_path=path)
+    try:
+        census = build_status_payload()["state_db_handles"]
+    finally:
+        db.close()
+
+    assert census["handles"] >= 1
+    assert census["paths"] == len(census["detail"])
+    row = next(row for row in census["detail"] if row["path"] == str(path.resolve()))
+    assert row["handles"]
+    assert set(row["handles"][0]) == {"site", "read_only"}
