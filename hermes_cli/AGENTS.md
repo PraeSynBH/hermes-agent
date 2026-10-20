@@ -160,7 +160,7 @@ and TUI all go through it). Clones are built in `profiles/.<name>.staging-<pid>`
 `_iter_named_profile_dirs` and the hot-serve rescan) and published by one `os.rename` after the strip;
 symlinked `.env`/`config.yaml` are materialized first so a clone never writes through to its source. Multiplex
 (`gateway.multiplex_profiles`) secret-scope rules: `gateway/AGENTS.md`. The served set is
-`profiles.py::profiles_to_serve(multiplex=True)` = default + every live dir under `profiles/` — live =
+`profiles_serve.py::profiles_to_serve(multiplex=True)` (re-exported by `profiles.py`) = default + every live dir under `profiles/` — live =
 carries an identity marker (`hermes_constants.named_profile_has_identity`: `config.yaml`/`.env`/`SOUL.md`/
 `profile.yaml`/`auth.json`/`state.db`) and is not tombstoned. A marker-less dir (cron/log side-effect
 shell, stray infrastructure dir) is never listed, served, ticked, `.env`-backfilled or resolvable via `-p`

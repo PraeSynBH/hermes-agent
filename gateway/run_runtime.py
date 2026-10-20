@@ -132,6 +132,32 @@ def _record_parked_profiles(parked):
         logger.debug('could not record parked_profiles', exc_info=True)
 
 
+def sync_capacity_parked(runner) -> bool:
+    """Fold the ``gateway.multiplex_max_profiles`` decision into ``parked_profiles``.
+
+    A profile past the ceiling is not served by this process at all (no adapters, no authority),
+    which is exactly what "parked" means to a client of that profile: it gets a terminal verdict
+    instead of waiting out its whole deadline. The decision itself is the one the serving
+    enumeration just made (``profiles_to_serve`` → ``remember_deferred``), so this only publishes
+    it, and un-parks the ones a raised ceiling brought back. Returns True when the map changed.
+    """
+    from hermes_cli.gateway_multiplex_capacity import deferred_by_capacity
+    parked = parked_profile_map(runner)
+    deferred = deferred_by_capacity()
+    changed = False
+    for name in [n for n, reason in parked.items()
+                 if str(reason).startswith('capacity:') and n not in deferred]:
+        parked.pop(name, None)
+        changed = True
+    for name, reason in deferred.items():
+        if parked.get(name) != reason:
+            parked[name] = reason
+            changed = True
+    if changed:
+        _record_parked_profiles(parked)
+    return changed
+
+
 async def initialize_gateway_runtime(runner):
     from gateway.runtime_bootstrap import TicketStore
     from gateway.runtime_ownership import process_ownership

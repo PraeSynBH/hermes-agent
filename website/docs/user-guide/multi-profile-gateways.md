@@ -746,6 +746,41 @@ A profile whose `state.db` cannot be opened is **parked** — logged as
 profile keeps booting; fix the store and re-run `hermes profile create` or wait
 for the periodic rescan.
 
+### Capping how many profiles one gateway serves
+
+One process serving the whole roster is cheap per call but **not** free per profile:
+every served profile carries its own adapters, executors and session authority, so the
+process's baseline thread count grows with the roster — measured at roughly **7 threads
+per served profile** plus ~25 process-wide on a 12-core Mac serving 43 profiles (286
+threads). On a host whose profile count has outrun the node, that baseline is what
+contends for the single event loop every profile shares, and no per-call bound fixes it.
+
+Set a hard ceiling in the default profile's `config.yaml`:
+
+```yaml
+gateway:
+  multiplex_max_profiles: 12          # default profile + 11 named; unset = no ceiling
+  multiplex_serve_priority: [cfo, cto] # named profiles that keep a slot first
+```
+
+- The **default profile is always served**; `multiplex_max_profiles: 1` means
+  "the default only", never "no gateway".
+- Slots past the default go to `multiplex_serve_priority` in the order written, then
+  alphabetically. Without a priority list the choice is deterministic but arbitrary, so
+  write one on a host where the ceiling will actually bite.
+- A profile past the ceiling is **not served by that process at all** — no adapters, no
+  session authority, no threads, `/p/<profile>/` not answered — and is published under
+  `parked_profiles` in `gateway_state.json` with a `capacity:` reason, so a client routing
+  to it gets a terminal verdict instead of waiting out its deadline.
+- The ceiling never affects what is **installed**: `hermes profile list`, `hermes gateway
+  status` and every `include_parked`/`include_standalone` enumeration still see the whole
+  roster. Raise the ceiling (or extend the priority list) and the rest is hot-served on the
+  next rescan, like any other roster change; lower it and the excess is parked the same way.
+
+A second gateway **process** on the same host does not help: it halves each process's thread
+count but not the host's, and it doubles the process-wide baseline. If one node cannot hold
+the roster you want served, the answer is fewer served profiles per node or another node.
+
 ### Routing shared-bot chats to profiles (`profile_routes`)
 
 Multiplexing selects a profile per **credential** (each profile's own bot

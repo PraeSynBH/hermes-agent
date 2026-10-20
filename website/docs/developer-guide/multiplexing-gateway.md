@@ -184,7 +184,7 @@ dropped, not misdelivered). Full schema and matching rules:
 
 ## Serving selected profiles
 
-`profiles_to_serve(multiplex, profile_allowlist)` in `hermes_cli/profiles.py`
+`profiles_to_serve(multiplex)` in `hermes_cli/profiles_serve.py` (re-exported by `hermes_cli/profiles.py`)
 is the single chokepoint for which profiles a multiplexer serves: default plus
 every valid profile directory, optionally filtered by allowlist. A malformed
 allowlist fails safe to default-only. The served set gates adapter startup,
