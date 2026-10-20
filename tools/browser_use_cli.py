@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 from hermes_constants import get_hermes_home, hermes_home_key
-from tools.browser_harness_dirs import daemon_env, daemon_identity, namespace_harness_dirs
+from tools.browser_harness_dirs import daemon_env, daemon_identity, daemon_pid_path, namespace_harness_dirs
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -727,6 +727,46 @@ def _reload_daemons(daemons) -> None:  # each ``daemon_identity`` daemon, with i
             _run_cli_killing_process_group([*cmd, "--reload"], "", daemon_env(env, daemon), 15)
 
 
+def _daemon_pid(pid_path: Optional[Path]) -> Optional[int]:
+    """The PID a harness daemon published at ``pid_path``; ``None`` when missing or corrupt."""
+    if pid_path is None:
+        return None
+    try:
+        return int(pid_path.read_text(encoding="utf-8-sig").strip() or 0) or None
+    except (OSError, ValueError):
+        return None
+
+
+def _register_started_daemon(env: dict, pid_path: Optional[Path], before_pid: Optional[int],
+                             started: float) -> None:
+    """Record a harness daemon THIS call caused to start in the machine spawn ledger.
+
+    The daemon detaches into its own session (``ipc.spawn_kwargs``) and reparents to init when the
+    CLI exits, so nothing owns its lifetime: clean teardown goes through ``stop_harness_daemons``,
+    but a SIGKILLed Hermes or a torn-down run scratch leaves it holding a browser and a LISTEN
+    socket forever (PRA-6594: 15 of them). One ledger entry — ``(pid, create_time)`` with this
+    process as spawner — is enough for the startup reconciler to PROVE it is residue and only then
+    reap it. A daemon that was already running (``before_pid``) is someone else's: never recorded.
+    """
+    after = _daemon_pid(pid_path)
+    if not after or after == before_pid:
+        return
+    try:
+        import psutil
+    except ImportError:  # psutil is a hard dep; defensive only
+        return
+    try:
+        created = psutil.Process(after).create_time()
+    except psutil.Error:
+        logger.debug("harness daemon %s vanished before it could be recorded", after, exc_info=True)
+        return
+    if created < started:
+        return  # pre-dates this call: a concurrent Hermes started it, not us
+    from hermes_cli.process_identity import register_child
+
+    register_child(after, "browser-harness-daemon")
+
+
 def _route_exec(env: dict, session: str, task_id: Optional[str], local: bool, local_sidecar: bool,
                 route_key: str) -> tuple[Optional[str], bool]:
     """``_route_backend`` for one browser_exec call; returns ``(error, runs on the local sidecar)``.
@@ -832,6 +872,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         with _driven_daemons_lock:
             daemon = daemon_identity(env)
             _driven_daemons[daemon] = hermes_home_key()
+        pid_path = daemon_pid_path(env)
+        before_pid = _daemon_pid(pid_path)  # a daemon this call REUSES is not ours to record
         try:
             return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
         except subprocess.TimeoutExpired:
@@ -842,6 +884,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             )}
         except OSError as e:
             return {"error_result": tool_error(f"Failed to launch browser-use CLI: {e}")}
+        finally:
+            # A daemon the CLI started detaches and outlives every call: record it so the startup
+            # reconciler can prove and reap it if this Hermes dies before stop_harness_daemons runs.
+            _register_started_daemon(env, pid_path, before_pid, started)
 
     if bot_desktop_browser:
         from tools.browser_tool_session import run_fenced
