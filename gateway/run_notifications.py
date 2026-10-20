@@ -1118,7 +1118,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             claim.proceed, claim.early_result, claim.defer = False, False, True
         return claim
 
-    def _completion_event_scope(self, evt: dict):
+    @contextlib.asynccontextmanager
+    async def _completion_event_scope(self, evt: dict):
         """Profile runtime scope of the session a completion event targets (a no-op context when the
         event is the default profile's or the scope is already installed).
 
@@ -1126,23 +1127,33 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         (``tools.async_delegation`` → ``get_hermes_home()/state.db``) resolve from the ambient scope.
         The supervised ``_async_delegation_watcher`` and startup-recovered process watchers run under
         the ROOT scope, so a secondary profile's completion was looked up in the DEFAULT profile's
-        state.db — classified ``terminal`` and dropped, its ledger row stranded ``pending`` forever."""
+        state.db — classified ``terminal`` and dropped, its ledger row stranded ``pending`` forever.
+
+        The source resolution hops off the loop: ``_build_process_event_source`` reads the session
+        store's index under its lock, and every watcher tick took that lock from the event loop — the
+        frame the liveness watchdog named twice on 2026-10-19 (01:28:43Z and 02:43:19Z) while serial
+        control probes sat at 3 s p50 / 30 s p95 under three concurrent turns.
+        """
         from gateway.run import _async_profile_runtime_scope
         from hermes_constants import get_hermes_home_override
-        source = self._build_process_event_source(evt)
+        source = await asyncio.to_thread(self._build_process_event_source, evt)
         if source is None or not getattr(source, "profile", None):
             raw_sid = _raw_process_event_session_id(evt)
             if raw_sid and getattr(getattr(self, "config", None), "multiplex_profiles", False):
-                return self._served_api_server_event_scope(evt, raw_sid)
-            # No routed profile: the launch profile's own completion. Bind ITS scope once the
-            # process multiplexes — unscoped, a fail-closed ledger read raises on a legitimate
-            # launch-profile event (no-op while single-profile).
-            from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
-            return async_launch_profile_scope_if_multiplexed()
-        profile_home = self._resolve_profile_home_for_source(source)
-        if get_hermes_home_override() == str(profile_home):
-            return contextlib.nullcontext()  # already inside this profile's scope
-        return _async_profile_runtime_scope(profile_home)
+                scope = self._served_api_server_event_scope(evt, raw_sid)
+            else:
+                # No routed profile: the launch profile's own completion. Bind ITS scope once the
+                # process multiplexes — unscoped, a fail-closed ledger read raises on a legitimate
+                # launch-profile event (no-op while single-profile).
+                from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
+                scope = async_launch_profile_scope_if_multiplexed()
+        else:
+            profile_home = self._resolve_profile_home_for_source(source)
+            # Already inside this profile's scope (a no-op context).
+            scope = (contextlib.nullcontext() if get_hermes_home_override() == str(profile_home)
+                     else _async_profile_runtime_scope(profile_home))
+        async with scope:
+            yield
 
     @contextlib.asynccontextmanager
     async def _served_api_server_event_scope(self, evt: dict, raw_sid: str):
