@@ -319,9 +319,9 @@ def _is_supervised_gateway_process() -> bool:
         return False
     try:
         from gateway.restart import is_supervised_gateway_launch
-        from gateway.status import get_running_pid
+        from tools.process_registry_pidfile import owns_live_gateway_pidfile
 
-        return is_supervised_gateway_launch() and get_running_pid(cleanup_stale=False) == os.getpid()
+        return is_supervised_gateway_launch() and owns_live_gateway_pidfile()
     except Exception as exc:
         logger.debug("Could not verify supervised gateway process identity: %s", exc)
         return False

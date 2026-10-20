@@ -1351,6 +1351,35 @@ def _run_foreground(
 # (1s in tests, a few seconds in practice) must not turn the guard's own cold-start cost
 # (module imports, git probes under load) into a refusal; the wedge it bounds lasted an hour.
 _PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
+# Ceiling for the same budget. The guard is not slow work — the identity probe it used to run per
+# call is memoized (`tools.process_registry._gateway_pid_owner_pid`) and the rest is a shlex scan
+# plus at most one bounded script read. So past this a guard is not "still working", it has wedged,
+# and inheriting the command's own 180 s deadline bought nothing but a 180 s hole in the turn that
+# returned no output at all (PRA-6500). Bound it; a wedged guard must cost a retry, not a turn.
+_PRE_EXEC_GUARD_MAX_TIMEOUT_S = 45
+
+_pre_exec_guard_wedge_reported = False
+
+
+def _note_pre_exec_guard_wedge(timeout_s: float) -> None:
+    """Report a wedged pre-exec guard once per process, as gateway health.
+
+    The condition is process-wide (a starved or GIL-bound gateway, never one command), so a line
+    per refusal only floods the log: 1169 of them accumulated before this existed. Emitted with a
+    phrase ``agent.monitoring.gateway_health`` classifies as a ``timeout`` so the wedge surfaces as
+    a health event instead of an anonymous tool error on whichever agent happened to call last.
+    """
+    global _pre_exec_guard_wedge_reported
+    if _pre_exec_guard_wedge_reported:
+        return
+    _pre_exec_guard_wedge_reported = True
+    logger.warning(
+        "Terminal pre-execution guard timed out (wedged: no verdict within %ss). The gateway is "
+        "starving its tool threads; commands will keep being refused until it recovers. This is a "
+        "gateway-health event, not a property of the refused command (PRA-6500). Further "
+        "occurrences are suppressed.",
+        timeout_s,
+    )
 
 
 def _pre_exec_block(
@@ -1479,7 +1508,9 @@ def terminal_tool(
 
         # The guard chain runs on the deadline worker; keep it answerable to /stop
         # aimed at this tool thread (a remote-backend script read polls is_interrupted()).
-        guard_timeout = max(plan.effective_timeout, _PRE_EXEC_GUARD_MIN_TIMEOUT_S)
+        guard_timeout = min(
+            max(plan.effective_timeout, _PRE_EXEC_GUARD_MIN_TIMEOUT_S), _PRE_EXEC_GUARD_MAX_TIMEOUT_S,
+        )
         _acting_token = acting_for_tid.set(threading.current_thread().ident)
         try:
             bounded_guard = run_bounded_sync(
@@ -1500,6 +1531,7 @@ def terminal_tool(
         finally:
             acting_for_tid.reset(_acting_token)
         if bounded_guard.timed_out:
+            _note_pre_exec_guard_wedge(guard_timeout)
             raise _Rejected(_error_json(
                 f"Terminal pre-execution guard did not finish within {guard_timeout}s "
                 "(process-identity probe wedged); the command was not run. Retry the call.",
