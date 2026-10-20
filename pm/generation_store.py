@@ -145,9 +145,14 @@ def build(kind: str, key: str, run: Callable[[Path], None], *, checkout: Path | 
         if replace:
             target = entry(kind, f"{key}-repair-{uuid.uuid4().hex[:12]}")
         elif target.exists():
-            # A builder died between mkdir and the complete marker: nothing may adopt it, and
-            # waiting out the age floor would block every later launch on the same content.
-            discard(target)
+            # An incomplete entry is a builder that died before its complete marker, or a tree that
+            # lost a file. Nothing may adopt it, and waiting out the age floor would block every
+            # later launch on the same content -- but a process may still be exec'ing it, so its
+            # bytes are only taken when no lease says a reader is inside.
+            if leases_held(target):
+                target = entry(kind, f"{key}-stale-{uuid.uuid4().hex[:12]}")
+            else:
+                discard(target)
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             run(target)
