@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import gateway.shutdown_watchdog as shutdown_watchdog_module
+import hermes_thread_dump
 import pytest
 
 from gateway.shutdown_watchdog import (
@@ -31,6 +32,15 @@ from gateway.shutdown_watchdog import (
     resolve_shutdown_watchdog_delay,
     write_loop_heartbeat,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_thread_dump_window():
+    """The all-thread dump is rate-limited per process; each test is its own incident."""
+    hermes_thread_dump.reset_dump_rate_limit()
+    yield
+    hermes_thread_dump.reset_dump_rate_limit()
+
 
 def test_resolve_shutdown_watchdog_delay_adds_grace():
     assert resolve_shutdown_watchdog_delay(180) == 180 + DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S

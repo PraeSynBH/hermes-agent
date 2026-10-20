@@ -8,10 +8,22 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+import hermes_thread_dump
 from gateway.shutdown_watchdog import (
     loop_heartbeat_forever,
     start_loop_liveness_watchdog,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_thread_dump_window():
+    """The all-thread dump is rate-limited per process; each test is its own incident."""
+    hermes_thread_dump.reset_dump_rate_limit()
+    yield
+    hermes_thread_dump.reset_dump_rate_limit()
+
 
 def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit():
     loop = MagicMock(spec=asyncio.AbstractEventLoop)
@@ -26,7 +38,7 @@ def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit():
     with (
         patch("gateway.shutdown_watchdog.logger.critical") as critical,
         patch(
-            "gateway.shutdown_watchdog.faulthandler.dump_traceback",
+            "gateway.shutdown_watchdog.dump_thread_stacks",
             side_effect=stop_during_dump,
         ) as dump,
         patch("gateway.shutdown_watchdog.os._exit", side_effect=exit_codes.append),
@@ -65,7 +77,7 @@ def test_loop_liveness_death_leaves_its_stacks_in_the_dump_file(tmp_path, monkey
     from gateway.shutdown_watchdog import get_shutdown_watchdog_dump_path
     dump = get_shutdown_watchdog_dump_path(tmp_path).read_text(encoding="utf-8-sig")
     assert '"event": "loop_liveness_watchdog_fired"' in dump
-    assert "most recent call first" in dump
+    assert "--- thread dump: loop_liveness_watchdog_fired (shutdown watchdog)" in dump
     assert exit_codes == [75]
 
 
@@ -92,7 +104,7 @@ def test_loop_liveness_watchdog_stop_during_final_miss_disarms_hard_exit():
     loop.call_soon_threadsafe.side_effect = hold_scheduled_probe
     with (
         patch("gateway.shutdown_watchdog.logger.critical") as critical,
-        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
+        patch("gateway.shutdown_watchdog.dump_thread_stacks") as dump,
         patch("gateway.shutdown_watchdog.os._exit", side_effect=exit_codes.append),
     ):
         handle = start_loop_liveness_watchdog(
@@ -130,7 +142,7 @@ def test_loop_liveness_watchdog_stop_after_first_recheck_skips_final_actions():
     loop.call_soon_threadsafe.side_effect = hold_scheduled_probe
     with (
         patch("gateway.shutdown_watchdog.logger.critical") as critical,
-        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback") as dump,
+        patch("gateway.shutdown_watchdog.dump_thread_stacks") as dump,
         patch("gateway.shutdown_watchdog.os._exit") as hard_exit,
     ):
         handle = start_loop_liveness_watchdog(
@@ -296,7 +308,7 @@ def test_loop_liveness_watchdog_marks_runtime_degraded_before_restart():
         fired.set()
 
     with (
-        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback"),
+        patch("gateway.shutdown_watchdog.dump_thread_stacks"),
         patch("gateway.shutdown_watchdog.os._exit", side_effect=fake_exit),
     ):
         handle = start_loop_liveness_watchdog(
