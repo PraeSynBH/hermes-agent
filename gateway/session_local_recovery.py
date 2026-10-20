@@ -296,12 +296,18 @@ def local_history(authority, ref, prepared=None):
     (``display_rows``), the first row carries ``archived_truncated: true``.
     """
     db = authority.db
-    target = transcript_target(authority, ref)
+    # ``prepare_history`` already resolved the physical target off the loop. Resolving it again here
+    # re-ran ``restore_local_session`` (receipt lineage reads plus the local store load, i.e. an open
+    # on the session JSON) inside the caller's attach lock, on the loop: that is the frame the
+    # out-of-loop liveness watchdog named at 17:16:13Z while 100 serial control probes took 1-6 s.
+    target = prepared[0] if prepared is not None else transcript_target(authority, ref)
     read_live, display, truncated = (prepared[1] if prepared is not None and prepared[0] == target
                                      else display_rows(db, target))
     live = db.get_messages_as_conversation(target, include_row_ids=True)
     live_ids = {row['_row_id'] for row in live}
     if not read_live <= live_ids:
+        # A rewind or a rotation landed since the prepare: the target itself may have moved.
+        target = transcript_target(authority, ref)
         read_live, display, truncated = display_rows(db, target)
         live = db.get_messages_as_conversation(target, include_row_ids=True)
     elif live_ids - read_live:

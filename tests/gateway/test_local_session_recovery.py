@@ -72,6 +72,7 @@ def test_real_daemon_recovers_only_authorized_never_started_local_work(tmp_path)
     print(json.dumps(probe(tmp_path)))
 
 
+@pytest.mark.allow_real_home_io  # importing gateway.config activates the checkout's install root; this test writes only tmp_path
 def test_messaging_session_history_follows_the_compression_tip(tmp_path, monkeypatch):
     """The authority keeps a messaging session's admission identity at the compression root,
     but attach/resume history must come from the current physical transcript."""
@@ -103,6 +104,48 @@ def test_messaging_session_history_follows_the_compression_tip(tmp_path, monkeyp
         # under the public TranscriptMessage name, never the internal ``_row_id``.
         assert [m['row_id'] for m in history if not m.get('archived')] == [m['id'] for m in db.get_messages('child')]
         assert not any('_row_id' in m for m in history)
+
+
+@pytest.mark.allow_real_home_io  # importing gateway.config activates the checkout's install root; this test writes only tmp_path
+def test_a_prepared_history_does_not_resolve_the_transcript_again(tmp_path, monkeypatch):
+    """``attach`` reads the resume history inline, under the session's event-stream lock, on the loop.
+
+    Resolving *which* transcript that history is (a receipt lineage read plus the local store's JSON
+    load) is filesystem work that ``prepare_history`` already hops off the loop; a second resolve
+    inside the lock put ``restore_local_session`` on the loop — the frame the out-of-loop liveness
+    watchdog named at 17:16:13Z, while 100 serial control probes took 1-6 s.
+    """
+    from gateway.config import Platform
+    from gateway.session_authority import LiveSession, SessionAuthority
+    from gateway.session_contract import SessionRef
+    from gateway import session_local_recovery as recovery
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    with SessionDB(db_path=tmp_path / 'state.db') as db:
+        db.create_session('root', source='telegram', session_key='agent:telegram:dm:1')
+        db.append_message('root', 'user', 'Q1')
+        authority = SessionAuthority(
+            SimpleNamespace(_draining=False, config=SimpleNamespace(multiplex_profiles=False)),
+            profile_id='owned', instance_id='current', db=db,
+            epoch=begin_runtime_epoch(db, instance_id='current'))
+        authority.sessions['root'] = LiveSession(
+            SimpleNamespace(platform=Platform.TELEGRAM, user_id='human'), 'agent:telegram:dm:1')
+        ref = SessionRef('owned', 'root')
+        resolved = []
+        real = recovery.transcript_target
+
+        def spy(auth, r):
+            resolved.append(r.session_id)
+            return real(auth, r)
+
+        monkeypatch.setattr(recovery, 'transcript_target', spy)
+        prepared = (authority.physical_target(ref), recovery.display_rows(db, authority.physical_target(ref)))
+        before = len(resolved)
+        rows = recovery.local_history(authority, ref, prepared)
+        assert [r['content'] for r in rows] == ['Q1']
+        assert len(resolved) == before, (
+            'local_history resolved the transcript a second time, on the caller\'s thread')
 
 
 @pytest.mark.asyncio
