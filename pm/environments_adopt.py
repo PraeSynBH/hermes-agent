@@ -23,13 +23,20 @@ def running_environment(project_root: Path) -> Path | None:
 
     A generation that is no longer selected still counts: an update landed under this process,
     and a request from it is recorded and built but only the next process can load the result.
+    Generations live under the checkout's state, and -- since a dependency tree is keyed by its
+    content -- in the shared tree store, where a superseded one is still superseded for this
+    checkout.
     """
+    from pm import generation_store
+
     entries = {Path(entry).resolve() for entry in sys.path if entry}
     try:
         selected = selected_venv(project_root)
     except (OSError, RuntimeError, ValueError):
         return None
-    for environment in (selected, *sorted((install_state_dir(project_root) / "environments").glob("*/venv"))):
+    shared = list((generation_store.store_root() / generation_store.VENV).glob("*/venv"))
+    for environment in (selected, *sorted((install_state_dir(project_root) / "environments").glob("*/venv")),
+                        *sorted(shared)):
         if site_packages(environment).resolve() in entries:
             return environment
     return None

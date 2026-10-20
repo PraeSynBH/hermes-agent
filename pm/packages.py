@@ -436,61 +436,93 @@ class Venv(StatePackage):
               skip_invalid_secondary: bool = False) -> dict:
         """Prepare one complete environment; the caller commits its selection.
 
+        The tree is content-keyed (``pm.generation_store``): ``uv.lock``, the extras, the pinned
+        interpreter and the member set name it, so a checkout whose inputs hash to a tree another
+        checkout already built adopts that one instead of installing a ~370 MB copy of it. That is
+        what a run-scoped worktree needs -- a fresh path per launch used to mean a full install
+        per launch, since the state key hashes the path.
+
         ``skip_invalid_secondary`` is the update's contract: an unreadable secondary profile
         is left out (the caller reports it) instead of refusing the whole graph.
         """
-        import uuid
-        from pm.environments import install_state_dir, runtime_facts_path
-        from pm.environment import managed_environment
+        import sys
+
+        from pm import generation_store
+        from pm.environments import runtime_facts_path
         from pm.lock import Facts
-        from pm.native_build import source_build_environment
-        from pm.workspace import enabled_member_dirs, lock_and_sync
 
         project = self.project_root()
-        generation = install_state_dir(project) / "environments" / uuid.uuid4().hex
-        candidate = generation / "venv"
-        environment = managed_environment(candidate, env=source_build_environment(project),
-                                          explicit=explicit or repair, output=sys.stderr)
-        if not repair:
-            # Inspection may skip a broken secondary profile, but publishing a replacement
-            # graph must not silently evict its recorded members (including passed candidates).
-            # An update does evict them, loudly: it must not fail on another profile's config.
-            from pm.plugins_state import enabled_plugins_ordered
-            enabled_plugins_ordered(skip_invalid_secondary=skip_invalid_secondary)
+        prior = Facts(runtime_facts_path(project), strict=repair).get("venv") or {}
+        from pm.workspace import enabled_member_dirs
+
         members = [] if repair else (enabled_member_dirs() if plugin_dirs is None else plugin_dirs)
-        try:
-            generation.mkdir(parents=True)
-            (generation / ".lease-managed").touch()
+        # Repair rebuilds the graph its own record names, so the recorded stamp is its key; a
+        # fresh sync is keyed by the inputs it is about to install.
+        key = prior.get("stamp") if repair else None
+        if not isinstance(key, str) or not key:
+            key = self.expected_stamp(extras, plugin_dirs=members)
+        reusable = None if repair else generation_store.complete_entry(generation_store.VENV, key)
+        if reusable is not None:
+            return {"environment": reusable / "venv", "resolved_lock": reusable / "workspace" / "uv.lock"}
+
+        def prepare(target: Path) -> None:
+            from pm.environment import managed_environment
+            from pm.native_build import source_build_environment
+            from pm.workspace import lock_and_sync
+
+            candidate = target / "venv"
+            environment = managed_environment(candidate, env=source_build_environment(project),
+                                              explicit=explicit or repair, output=sys.stderr)
             environment.create()
-            prior = Facts(runtime_facts_path(project), strict=repair).get("venv") or {}
+            if not repair:
+                # Inspection may skip a broken secondary profile, but publishing a replacement
+                # graph must not silently evict its recorded members (including passed candidates).
+                # An update does evict them, loudly: it must not fail on another profile's config.
+                from pm.plugins_state import enabled_plugins_ordered
+                enabled_plugins_ordered(skip_invalid_secondary=skip_invalid_secondary)
             replay = None
             if repair and ("environment" in prior or "resolved_lock" in prior):
-                if not all(isinstance(prior.get(key), str) and prior[key] for key in ("environment", "resolved_lock")):
-                    raise InstallError(self.name, "recorded dependency paths are incomplete; refusing to drop plugins")
-                recorded = Path(prior["resolved_lock"]).resolve()
-                previous = Path(prior["environment"]).resolve().parent
-                generations = install_state_dir(project) / "environments"
-                if (previous.parent != generations.resolve() or recorded != previous / "workspace" / "uv.lock"
-                        or not recorded.is_file()):
-                    raise InstallError(self.name, "recorded dependency lock is missing; refusing to drop plugins")
-                replay = recorded.parent
+                replay = _repair_replay(prior, project)
             seed = (Path(prior["resolved_lock"]) if members and prior.get("resolved_lock")
                     else project / "uv.lock")
-            lock_and_sync(members, extras, root=generation / "workspace",
+            lock_and_sync(members, extras, root=target / "workspace",
                           seed_lock=seed, frozen=repair or not members, replay=replay,
                           source=project, environment=environment)
-            resolved_lock = generation / "workspace" / "uv.lock"
             environment.check()
             if repair:
                 from pm.environments import venv_command
                 from pm.recovery import validate_environment
                 validate_environment(venv_command(project, candidate, ("-I",)),
-                                     env=dict(environment.env), cwd=resolved_lock.parent)
-        except BaseException:
-            shutil.rmtree(generation, ignore_errors=True)
-            raise
-        (generation / ".lease-managed").touch()
-        return {"environment": candidate, "resolved_lock": resolved_lock}
+                                     env=dict(environment.env), cwd=target / "workspace")
+
+        entry = generation_store.build(generation_store.VENV, key, prepare, checkout=project, replace=repair)
+        return {"environment": entry / "venv", "resolved_lock": entry / "workspace" / "uv.lock"}
+
+
+def _repair_replay(prior: dict, project: Path) -> Path:
+    """The recorded build inputs a repair replays, or raise when the record cannot be trusted.
+
+    The record names an environment and the workspace built beside it. That environment is a
+    path-keyed generation (``<state>/environments/<gen>``) or a shared content-keyed tree
+    (``.generations/venv/<key>``); both keep the workspace next to the venv. Nothing here may
+    guess: a record that does not agree with its own workspace would make the repair drop
+    members silently.
+    """
+    from pm import generation_store
+    from pm.environments import install_state_dir
+    from pm.package import InstallError
+
+    recorded_env, environment = prior.get("resolved_lock"), prior.get("environment")
+    if not (isinstance(recorded_env, str) and recorded_env and isinstance(environment, str) and environment):
+        raise InstallError("venv", "recorded dependency paths are incomplete; refusing to drop plugins")
+    generation = Path(environment).resolve().parent
+    recorded = Path(recorded_env).resolve()
+    parents = ((install_state_dir(project) / "environments").resolve(),
+               generation_store.store_root().resolve() / generation_store.VENV)
+    if (generation.parent not in parents or recorded != generation / "workspace" / "uv.lock"
+            or not recorded.is_file()):
+        raise InstallError("venv", "recorded dependency lock is missing; refusing to drop plugins")
+    return generation / "workspace"
 
 
 @register

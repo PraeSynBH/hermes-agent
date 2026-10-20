@@ -38,6 +38,18 @@ def install_state_dir(project_root: Path) -> Path:
     return installs_root() / install_key(project_root)
 
 
+def dependency_trees_root() -> Path:
+    """The shared, content-keyed trees a checkout's state may select (``pm.generation_store``).
+
+    Dependency state is keyed by checkout path, but the trees are a function of the checkout's
+    *content*: every worktree of one repository at the same lock hashes to the same tree, so a
+    fresh checkout adopts it instead of paying a full install per launch.
+    """
+    from pm.generation_store import store_root
+
+    return store_root()
+
+
 def owning_home_root(project_root: Path) -> Path | None:
     """The data root that owns this checkout when the active root only borrows it, else ``None``.
 
@@ -313,7 +325,12 @@ def _recorded_venv(project_root: Path) -> Path | None:
         raise RuntimeError("invalid dependency environment path")
     environment = Path(value).resolve()
     generations = install_state_dir(project_root) / "environments"
-    if not environment.is_relative_to(generations.resolve()) or not (environment / "pyvenv.cfg").is_file():
+    from pm.generation_store import VENV, store_root
+
+    shared = (store_root() / VENV).resolve()
+    if not (environment.is_relative_to(generations.resolve()) or environment.is_relative_to(shared)):
+        raise RuntimeError(f"dependency environment is missing or outside this install: {environment}")
+    if not (environment / "pyvenv.cfg").is_file():
         raise RuntimeError(f"dependency environment is missing or outside this install: {environment}")
     return environment
 

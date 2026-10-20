@@ -41,17 +41,23 @@ def owning_install_root(project_root: Path) -> Path | None:
 
 
 def _pm_environment_owner(venv: Path) -> Path | None:
-    """The checkout a PM generation venv (``<installs>/<key>/environments/<gen>/venv``) belongs to.
+    """The checkout a PM dependency environment belongs to, when this is one.
 
-    Its ``hermes_cli`` is the generation's ``workspace/`` snapshot, which has no ``.git``, so an
-    update run from it must go to the checkout (#122627). The install key hashes the checkout
-    path, which proves the path recorded beside it.
+    A generation is ``<installs>/<key>/environments/<gen>/venv``; since dependency trees are
+    keyed by content (``pm.generation_store``) it can also be a shared tree under
+    ``<installs>/.generations/<kind>/<digest>/venv``, which several checkouts select. Either way
+    its ``hermes_cli`` is a build snapshot with no ``.git``, so an update run from it must go to
+    the checkout (#122627). The state that selects it records that checkout and keys on its
+    path, which proves the path beside it.
     """
     from pm.environments import install_key
 
-    state = venv.parent.parent.parent
-    if venv.parent.parent.name != "environments":
-        return None
+    if venv.parent.parent.name == "environments":
+        state = venv.parent.parent.parent
+    else:
+        state = _selecting_state(venv)
+        if state is None:
+            return None
     try:
         # pm.environments.record_activation_inputs writes it on every full install.
         owner = Path((state / "inputs" / ".project-root").read_text(encoding="utf-8-sig").strip())
@@ -60,6 +66,29 @@ def _pm_environment_owner(venv: Path) -> Path | None:
     if install_key(owner) != state.name or not (owner / "hermes_cli" / "main.py").is_file():
         return None
     return owner
+
+
+def _selecting_state(venv: Path) -> Path | None:
+    """The install state whose record selects this dependency environment, if any."""
+    import json
+
+    from pm.environments import installs_root
+
+    installs = installs_root()
+    if not installs.is_dir():
+        return None
+    target = venv.resolve()
+    for state in sorted(installs.iterdir()):
+        if not state.is_dir() or state.name.startswith("."):
+            continue
+        try:
+            row = json.loads((state / "facts.json").read_text(encoding="utf-8-sig"))
+            recorded = row["packages"]["venv"]["environment"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if isinstance(recorded, str) and Path(recorded).resolve() == target:
+            return state
+    return None
 
 
 def retarget_to_owning_install(project_root: Path) -> None:

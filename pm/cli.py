@@ -523,12 +523,15 @@ def cmd_gc(args) -> int:
     runtimes = collect_runtime_generations(install_state_dir(repo_root()) / "pm-runtime")
     from pm.environments import installs_root
     from pm.install_states import collect_orphan_install_states, collect_stale_install_states
+    from pm.generation_store import collect_unreferenced
     installs = installs_root()
     orphans = collect_orphan_install_states(installs)
     stale = collect_stale_install_states(installs, active=[install_state_dir(repo_root())])
+    trees = collect_unreferenced(installs)
     print(f"gc: removed {removed}, kept {kept}; removed {len(generations)} dependency generations, "
           f"{len(runtimes)} PM runtime generations, {len(orphans)} install state dir(s) of deleted "
-          f"checkouts, {len(stale)} stale install state dir(s)")
+          f"checkouts, {len(stale)} stale install state dir(s), {len(trees)} dependency tree(s) "
+          f"no checkout selects")
     return 0
 
 
