@@ -1160,23 +1160,34 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     try:
         _prune_stale_worktree_trees(repo_root, max_age_hours)
     finally:
-        _reclaim_orphan_install_states()
+        _reclaim_install_states(repo_root)
 
 
-def _reclaim_orphan_install_states() -> None:
+def _reclaim_install_states(repo_root: str) -> None:
     """Trees removed by any path (the prune pass, `git worktree remove` by hand, `rm -rf` of a
-    scratch clone) leave their ~200 MB dependency state under <home>/installs/; reclaim it on
-    every pass, including the early returns where no tree is old enough to prune. Startup
-    maintenance must never block a launch; the traceback goes to the debug log."""
+    scratch clone) leave their dependency state under <home>/installs/; reclaim it on every pass,
+    including the early returns where no tree is old enough to prune. Then bound the states whose
+    checkouts still exist: a harness that keeps one worktree per issue at a stable path pins a
+    ~750 MB state each, and nothing else would ever reclaim them. The state this launch runs from
+    is never stale-evicted, so its own superseded generations -- a ~650 MB venv per publish, and
+    six of them on one host -- are collected here too, on the same launch-path timer. Startup
+    maintenance must never block a launch; the traceback goes to the debug log.
+    """
     try:
-        from pm.environments import installs_root
-        from pm.install_states import collect_orphan_install_states
+        from hermes_cli.venv_sync import collect_superseded_generations
+        from pm.environments import install_state_dir, installs_root
+        from pm.install_states import collect_orphan_install_states, collect_stale_install_states
 
-        reclaimed = collect_orphan_install_states(installs_root())
+        installs = installs_root()
+        reclaimed = collect_orphan_install_states(installs)
         if reclaimed:
             logger.info("Reclaimed %d dependency state dir(s) of deleted checkouts", len(reclaimed))
+        evicted = collect_stale_install_states(installs, active=[install_state_dir(Path(repo_root))])
+        if evicted:
+            logger.info("Evicted %d stale dependency state dir(s) past the retention floor", len(evicted))
+        collect_superseded_generations(Path(repo_root))
     except Exception:
-        logger.debug("Orphan install-state reclaim failed", exc_info=True)
+        logger.debug("Install-state reclaim failed", exc_info=True)
 
 
 def _prune_stale_worktree_trees(repo_root: str, max_age_hours: int) -> None:
