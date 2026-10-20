@@ -57,6 +57,9 @@ TEST_ENV = "testenv"
 #: a finished tree. The window also covers a checkout whose record is being replaced.
 MIN_AGE_SECONDS = 86400.0
 
+#: The store's directory name under the data root's ``installs/``.
+STORE_DIRECTORY = ".generations"
+
 COMPLETE_MARKER = ".complete"
 #: Lease directory prefix every lease-managed generation carries (``hermes_cli.runtime_state``).
 LEASE_MARKER = ".lease-managed"
@@ -66,7 +69,7 @@ def store_root() -> Path:
     """Where shared trees live: a sibling of the install states, never inside one."""
     from pm.environments import installs_root
 
-    return installs_root() / ".generations"
+    return installs_root() / STORE_DIRECTORY
 
 
 def entry(kind: str, key: str) -> Path:
@@ -190,7 +193,7 @@ def references(installs: Path) -> set[Path]:
     named: set[Path] = set()
     if not installs.is_dir():
         return named
-    store = store_root().resolve()
+    store = (installs / STORE_DIRECTORY).resolve()
     for state in installs.iterdir():
         if not state.is_dir() or state.name.startswith(".") or state == store:
             continue
@@ -214,9 +217,9 @@ def leases_held(directory: Path) -> bool:
     return held(directory)
 
 
-def _sweep_evictions() -> None:
+def _sweep_evictions(store: Path) -> None:
     """Finish a removal whose pass died mid-``rmtree``; the key was already gone by then."""
-    for kind_dir in (store_root() / VENV, store_root() / TEST_ENV):
+    for kind_dir in (store / VENV, store / TEST_ENV):
         if not kind_dir.is_dir():
             continue
         for leftover in kind_dir.glob(".evicting-*"):
@@ -260,10 +263,10 @@ def collect_unreferenced(installs: Path, *, min_age_seconds: float = MIN_AGE_SEC
     what the last launch built instead of paying for its own copy.
     """
     removed: list[Path] = []
-    store = store_root()
+    store = installs / STORE_DIRECTORY
     if not store.is_dir():
         return removed
-    _sweep_evictions()
+    _sweep_evictions(store)
     named = references(installs)
     now = time.time()
     for kind in (VENV, TEST_ENV):
