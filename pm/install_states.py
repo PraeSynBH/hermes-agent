@@ -11,9 +11,16 @@ The state dir records the checkout it belongs to in ``inputs/.project-root`` (wr
 checkout is gone: a data root shared with a container (``-v ~/.hermes:/opt/data``) or an
 unmounted volume records paths this process cannot see. So a dir is an orphan only when its
 checkout sat where this process can see that it was deleted -- under the data root that owns
-``installs/`` (scratch clones, the runtime checkout) or directly in a ``.worktrees/`` dir that
-still exists. Removal still fails closed on anything a live process could hold: the install
-lock, or a dependency / PM runtime generation lease.
+``installs/`` (scratch clones, the runtime checkout), directly in a ``.worktrees/`` dir that
+still exists, or under the OS temp dir. Removal still fails closed on anything a live process
+could hold: the install lock, or a dependency / PM runtime generation lease.
+
+The temp tier is what bounds agent hosts: a harness that gives every run a fresh worktree in
+``$TMPDIR`` commits a full environment per run, and deleting the worktree at the end of the run
+left the state behind forever -- one ~750 MB tree per launch, none of them reclaimable under the
+data-root and ``.worktrees`` rules alone. Temp is the one parent that is not evidence: a harness
+routinely leaves the run dir (sometimes the whole path) sitting empty, so a missing root there is
+the proof, and a live run still holds the lock or a lease.
 """
 
 from __future__ import annotations
@@ -22,15 +29,32 @@ import contextlib
 import logging
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
+def system_temp_root() -> Path:
+    """The OS temp dir run-scoped checkouts record under (resolved, so ``/var`` matches ``/private/var``)."""
+    return Path(tempfile.gettempdir()).resolve()
+
+
+def _run_scoped_temp_checkout(root: Path) -> bool:
+    """True when *root* was a checkout under the OS temp dir and no longer exists."""
+    try:
+        under_temp = root.resolve().is_relative_to(system_temp_root())
+    except (OSError, RuntimeError):
+        return False
+    return under_temp and not root.exists()
+
+
 def _provably_deleted(root: Path, data_root: Path) -> bool:
     if root.exists():
         return False
-    return root.is_relative_to(data_root) or (root.parent.name == ".worktrees" and root.parent.is_dir())
+    return (root.is_relative_to(data_root)
+            or (root.parent.name == ".worktrees" and root.parent.is_dir())
+            or _run_scoped_temp_checkout(root))
 
 
 def orphan_install_states(installs: Path) -> list[Path]:

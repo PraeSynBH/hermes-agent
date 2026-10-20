@@ -7,6 +7,7 @@ import os
 import subprocess
 
 import pm.environments
+import pm.install_states
 import pytest
 from hermes_cli.worktree_ops import _prune_stale_worktrees
 from pm.filesystem import lock_fd
@@ -22,6 +23,9 @@ def _state(installs, key, project_root):
 
 
 def test_startup_prune_reclaims_only_provably_deleted_checkouts(tmp_path, monkeypatch):
+    # ``tmp_path`` itself lives under the OS temp dir; a temp root this test can point at keeps
+    # the mount-boundary cases below outside it, which is what a foreign-host record looks like.
+    monkeypatch.setattr(pm.install_states, "system_temp_root", lambda: tmp_path / "sys-temp")
     installs = tmp_path / "home" / "installs"
     repo = tmp_path / "repo"
     (repo / ".worktrees").mkdir(parents=True)
@@ -67,6 +71,23 @@ def test_held_orphan_is_kept(tmp_path):
             os.close(fd)
     # Locks released (owner exited): all are reclaimed on the next pass.
     assert sorted(p.name for p in collect_orphan_install_states(installs)) == ["dddd", "eeee", "ffff"]
+
+
+def test_run_scoped_temp_checkout_is_reclaimed_after_its_worktree_is_deleted(tmp_path, monkeypatch):
+    """The harness leaves the run dir (sometimes the whole path) behind, so under the temp dir a
+    missing checkout is the proof. A live worktree, and a checkout outside temp, are kept."""
+    temp_root = tmp_path / "sys-temp"
+    run_dir = temp_root / "paperclip-run-prx-5657-1234"
+    (run_dir / "live-wt").mkdir(parents=True)
+    installs = tmp_path / "home" / "installs"
+    gone = _state(installs, "aaaa", run_dir / "finished-wt")
+    live = _state(installs, "bbbb", run_dir / "live-wt")
+    outside_temp = _state(installs, "cccc", tmp_path / "paperclip" / "prx-5657-wt")
+    monkeypatch.setattr(pm.install_states, "system_temp_root", lambda: temp_root)
+
+    assert orphan_install_states(installs) == [gone]
+    assert collect_orphan_install_states(installs) == [gone]
+    assert live.is_dir() and outside_temp.is_dir()
 
 
 @pytest.mark.platforms("posix")
