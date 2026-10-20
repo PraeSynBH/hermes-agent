@@ -797,6 +797,15 @@ gateway:
 | cron store | enabled jobs in `profiles/<name>/cron/jobs.json` | core |
 | credentials | adapter credentials in `profiles/<name>/.env` (the same key table `hermes profile clone` uses) | core |
 | manifest | `gateway.multiplex_demand_manifest` — agents that wake a profile from outside Hermes | a host-side collector |
+| pending admission | a client that asked for a profile this gateway refused, live in the gateway process | core |
+
+The last row is the only signal that is not read from disk, and the only one that says somebody
+is blocked *now*: the gateway records the refusal (a `/p/<profile>/` scope miss or a routed
+message for a parked profile) and counts that profile as demand-bearing for
+`gateway_multiplex_demand.WANTED_TTL_SECONDS` (300 s). A client that asked once and gave up
+cannot hold a slot: the sighting expires on its own, and one that keeps being asked keeps
+refreshing it. Note that this is a sighting, not a lease — the profile is hot-served on the next
+30-second rescan, and the tick after that either keeps it (still being asked) or parks it again.
 
 The manifest is a generic, schema-versioned host input; core never reads another product's
 database. Default location: `<default home>/gateway_demand.json`, written atomically:
@@ -837,6 +846,18 @@ A profile that would be evicted by a demand flip while it holds live work — a 
 a `/bg` agent, an admitted-but-unstarted task — keeps its slot for that cycle and is published
 under `holding` with `since` and the profile waiting for it. The wait is visible on the same
 tick; the swap completes on the first tick after the holder goes idle.
+
+The decision also names what demand *kept*, not only what it dropped: `pinned` (profile → the
+work signal that justified its slot) and `deferred_for_demand` (the profiles the pre-demand
+order would have served instead), plus one INFO line per changed decision —
+
+```
+[MULTIPLEX] Pinned by demand: 'agent' (a client is waiting (pending admission)) kept a slot;
+'mike' deferred instead (idle at the ceiling edge)
+```
+
+so a log read after an incident shows a deliberate trade instead of an unexplained eviction. A
+profile that is deferred while a client is waiting says so in its own `parked_profiles` reason.
 
 A second gateway **process** on the same host does not help: it halves each process's thread
 count but not the host's, and it doubles the process-wide baseline. If one node cannot hold
