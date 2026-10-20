@@ -4,7 +4,7 @@ Every other liveness backstop (loop-liveness watchdog, shutdown watchdog, heartb
 assumes startup succeeded; none can fire if the process deadlocks before the event loop
 is alive (OOF-298: ~30h with every thread in ``futex_wait_queue``, zero logs, s6 saw a
 live PID). A daemon thread armed at process entry and disarmed once the loop is confirmed
-live dumps all-thread stacks (``faulthandler``), records the exit in the lifecycle ledger
+live dumps all-thread stacks (``hermes_thread_dump``), records the exit in the lifecycle ledger
 (NS-608) and ``os._exit``\\ s with the service-restart code so s6/systemd respawn.
 
 Slow-but-alive startups are not killed. Order of authority: (1) phase-owned progress
@@ -28,7 +28,6 @@ Everything is best-effort: a watchdog failure must never affect the startup it o
 
 from __future__ import annotations
 
-import faulthandler
 import json
 import logging
 import os
@@ -37,6 +36,8 @@ import time
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from hermes_thread_dump import dump_thread_stacks
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +146,7 @@ def _append_dump(write, failure_msg: str) -> None:
 
 
 def _write_dump_record(record: dict[str, Any]) -> None:
-    """Append a one-line JSON metadata record beside the faulthandler dump."""
+    """Append a one-line JSON metadata record beside the thread dump."""
     _append_dump(
         lambda fh: fh.write(json.dumps(record, default=str) + "\n"),
         "Failed to write startup watchdog dump record",
@@ -264,7 +265,7 @@ class StartupWatchdogHandle:
     def _fire(self) -> None:
         """Forensics, then exit — with the exit itself independently bounded.
 
-        Everything producing forensics (logging, dump record, faulthandler, ledger)
+        Everything producing forensics (logging, dump record, thread dump, ledger)
         can block: the wedged main thread may hold the logging handler lock, the disk
         may be hung. None of that may stop the respawn, so the escort thread starts
         FIRST. ``os._exit`` is async-signal-safe and lock-free by design.
@@ -300,14 +301,13 @@ class StartupWatchdogHandle:
         )
         # Write the durable copy first. A detached service can have a blocked
         # stderr, and the exit escort bounds the whole forensic path to 10s.
+        # Bounded, rate-limited, pure-Python (PRA-6536): the C-level all-thread walk this
+        # replaced faulted in _Py_DumpTracebackThreads and killed the process.
         _append_dump(
-            lambda fh: faulthandler.dump_traceback(file=fh, all_threads=True),
-            "Startup watchdog file-based faulthandler dump failed",
+            lambda fh: dump_thread_stacks("startup watchdog fired", file=fh),
+            "Startup watchdog file-based thread dump failed",
         )
-        try:
-            faulthandler.dump_traceback(all_threads=True)
-        except Exception:
-            logger.debug("Startup watchdog faulthandler dump failed", exc_info=True)
+        dump_thread_stacks("startup watchdog fired")
         # Ledger write on a helper thread (it imports application code; the
         # wedged main thread may hold the import lock). Bounded join, then exit
         # regardless — NS-608 classification is best-effort; the respawn is not.

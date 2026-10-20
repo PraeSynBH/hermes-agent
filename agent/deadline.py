@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import contextvars
 from contextlib import contextmanager
-import faulthandler
 import logging
 import os
 import subprocess
@@ -225,14 +224,15 @@ def _dump_blocked_loop_diagnostics(label: str, timeout_s: float) -> None:
     logger.warning(
         "[deadline] %r deadline (%.0fs) expired but the event loop has not processed the expiry "
         "after a further %.0fs — the loop thread appears BLOCKED in a synchronous call, which is "
-        "why no asyncio timeout can fire. Dumping all thread stacks to stderr to identify the "
+        "why no asyncio timeout can fire. Dumping bounded thread stacks to stderr to identify the "
         "blocking frame.",
         label, timeout_s, _LOOP_BLOCKED_DUMP_GRACE_S,
     )
-    try:
-        faulthandler.dump_traceback(all_threads=True)
-    except Exception:
-        logger.debug("faulthandler traceback dump failed", exc_info=True)
+    # Bounded, rate-limited, pure-Python: the C-level all-thread walk that used to run here
+    # faulted in _Py_DumpTracebackThreads and killed the gateway (PRA-6536).
+    from hermes_thread_dump import dump_thread_stacks
+
+    dump_thread_stacks(f"deadline expired with the loop blocked: {label!r}")
 
 
 async def run_bounded_async(

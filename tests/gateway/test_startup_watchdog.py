@@ -368,6 +368,9 @@ class TestFire:
         assert exit_capture.codes == [SERVICE_RESTART_EXIT_CODE]
 
     def test_fire_writes_dump_record_and_stacks(self, exit_capture, tmp_path):
+        import hermes_thread_dump as thread_dump
+
+        thread_dump.reset_dump_rate_limit()  # the dump floor is per process; tests share one
         arm_startup_watchdog(timeout_s=0.1)
         assert exit_capture.fired.wait(timeout=5)
         dump_path = get_startup_watchdog_dump_path(tmp_path)
@@ -380,18 +383,20 @@ class TestFire:
         assert record["tag"] == "startup_watchdog.fired"
         assert record["exit_code"] == SERVICE_RESTART_EXIT_CODE
         assert record["timeout_s"] == pytest.approx(0.1)
-        # File-based faulthandler dump follows the JSON record (stderr may be
-        # absent on detached runs).
-        assert "Thread" in content or "Current thread" in content
+        # File-based bounded thread dump follows the JSON record (stderr may be
+        # absent on detached runs). It is not faulthandler's C walk: that walk faulted
+        # under a blocked loop and killed the process (PRA-6536).
+        assert "thread dump: startup watchdog fired" in content
+        assert "MainThread" in content
 
     def test_file_dump_precedes_stderr_dump(self, monkeypatch):
         """A blocked stderr must not hide the durable stack dump."""
         writes = []
 
-        def _dump(*, file=None, all_threads=True):
+        def _dump(reason, *, file=None):
             writes.append("file" if file is not None else "stderr")
 
-        monkeypatch.setattr(sw.faulthandler, "dump_traceback", _dump)
+        monkeypatch.setattr(sw, "dump_thread_stacks", _dump)
         monkeypatch.setattr(
             StartupWatchdogHandle, "_exit", staticmethod(lambda code: None)
         )
@@ -428,7 +433,7 @@ class TestFire:
 
 
 class TestBoundedExit:
-    """The fire path's forensics (logging, dump record, faulthandler,
+    """The fire path's forensics (logging, dump record, thread dump,
     ledger) may themselves wedge — the wedged main thread can hold the
     logging handler lock, the disk can be full or hung. An escort thread
     free of logging/filesystem/application locks must still reach the exit

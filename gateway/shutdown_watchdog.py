@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import faulthandler
 import json
 import logging
 import os
@@ -24,6 +23,7 @@ from typing import Any, Callable, Dict, Optional
 
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
 from hermes_constants import get_hermes_home, get_process_hermes_home
+from hermes_thread_dump import dump_thread_stacks
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -283,54 +283,27 @@ def resolve_shutdown_watchdog_delay(
     return _coerce_float(drain_timeout, 0.0) + grace
 
 
-def _frame_snapshot(wanted: int = 12) -> str:
-    """Per-thread innermost frames from ``sys._current_frames()``: the always-available fallback.
-
-    ``faulthandler.dump_traceback`` silently yields ``<freed thread state>`` (or nothing) when it
-    cannot read a thread's state, which is exactly what the 2026-10-18T18:17:43Z loop-liveness fire
-    hit — the most damaging freeze of that window left no stacks at all. Reading the frames from
-    inside the watchdog thread cannot fail that way, so every fire records who was where.
-    """
-    try:
-        frames = sys._current_frames()
-        names = {t.ident: t.name for t in threading.enumerate()}
-    except Exception:
-        return "(frame snapshot unavailable)\n"
-    lines = []
-    for ident, frame in frames.items():
-        chain = []
-        while frame is not None and len(chain) < wanted:
-            chain.append(f"    {frame.f_code.co_filename}:{frame.f_lineno} {frame.f_code.co_name}")
-            frame = frame.f_back
-        lines.append(f"  thread {ident} [{names.get(ident, '?')}]")
-        lines.extend(chain)
-    return "\n".join(lines) + "\n"
-
-
 def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[dict[str, Any]],
                          event: str = "shutdown_watchdog_fired") -> None:
-    """Best-effort faulthandler + metadata dump before hard-exit (file, then stderr)."""
+    """Best-effort thread dump + metadata before hard-exit (file, then stderr)."""
     header = {"event": event, "pid": os.getpid(), "delay_s": delay_s,
               "fired_at": datetime.now(UTC).isoformat(), "snapshot": snapshot or {}}
     with contextlib.suppress(OSError):  # unwritable dir: skip only the file copy, stderr still runs
         dump_path.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(Exception), open(dump_path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(header, default=str) + "\n--- faulthandler dump (all threads) ---\n")
+        fh.write(json.dumps(header, default=str) + "\n")
         fh.flush()
-        try:
-            faulthandler.dump_traceback(file=fh, all_threads=True)
-        except Exception:
-            fh.write("(faulthandler.dump_traceback failed)\n")
-        # Second witness: faulthandler can return "<freed thread state>" with no stacks at all.
-        fh.write("--- sys._current_frames ---\n")
-        fh.write(_frame_snapshot())
+        # One bounded, rate-limited, pure-Python dump. The C-level all-thread walk used to run
+        # here and faulted in _Py_DumpTracebackThreads (PRA-6536).
+        dump_thread_stacks(f"{event} (shutdown watchdog)", file=fh)
         fh.write("--- end dump ---\n")
         fh.flush()
     with contextlib.suppress(Exception):  # stderr too: journald/launchd get it if disk is wedged
         sys.stderr.write(f"Gateway {event.replace('_', ' ')} after {delay_s:.0f}s "
-                         f"(pid={os.getpid()}); dumping all thread stacks.\n")
+                         f"(pid={os.getpid()}); dumping bounded thread stacks.\n")
         sys.stderr.flush()
-        faulthandler.dump_traceback(all_threads=True)
+        # Rate-limited: when the file arm already dumped, this is a counted no-op, not a second walk.
+        dump_thread_stacks(f"{event} (shutdown watchdog)")
 
 
 def arm_shutdown_watchdog(
