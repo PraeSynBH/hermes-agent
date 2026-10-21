@@ -51,9 +51,18 @@ class StreamJsonEmitter:
         return self
 
     def bind_session(self, session_id: str) -> None:
-        """Record the id the gateway assigned after ``init`` was written, so an interrupted or failed
-        run still reports which session holds the accepted work."""
-        self._session_id = session_id or self._session_id
+        """Record the id the gateway assigned after ``init`` was written, and announce it, so an
+        interrupted or failed run still reports which session holds the accepted work.
+
+        A timeout SIGKILLs this process mid-turn: the terminal ``result`` record never runs, so the
+        id it would have carried is lost. Orchestrators that resume from the last ``session_id``
+        seen on ANY ``system`` event (Paperclip's ``parseStreamJsonTranscript``) can only reuse the
+        work if the id is on stdout before the turn starts. Empty and repeated binds add nothing."""
+        session_id = session_id or ""
+        if not session_id or session_id == self._session_id:
+            return
+        self._session_id = session_id
+        self._emit({"type": "system", "subtype": "session", "session_id": session_id})
 
     def on_text_delta(self, text: str | None) -> None:
         # Only None/"" (the turn-end sentinel) is dropped: whitespace deltas are part of the text, and

@@ -105,8 +105,8 @@ def _interrupted_turn(_peer):
 
 
 @pytest.mark.parametrize("turn, credentials_ok, exit_code, types", [
-    (_ok_turn, True, 0, ["system", "text", "tool_use", "tool_result", "result"]),
-    (_interrupted_turn, True, 130, ["system", "result"]),
+    (_ok_turn, True, 0, ["system", "system", "text", "tool_use", "tool_result", "result"]),
+    (_interrupted_turn, True, 130, ["system", "system", "result"]),
     (_ok_turn, False, 1, ["system", "result"]),  # credentials fail before any session exists
 ])
 def test_chat_stream_json_implies_quiet_and_closes_with_result(monkeypatch, capsys, turn, credentials_ok, exit_code,
@@ -118,6 +118,61 @@ def test_chat_stream_json_implies_quiet_and_closes_with_result(monkeypatch, caps
     assert events[-1]["exit_code"] == exit_code
     # A launch refused before the gateway created a session has none to report.
     assert events[-1]["session_id"] == ("session-123" if credentials_ok else "")
+    if credentials_ok:
+        # The id must reach stdout BEFORE the turn starts: a SIGKILLed run writes no ``result``
+        # record, so the terminal envelope cannot be the only carrier.
+        announced = [e for e in events if e["type"] == "system" and e.get("subtype") == "session"]
+        assert [e["session_id"] for e in announced] == ["session-123"]
+        assert events.index(announced[0]) < len(events) - 1
+
+
+def test_bind_session_survives_a_kill_before_the_result_record(capsys):
+    """Regression for SOU-2781: a timeout SIGKILLs the child mid-turn, so the id it earned is only
+    recoverable if ``bind_session`` announced it — ``parseStreamJsonTranscript`` reads the last
+    non-empty ``session_id`` from any ``system`` event in the partial stdout."""
+    emitter = StreamJsonEmitter(model="m")  # init goes out with no id, as in a fresh one-shot run
+    emitter.bind_session("sess-earned")
+    emitter.on_text_delta("working")
+    # …then the process dies here: no emit_result, no result record.
+
+    events = _events(capsys)
+    assert [e["type"] for e in events] == ["system", "system", "text"]
+    assert [e["session_id"] for e in events if e["type"] == "system"] == ["", "sess-earned"]
+    assert events[1]["subtype"] == "session"
+
+
+def test_bind_session_does_not_re_announce(capsys):
+    """Re-binding the same id (or binding "") adds no event: a clean-exit run carries exactly one
+    session announcement, and a resume's id is not repeated per turn."""
+    emitter = StreamJsonEmitter(model="m", session_id="known")
+    emitter.bind_session("known")
+    emitter.bind_session("")
+    emitter.bind_session("other")
+
+    events = _events(capsys)
+    assert [(e["type"], e.get("subtype"), e.get("session_id")) for e in events] == [
+        ("system", "init", "known"), ("system", "session", "other")]
+
+
+def test_text_format_never_builds_the_stream_json_emitter(monkeypatch, capsys):
+    """Regression for SOU-2781: ``--format text`` must not gain a JSONL session line on stdout."""
+    from hermes_cli import gateway_chat, gateway_chat_startup
+
+    seen = {}
+
+    def run(args, emitter=None):
+        seen["emitter"] = emitter
+        return 0
+
+    monkeypatch.setattr(gateway_chat, "run_gateway_chat", run)
+    monkeypatch.setattr(gateway_chat, "_register_terminal_process", lambda: None)
+    monkeypatch.setattr(gateway_chat_startup, "ensure_launch_provider", lambda _args: True)
+
+    from hermes_cli._parser import build_top_level_parser
+    parser, _, _ = build_top_level_parser()
+    assert gateway_chat.launch_from_args(parser.parse_args(["chat", "-q", "hello"])) == 0
+    assert seen["emitter"] is None
+    assert capsys.readouterr().out == ""
 
 
 @pytest.mark.parametrize("argv, message", [
