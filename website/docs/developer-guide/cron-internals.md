@@ -427,6 +427,19 @@ The scheduler uses cross-process file-based locking (`fcntl.flock` on Unix, `msv
 
 Before the tick lock, a gateway whose checkout was updated under it (boot revision ≠ disk revision) yields the tick when another process holds the gateway runtime lock — a fresher gateway's ticker dispatches instead, and the stale one must not race it with mixed `sys.modules`. The yield is raised (`CronTickYielded`) and persisted as the ticker's last error, so `hermes cron status` reports **"Gateway is running STALE code — its cron ticker yields every tick and fires NOTHING"** with both revisions and the restart command, even though the liveness heartbeat keeps refreshing. `hermes update` closes the loop: a gateway the post-update fleet version matrix proves stale is handed to the drain-first `request_restart` path (SIGUSR1) instead of being left running; a supervised gateway respawns on the new code, a bare `gateway run` is stopped and listed under "Restart manually".
 
+### Drain gate
+
+While the gateway drains in-flight work, `can_dispatch` is false and the ticker holds every due
+slot: nothing is dispatched, `next_run_at` does not move, and the slot fires as a catch-up on the
+first allowed tick. A held slot is never silent (`cron/scheduler_drain_gate.py`): one WARNING per
+boundary names the due job ids and the drain's `principal`/`requested_at`, `last_fire_error` is
+stamped on each held job with the `gateway_draining` reason (`hermes cron list` and the liveness
+checks read it), and a drain still open after the tightest served detector's tolerance (40 min)
+logs one ERROR per episode — past that point the drain itself is the incident, because the
+detectors downstream can only report their own `last_run_at` aging. The hold scans the store
+read-only: `get_due_jobs()` persists a `last_dispatch` stamp, and a held slot must not be recorded
+as dispatched.
+
 ## CLI Interface
 
 The `hermes cron` CLI provides direct job management:

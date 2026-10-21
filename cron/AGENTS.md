@@ -27,6 +27,16 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   finds the stamp with a dead owner restores the instant ONCE (`cron/occurrences.py`), the
   executions ledger's `scheduled_instant` blocks a second fire, `cron.catch_up_missed: false`
   skips past-grace misses with a logged reason. Never drop a slot silently (#107485).
+- **A held tick is never silent.** The drain gate (`scheduler_drain_gate.py`, driven by the
+  gateway's `can_dispatch`) leaves every due slot in place and fires it as a catch-up once the
+  drain releases — but it also names the held job ids in one WARNING per boundary, stamps
+  `last_fire_error=<gateway_draining …>` on each held job (what `hermes cron list` and the liveness
+  checks read; a success clears it), and logs one ERROR per episode once the drain outlives the
+  tightest served detector (40 min) — a drain that long silences a page's worth of work while every
+  downstream detector can only report its own `last_run_at` aging (SOU-3252). The hold scans the
+  store READ-ONLY (`get_due_jobs()` persists `last_dispatch` marks and the slot was not
+  dispatched), and the ticker must not pre-empt the tick with its own quiet gate — the decision
+  belongs inside the per-profile scope where the jobs and the marker live.
 - Per-home tick lock `<home>/cron/.tick.lock` prevents duplicate ticks across processes for
   that profile's store; never a `~/.hermes/...` literal.
 - **Headless ticks refuse, never spawn.** `hermes cron tick` (system crontab / external scheduler)
