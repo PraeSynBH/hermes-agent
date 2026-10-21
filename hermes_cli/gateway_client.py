@@ -12,6 +12,7 @@ import time
 
 # The owner's protocol name; session_contract is dependency-free (no config/plugins load).
 from gateway.session_contract import CANONICAL_GATEWAY_PROTOCOL as GATEWAY_WS_PROTOCOL
+from hermes_cli.gateway_restart_window import RESTART_WINDOW_REASON
 
 GATEWAY_WS_TICKET_PREFIX = "hermes-gateway-ticket."
 # Per-request answer budget. Owner verbs are admissions/reads that answer promptly; the one that
@@ -291,6 +292,26 @@ class GatewayUnavailableError(GatewayClientError):
     def __init__(self, message, state):
         super().__init__(message)
         self.state = state
+        #: Seconds until the host is worth asking again. None = no owner-side schedule to honour.
+        self.retry_after_s: float | None = None
+
+    @property
+    def retryable(self) -> bool:
+        """Whether re-dispatching this run can succeed without anything on this host changing."""
+        return self.retry_after_s is not None
+
+
+class GatewayRestartingError(GatewayUnavailableError):
+    """A declared restart window owns the gateway: a bounded, RETRYABLE verdict, never a boot.
+
+    Raised the moment the window is read, so a run dispatched into one fails in seconds and can be
+    re-queued for ``retry_after_s`` instead of spending its whole admission budget on a daemon the
+    owning job has deliberately stopped (PRA-6692: 6 runs, 120 s each, inside a 187 s window).
+    """
+
+    def __init__(self, message: str, retry_after_s: float):
+        super().__init__(message, "restarting")
+        self.retry_after_s = retry_after_s
 
 
 class EventQueue(asyncio.Queue):
@@ -589,6 +610,18 @@ async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
                 phase = "update-fence"
                 await asyncio.sleep(min(UPDATE_FENCE_POLL_INTERVAL_S, left(UPDATE_FENCE_POLL_INTERVAL_S)))
                 continue
+            if result.reason_code == RESTART_WINDOW_REASON:
+                # A declared restart window: the owning job stopped the gateway and will start it
+                # itself, on a schedule this client can read. This is the one case in admission that
+                # must NOT wait — the outage is longer than the budget by design (187 s vs 120 s), so
+                # waiting can only convert a retryable window into a runtime-boot failure. Fail in
+                # seconds, name the lease, let the dispatcher re-queue (PRA-6692).
+                left_s = result.retry_after_s if result.retry_after_s is not None else 0.0
+                raise GatewayRestartingError(
+                    "Gateway restarting: a declared restart window owns the gateway, so this run was "
+                    f"never admitted (elapsed={time.monotonic() - started:.1f}s, "
+                    f"retryAfterS={int(round(left_s))}, retryable=true): "
+                    f"{result.detail or 'restart window open'}", float(left_s))
             if new_work and result.state == "draining" and attachable(result):
                 drain = f"{result.state}: {result.reason_code or 'draining'}"
                 if left(1.0) <= 0:
