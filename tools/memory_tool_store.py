@@ -128,6 +128,15 @@ def _over_limit(new_total: int, limit: int) -> str:
     return f"would put memory at {new_total:,}/{limit:,} chars: free at least {new_total - limit:,} chars"
 
 
+def _store_home_label(path: Path) -> str:
+    """``~/.hermes/profiles/<p>`` for a store file — one gateway serves many profiles, so
+    ``MEMORY.md`` alone cannot say whose store went over budget (PRX-5813: 1,347 warning
+    lines, none attributable to a profile without matching char counts by hand)."""
+    from hermes_constants import display_hermes_home
+
+    return display_hermes_home(path.parent.parent)
+
+
 # Patch content cannot be empty, and 'remove' would drop the sibling facts in the entry.
 PATCH_DROP_HINT = "To drop text inside an entry, patch a longer span that contains it; 'remove' deletes the whole entry."
 
@@ -230,7 +239,8 @@ class MemoryStore:
             findings = scan_for_threats(entry, scope="strict") if entry and not entry.startswith("[BLOCKED:") else None
             if not findings:
                 return entry
-            logger.warning("Memory entry from %s blocked at load time: %s", filename, ", ".join(findings))
+            logger.warning("Memory entry from %s (%s) blocked at load time: %s", filename,
+                           _store_home_label(path), ", ".join(findings))
             return (f"[BLOCKED: {filename} entry contained threat pattern(s): {', '.join(findings)}. "
                     f"Removed from system prompt; use memory(action=remove, target='{_store_target(filename)}') "
                     f"to delete the original.]")
@@ -247,9 +257,9 @@ class MemoryStore:
             # add/replace, so the oversized block would silently ride in the prompt while every later
             # add is refused with no visible cause (#10877). Warn; never truncate a user's memories.
             if (count := self._char_count(target)) > (limit := self._char_limit(target)):
-                logger.warning("%s exceeds its char limit on load: %d/%d chars. Entries stay loaded; "
+                logger.warning("%s (%s) exceeds its char limit on load: %d/%d chars. Entries stay loaded; "
                                "further additions are blocked until it is back under the limit.",
-                               path.name, count, limit)
+                               path.name, _store_home_label(path), count, limit)
             self._system_prompt_snapshot[target] = self._render_block(target, [_sanitize(e, path.name) for e in entries])
 
     @staticmethod
