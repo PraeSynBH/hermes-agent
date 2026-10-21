@@ -642,6 +642,11 @@ class GatewayConfig:
     # failure exit only severs the UI's websockets and drops in-flight assistant messages (#118080).
     # Retryable failures are recoverable in both modes; non-retryable adapter loss always exits.
     on_all_adapters_down: str = "exit"  # "exit" | "stay_alive"; GATEWAY_ON_ALL_ADAPTERS_DOWN overrides
+    # On-call webhook (Alertmanager format) that receives a page when a transport goes fatal and a
+    # resolved notice when it reconnects: the only channel that survives the transport being down
+    # (PRA-6623). Unset = no paging. The receiver owns dedupe — one open card per fingerprint.
+    alert_webhook_url: Optional[str] = None
+
     unauthorized_dm_behavior: str = "pair"  # UNAUTHORIZED_DM_BEHAVIORS
     unauthorized_dm_decline_message: str = ""  # "decline" reply text; empty → DEFAULT_UNAUTHORIZED_DM_DECLINE_MESSAGE
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
@@ -655,6 +660,7 @@ class GatewayConfig:
         "stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user",
         "max_concurrent_sessions", "multiplex_profiles",
         "on_all_adapters_down",
+        "alert_webhook_url",
         "room_link_url", "systemd_watchdog_seconds", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s",
         "loop_watchdog_max_strikes", "unauthorized_dm_behavior", "unauthorized_dm_decline_message",
@@ -769,6 +775,11 @@ class GatewayConfig:
         max_concurrent_sessions = _coerce_optional_positive_int(
             pick("max_concurrent_sessions"), key_label("max_concurrent_sessions")
         )
+        alert_webhook_url = pick("alert_webhook_url")
+        if not isinstance(alert_webhook_url, str) or not alert_webhook_url.strip():
+            alert_webhook_url = None
+        else:
+            alert_webhook_url = alert_webhook_url.strip()
 
         try:
             session_store_max_age_days = max(int(data.get("session_store_max_age_days", 90)), 0)
@@ -793,6 +804,7 @@ class GatewayConfig:
             loop_watchdog_probe_timeout_s=bounded_float("loop_watchdog_probe_timeout_s", DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, 1.0, 600.0),
             loop_watchdog_max_strikes=max_strikes,
             on_all_adapters_down=on_all_adapters_down,
+            alert_webhook_url=alert_webhook_url,
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=_normalize_choice(data.get("unauthorized_dm_behavior"), UNAUTHORIZED_DM_BEHAVIORS, "pair"),
             unauthorized_dm_decline_message=str(data.get("unauthorized_dm_decline_message") or "").strip(),

@@ -25,6 +25,7 @@ from gateway.config import (
     Platform,
     platform_binds_port as _platform_binds_port,
 )
+from gateway.alert_webhook import page_platform_fatal, page_platform_recovered
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.helpers import carry_inbound_dedup, hand_over_held_inbound
 from gateway.restart import is_global_startup_conflict
@@ -385,6 +386,7 @@ class GatewayAdapterLifecycleMixin:
             error_code=adapter.fatal_error_code,
             error_message=adapter.fatal_error_message,
         )
+        page_platform_fatal(adapter)  # a dead transport cannot report itself over the chat (PRA-6623)
         if existing is adapter:
             record_platform_disconnect(adapter)
             # Claim for teardown BEFORE awaiting disconnect(), else a second fatal disconnects it twice.
@@ -923,6 +925,7 @@ class GatewayAdapterLifecycleMixin:
             logger.info("⚠ %s reconnected in degraded mode (receive path not yet confirmed)", platform.value)
         else:
             logger.info("✓ %s reconnected successfully", platform.value)
+            page_platform_recovered(adapter)  # the receive path is proven: close the outage card (PRA-6623)
         self._schedule_planned_restart_replay()
         # Responses rejected while down are owned by this live process (startup recovery cannot claim them).
         with _log_suppressed(

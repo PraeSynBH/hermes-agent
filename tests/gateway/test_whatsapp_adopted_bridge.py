@@ -99,7 +99,8 @@ async def test_logged_out_session_is_named_instead_of_a_generic_exit(tmp_path):
     assert await adapter._check_managed_bridge_exit() is not None
     assert adapter.fatal_error_code == "whatsapp_logged_out"
     assert "hermes whatsapp" in adapter.fatal_error_message
-    assert adapter.fatal_error_retryable is True, "re-pairing must recover without a gateway restart"
+    assert adapter.fatal_error_retryable is False, (
+        "bridge.js exits(1) on loggedOut, so a retryable verdict re-spawns a doomed bridge forever")
 
 
 @pytest.mark.asyncio
@@ -152,6 +153,23 @@ async def test_a_connected_health_probe_clears_the_not_connected_window(tmp_path
     assert adapter._bridge_not_connected_since is None
     assert adapter.fatal_error_code is None
     assert _BRIDGE_NOT_CONNECTED_SECS > 5
+
+
+@pytest.mark.asyncio
+async def test_a_wedged_bridge_with_a_live_pid_is_restarted_after_the_longer_streak(tmp_path):
+    """Alive but deaf past any busy moment is not 'keep polling': it is restarted (PRA-6623)."""
+    from plugins.platforms.whatsapp.adapter import _ADOPTED_BRIDGE_WEDGED_STREAK
+
+    adapter = _make_adapter(tmp_path)
+    _dead(adapter, _ADOPTED_BRIDGE_WEDGED_STREAK)
+
+    from plugins.platforms.whatsapp import adapter as adapter_module
+    with patch.object(adapter_module, "_read_bridge_pidfile", return_value=(4321, 99, 19876)), \
+         patch.object(adapter_module, "_bridge_pid_is_ours", return_value=True):
+        assert await adapter._check_managed_bridge_exit() is not None
+    assert adapter.fatal_error_code == "whatsapp_bridge_unresponsive"
+    assert adapter.fatal_error_retryable is True, "the reconnect path reaps the pid and respawns"
+    assert "pid 4321" in adapter.fatal_error_message
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,7 @@ from pathlib import Path
 from agent.i18n import t
 from gateway.config import Platform
 from gateway.delivery import looks_like_telegram_private_chat_id
+from gateway.alert_webhook import page_platform_fatal
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
@@ -1396,6 +1397,7 @@ class GatewayStartupMixin:
             )
             target = startup_retryable_errors if _retryable else startup_nonretryable_errors
             target.append(f"{platform.value}: {adapter.fatal_error_message}")
+            page_platform_fatal(adapter)  # a transport that never came up is still an outage (PRA-6623)
             if _retryable:
                 self._failed_platforms[platform] = self._startup_retry_entry(
                     platform, adapter, platform_config, queued=False

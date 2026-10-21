@@ -340,6 +340,9 @@ _QUOTED_MIME_BY_BRIDGE_KIND = {
 # requests. Six is ~30 s at the poll loop's 5 s error backoff: long enough that a busy bridge is never
 # declared dead, short enough that a paging outage is caught while the alert is still actionable.
 _ADOPTED_BRIDGE_DEAD_STREAK = 6
+# A bridge whose pidfile process is still alive but deaf: twice the dead streak (~60 s) is past any
+# busy moment, so it is restarted instead of polled forever (PRA-6623).
+_ADOPTED_BRIDGE_WEDGED_STREAK = 2 * _ADOPTED_BRIDGE_DEAD_STREAK
 
 # The bridge answers /health with a non-connected status while it is logged out or showing a QR, and the
 # poll loop cannot tell that from health: it only sees HTTP 200s. Sample rarely, and report only a
@@ -759,7 +762,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             logger.info("[%s] Bridge exited during shutdown (code %d).", self.name, returncode)
             return None
         code, message = self._bridge_gone_cause(f"WhatsApp bridge process exited unexpectedly (code {returncode}).")
-        return await self._declare_bridge_dead(message, code)
+        # A logged-out session cannot be re-paired by a respawn: bridge.js exits(1) on loggedOut, so a
+        # retryable verdict would re-spawn a doomed bridge at every backoff (PRA-6623).
+        return await self._declare_bridge_dead(message, code, retryable=code != "whatsapp_logged_out")
 
     async def _declare_bridge_dead(self, message: str, code: str, *, retryable: bool = True) -> str:
         """Report a dead bridge once (log, fatal error, platform status) and return what to hand the caller."""
@@ -783,22 +788,36 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         ``_adopted`` bridges are the ones we did not spawn, so ``_bridge_process`` is ``None`` and nothing
         polls them. Two signals, because neither alone is sound: the pidfile names a process (a live one
-        means "wedged, not gone" — keep polling; a recorded-but-dead one is proof), and an unbroken streak
-        of failed bridge requests covers the normal adopt case of no pidfile at all (an out-of-process
+        that also answers is fine; a live one that has gone deaf is wedged and gets restarted at
+        ``_ADOPTED_BRIDGE_WEDGED_STREAK``; a recorded-but-dead one is proof), and an unbroken streak of
+        failed bridge requests covers the normal adopt case of no pidfile at all (an out-of-process
         ``hermes whatsapp`` bridge leaves none). One answered request zeroes the streak, so a slow or busy
         bridge is never mistaken for a dead one.
+
+        Both outcomes are fatal errors, so the reconnect watcher respawns the bridge: a retryable one is
+        re-queued (it reaps the pidfile process and spawns a new bridge), and a logged-out session is not,
+        because no respawn can re-pair it — bridge.js exits(1) on ``DisconnectReason.loggedOut``, so a
+        retryable verdict there would respawn a doomed bridge forever (PRA-6623).
         """
         if getattr(self, "_shutting_down", False) or not self._running:
             return None
         streak = getattr(self, "_bridge_unreachable_streak", 0)
         if streak < _ADOPTED_BRIDGE_DEAD_STREAK:
             return None
-        pid, recorded_start, _ = _read_bridge_pidfile(self._session_path)
-        if pid is not None and _bridge_pid_is_ours(pid, recorded_start):
-            return None  # process still alive under our pidfile: unreachable, not exited
         code, message = self._bridge_gone_cause(
             f"WhatsApp bridge stopped answering on port {self._bridge_port} ({streak} consecutive failed "
             f"requests; no live bridge for {self._session_path}).")
+        if code == "whatsapp_logged_out":
+            return await self._declare_bridge_dead(message, code, retryable=False)
+        pid, recorded_start, _ = _read_bridge_pidfile(self._session_path)
+        if pid is not None and _bridge_pid_is_ours(pid, recorded_start):
+            if streak < _ADOPTED_BRIDGE_WEDGED_STREAK:
+                return None  # alive and only briefly deaf: a busy bridge, not an exited one
+            # Alive but deaf past any busy moment. Left alone it polled forever with a live pid and no
+            # signal (PRA-6623); the reconnect path reaps it by pidfile and spawns a fresh bridge.
+            code = "whatsapp_bridge_unresponsive"
+            message = (f"WhatsApp bridge (pid {pid}) is running but has not answered on port "
+                       f"{self._bridge_port} for {streak} consecutive requests; restarting it.")
         return await self._declare_bridge_dead(message, code)
 
     def _bridge_gone_cause(self, fallback_message: str) -> tuple[str, str]:
@@ -811,7 +830,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """
         offset = getattr(self, "_bridge_log_offset", 0) or 0
         try:
-            with open(self._bridge_log or (self._session_path.parent / "bridge.log"), "rb") as fh:
+            # Binary on purpose: the offset is a byte count, and the tail is decoded with errors="replace".
+            with open(self._bridge_log or (self._session_path.parent / "bridge.log"), "rb") as fh:  # windows-footgun: ok -- binary read; no text-mode encoding applies
                 fh.seek(offset)
                 tail = fh.read()[-4000:].decode("utf-8", "replace")
         except OSError:
@@ -819,8 +839,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if "Logged out." in tail or "logged_out" in tail:
             return ("whatsapp_logged_out",
                     "WhatsApp session is logged out — the linked device is gone, so no message can be sent or "
-                    "received. Re-pair it with `hermes whatsapp` (scan the QR), then the gateway reconnects on its "
-                    f"next attempt. Bridge log: {self._bridge_log or (self._session_path.parent / 'bridge.log')}")
+                    "received. Re-pair it with `hermes whatsapp` (scan the QR) and then restart the gateway: this "
+                    "is not retried automatically, because bridge.js exits on a logged-out session and every "
+                    f"retry would re-spawn a bridge that cannot connect. Bridge log: {self._bridge_log or (self._session_path.parent / 'bridge.log')}")
         return "whatsapp_bridge_exited", fallback_message
 
     def _terminate_bridge(self, *, force: bool) -> None:
@@ -1012,7 +1033,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         try:
             ok, data = await self._probe_bridge_health()
         except Exception:
-            return None  # unreachable is the poll loop's streak's business, not this check's
+            # Unreachable is the poll loop's streak's business, not this check's; the traceback is only
+            # useful at debug (a dead port raises here on every probe).
+            logger.debug("[%s] bridge health probe failed", self.name, exc_info=True)
+            return None
         if not ok or not isinstance(data, dict) or data.get("status") == "connected":
             self._bridge_not_connected_since = None
             return None

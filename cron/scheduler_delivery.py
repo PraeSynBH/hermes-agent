@@ -1596,6 +1596,24 @@ def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: lis
     delivery_errors.append(note)
 
 
+def _page_cron_target(job: dict, t: _TargetDelivery, *, ok: bool, error: str = "") -> None:
+    """Page the board about a cron DELIVERY TARGET (not a job), and close it on recovery.
+
+    Eight jobs failing against a dead WhatsApp bridge are one outage with one card; the fingerprint
+    is the target, so the second job's failure does not open a second issue (PRA-6623). Never
+    raises and never blocks: the sender runs the POST on its own thread.
+    """
+    try:
+        from gateway import alert_webhook
+        if ok:
+            alert_webhook.cron_target_ok(t.platform_name, str(t.chat_id))
+        else:
+            alert_webhook.cron_target_failing(
+                t.platform_name, str(t.chat_id), job_id=str(job.get("id", "?")), error=error)
+    except Exception:
+        logger.debug("Job '%s': could not page the board about %s", job.get("id"), t.where, exc_info=True)
+
+
 def _deliver_standalone(
     t: _TargetDelivery, content: str, media_files: list, target_errors: list, delivery_errors: list,
 ) -> None:
@@ -1606,6 +1624,7 @@ def _deliver_standalone(
         if not target_errors:
             target_errors.append(f"relay delivery to {t.where} failed")
         delivery_errors.extend(target_errors)
+        _page_cron_target(job, t, ok=False, error=target_errors[-1])
         return
     result, err = _standalone_send(t, content, media_files)
     if err is None and result and result.get("error"):
@@ -1615,6 +1634,7 @@ def _deliver_standalone(
     if err is not None:
         target_errors.append(err)
         delivery_errors.extend(target_errors)
+        _page_cron_target(job, t, ok=False, error=err)
         # A satellite profile's worker has no platform token, so standalone cannot stand in for a
         # live adapter that is only waiting to reconnect: keep the payload for that adapter.
         _queue_for_live_reconnect(t, content, media_files, delivery_errors)
@@ -1626,6 +1646,7 @@ def _deliver_standalone(
         logger.error("Job '%s': %s", job["id"], msg)
         delivery_errors.append(msg)
     logger.info("Job '%s': delivered to %s:%s", job["id"], t.platform_name, t.chat_id)
+    _page_cron_target(job, t, ok=True)
     # Thread seeding only happens on the live lane, so no thread_seeded gate applies here.
     _maybe_mirror_cron_delivery(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,

@@ -78,6 +78,35 @@ class _ReplacementDeliveryAdapter(BasePlatformAdapter):
 
 
 @pytest.mark.asyncio
+async def test_runner_pages_the_board_when_a_transport_goes_fatal(monkeypatch, tmp_path):
+    """Regression for PRA-6623: a runtime fatal must reach the board, not just the log.
+
+    The 2026-10-21 outage logged 2,571 poll errors and opened no card, because nothing on the fatal
+    path escalated. The runner's fatal handler is that path for every adapter.
+    """
+    paged = []
+    monkeypatch.setattr("gateway.run_adapters.page_platform_fatal", lambda adapter: paged.append(adapter) or True)
+
+    config = GatewayConfig(
+        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True, token="token")},
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    adapter = _RuntimeRetryableAdapter()
+    adapter._set_fatal_error(
+        "whatsapp_bridge_exited", "WhatsApp bridge process exited unexpectedly (code 1).",
+        retryable=True,
+    )
+    runner.adapters = {Platform.WHATSAPP: adapter}
+    runner.delivery_router.adapters = runner.adapters
+    runner.stop = AsyncMock()
+
+    await runner._handle_adapter_fatal_error(adapter)
+
+    assert paged == [adapter], "the fatal handler is where a dead transport becomes a board card"
+
+
+@pytest.mark.asyncio
 async def test_runner_queues_retryable_runtime_fatal_for_reconnection(monkeypatch, tmp_path):
     """Retryable runtime fatal errors queue the platform for reconnection
     AND keep the gateway alive — the background reconnect watcher recovers

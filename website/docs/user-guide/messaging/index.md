@@ -354,6 +354,36 @@ Semantics are honest at-least-once:
 Disable with `gateway.delivery_ledger: false` in `config.yaml` (restores the
 old behavior: in-flight responses are lost on crash).
 
+### Transport outage escalation (on-call webhook)
+
+A chat transport cannot report its own death over the chat it carries. When a
+platform goes fatal — a WhatsApp bridge that stopped answering, a revoked bot
+token, a port conflict — the gateway also posts an
+[Alertmanager-format](https://prometheus.io/docs/alerting/latest/alertmanager/)
+alert to `gateway.alert_webhook_url`, and posts the matching `resolved` notice
+when the platform connects again:
+
+```yaml
+gateway:
+  alert_webhook_url: http://127.0.0.1:9095/   # unset = no paging
+```
+
+- **Fingerprint, not per-event:** the alert is `TransportDown` with
+  `client: <platform>`, so a receiver that dedupes on (alertname, client) keeps
+  **one** card open for an outage and closes it when the resolved notice
+  arrives — no matter how many times the failure is re-declared.
+- **Cron delivery failures use the same channel,** fingerprinted per
+  destination (`CronDeliveryFailing`, `client: <platform>:<chat_id>`): eight jobs
+  failing against one dead bridge are one outage, not eight cards.
+- **Never blocks the loop:** the POST runs on a short-lived thread with a 5 s
+  timeout; an unreachable webhook logs once and is otherwise inert.
+- A `relay_disabled` verdict is a configuration choice, not an outage, and is
+  not paged.
+
+The receiver owns what a card looks like; anything that accepts the
+Alertmanager webhook shape works (Paperclip's on-call receiver files one board
+issue per fingerprint).
+
 ### Session continuity
 
 Gateway conversations do not reset after inactivity or at a daily boundary. Use `/new`
