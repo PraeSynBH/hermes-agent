@@ -94,10 +94,9 @@ def loop_thread_stack(ident: int, depth: int = DEFAULT_LOOP_STACK_DEPTH) -> str:
     ``sys._current_frames()`` from the watchdog thread names the ``file:line function`` for
     free, including the coroutine frame that is executing on the loop right now.
     """
-    try:
-        frame = sys._current_frames().get(ident)
-    except Exception:
-        return "(loop thread frames unavailable)\n"
+    # ``sys._current_frames()`` is a snapshot of every thread's frame; it has no failure mode of
+    # its own, and a guard here would only turn a missing thread into a mystery for the reader.
+    frame = sys._current_frames().get(ident)
     if frame is None:
         return f"(thread {ident} is not running Python)\n"
     lines = []
