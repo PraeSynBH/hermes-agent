@@ -305,6 +305,19 @@ _PIPE_TO_INTERPRETER = re.compile(
     r"\|\s*&?\s*(?:sudo\s+)?(?:sh|bash|dash|ksh|zsh|xargs|eval|source)\b"
 )
 
+# Executables whose options carry a request BODY to a server. The heredoc allowlist covers a body fed
+# on stdin; an INLINE value is the same data (PRX-5770): `curl -d '{"text":"hermes gateway restart"}'`
+# sends that prose, it does not run it, and the ordinary way to write up a restart incident is a
+# request body that quotes one.
+_DATA_PAYLOAD_EXECUTABLES = frozenset({"curl", "wget"})
+_DATA_PAYLOAD_VALUE_OPTIONS = {
+    "curl": frozenset({
+        "-d", "--data", "--data-ascii", "--data-binary", "--data-raw", "--data-urlencode",
+        "--json", "-F", "--form", "--form-string",
+    }),
+    "wget": frozenset({"--post-data", "--post-file", "--body-data", "--body-file"}),
+}
+
 # Bytes sniffed before reading a referenced file in full (see _BINARY_MAGICS).
 _BINARY_SNIFF_BYTES = 4096
 
@@ -952,13 +965,64 @@ def _mask_data_sink_arguments(text: str) -> str:
     return "\n".join(lines_out) if changed else text
 
 
+def _mask_request_body_arguments(text: str) -> str:
+    """Replace an HTTP client's inline request-body option VALUES with a neutral placeholder.
+
+    ``curl -d '{"text": "…hermes gateway restart…"}'`` hands that prose to the server; it is not a
+    command this shell runs. Every value given to a ``_DATA_PAYLOAD_VALUE_OPTIONS`` option in a
+    curl/wget segment becomes ``arg``, leaving the rest of the line — the URL, another command after
+    a ``;`` — fully visible. Strictly fail-closed, exactly like ``_mask_data_sink_arguments``: a
+    value carrying an execution marker (``$(``, backtick, process substitution) disables masking
+    for the whole text, and a line that pipes into a shell is never masked.
+    """
+    lines_out: list[str] = []
+    changed = False
+    for line in text.splitlines() or [text]:
+        if _PIPE_TO_INTERPRETER.search(line):
+            lines_out.append(line)
+            continue
+        try:
+            tokens = _line_tokens(line)
+        except ValueError:
+            lines_out.append(line)
+            continue
+
+        rebuilt: list[str] = []
+        for segment in _split_segments(tokens, keep_controls=True):
+            index = _command_token_index(segment)
+            name = Path(segment[index]).name if index is not None else ""
+            options = _DATA_PAYLOAD_VALUE_OPTIONS.get(name)
+            if index is None or options is None:
+                rebuilt.extend(segment)
+                continue
+            masked = list(segment)
+            hit = False
+            for position in range(index + 1, len(masked)):
+                option, separator, inline = masked[position].partition("=")
+                if option not in options:
+                    continue
+                value_position = position if separator and inline else position + 1
+                if value_position >= len(masked):
+                    continue
+                if any(marker in masked[value_position] for marker in _UNSAFE_DATA_ARG_MARKERS):
+                    return text
+                masked[value_position] = "arg"
+                hit = True
+            rebuilt.extend(masked)
+            changed = changed or hit
+        lines_out.append(" ".join(rebuilt))
+    return "\n".join(lines_out) if changed else text
+
+
 def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
     """Lifecycle scan exempting matches inside data arguments: cheap regex first (no-match pays
-    nothing), then re-scan with data-sink arguments masked; only a surviving match blocks."""
+    nothing), then re-scan with data-sink arguments and inline request bodies masked; only a
+    surviving match blocks."""
     if not contains_gateway_lifecycle_command(text):
         return False
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
-    return contains_gateway_lifecycle_command(_mask_data_sink_arguments(normalized))
+    masked = _mask_request_body_arguments(_mask_data_sink_arguments(normalized))
+    return contains_gateway_lifecycle_command(masked)
 
 
 def _direct_lifecycle_scan(command: str) -> bool:
