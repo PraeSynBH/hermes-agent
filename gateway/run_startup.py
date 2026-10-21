@@ -916,16 +916,17 @@ class GatewayStartupMixin:
         return open(os.path.join(log_dir, "gateway_faulthandler.log"), "a", encoding="utf-8")  # windows-footgun: ok (append log writer, not a read)
 
     def _start_install_faulthandler(self) -> None:
-        """Enable faulthandler (stderr or a log file) plus the SIGUSR2 stack-dump hook."""
-        # sys.stderr may be None (Windows VBS / pythonw / detached service): fall back to a log file.
-        try:
-            # Enable faulthandler for stack dumps on freezes/crashes (#70344). Falls back to a log file when
-            # sys.stderr is None (Windows VBS / pythonw / detached service) — otherwise the gateway would
-            # die here and take every adapter offline. See #71671.
-            faulthandler.enable()
-        except (RuntimeError, ValueError, OSError):
-            with _log_suppressed(logging.DEBUG, "faulthandler.enable() unavailable", exc_info=True):
-                faulthandler.enable(file=self._open_faulthandler_log(), all_threads=True)
+        """Arm the fatal-signal crash recorder plus the SIGUSR2 stack-dump hook."""
+        # Fatal signals (SIGBUS/SIGSEGV/SIGABRT) get their own parseable record in
+        # logs/gateway-crash.log. ``run_gateway`` arms this before asyncio.run; the arm here
+        # is for ``python -m gateway.run`` and is a no-op when already armed. faulthandler
+        # used to write these dumps to stderr — i.e. into gateway.error.log among every other
+        # line, with nothing an exit-diag row or a soak gate could key on (PRA-6669). The
+        # recorder's descriptor is opened once and held for the process lifetime, so a death
+        # under memory pressure cannot fail on the handle it needs.
+        from gateway.crash_recorder import arm as _arm_crash_recorder
+
+        _arm_crash_recorder(getattr(self.config, "log_dir", None))
         # SIGUSR2 stack dump to file for service managers that drop stderr; POSIX-only.
         # chain=False: SIGUSR2's default disposition is "terminate", so chaining to it
         # dumps the stacks and then kills the gateway the operator was trying to inspect.

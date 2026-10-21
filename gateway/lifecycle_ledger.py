@@ -185,6 +185,31 @@ def stamp_restart_request(requester: Optional[dict[str, Any]], *, source: str,
         logger.debug("Failed to stamp the restart requester", exc_info=True)
 
 
+def _crash_evidence(home: Optional[Path], prior_pid: Any = None) -> dict[str, Any]:
+    """``prior_crash_*`` fields for a death that left a fatal-signal record, else ``{}``.
+
+    ``gateway-crash.log`` is written by the dying process from signal context
+    (``gateway.crash_recorder``); naming the signal here is what separates "died hard" from
+    "died hard of SIGBUS" on the row the soak gates key on (PRA-6669). A record whose pid is
+    not the sentinel's previous owner belongs to an older life and is not this boot's news.
+    """
+    try:
+        from gateway.crash_recorder import CRASH_LOG_NAME, prior_crash
+
+        crash = prior_crash(path=_home_path(home, "logs", CRASH_LOG_NAME))
+    except Exception:
+        logger.debug("Could not read the fatal-signal crash record", exc_info=True)
+        return {}
+    if not crash or (prior_pid is not None and crash.get("pid") != prior_pid):
+        return {}
+    fields: dict[str, Any] = {"prior_crash_ts": crash.get("ts"), "prior_crash_reason": crash.get("reason"),
+                              "prior_crash_pid": crash.get("pid")}
+    if crash.get("signal"):
+        fields["prior_crash_signal"] = crash["signal"]
+        fields["prior_crash_signal_number"] = crash.get("signal_number")
+    return fields
+
+
 def detect_unclean_exit(home: Optional[Path] = None) -> Optional[dict[str, Any]]:
     """Evidence dict when the previous life died uncleanly, else ``None``. Read-only."""
     sentinel = _read_json(get_lifecycle_sentinel_path(home))
@@ -210,6 +235,7 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[dict[str, Any]]
         evidence["last_heartbeat_mem"] = mem
         if _suspected_oom(mem):
             evidence["suspected_oom"] = True
+    evidence.update(_crash_evidence(home, evidence.get("prior_pid")))
     return evidence
 
 
@@ -331,12 +357,23 @@ def _report_unclean_exit(evidence: dict[str, Any], home: Optional[Path], *, defe
                 verdict,
             )
     _append_exit_diag({"ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(), **evidence}, home)
+    if evidence.get("prior_crash_signal"):
+        # A knob the soak gates and restart watchdogs read: "no deploy occurred, the window
+        # still restarted" (PRA-6502 / PRA-6380) must be distinguishable from a clean run of
+        # boots. One line, distinct tag, the signal that killed the process (PRA-6669).
+        _append_exit_diag({"ts": _now_iso(), "tag": "gateway.soak_window_reset", "pid": os.getpid(),
+                           "reason": "crash_signal",
+                           "prior_crash_signal": evidence["prior_crash_signal"],
+                           "prior_crash_ts": evidence.get("prior_crash_ts"),
+                           "prior_pid": evidence.get("prior_pid")}, home)
     logger.warning(
         "Previous gateway life (pid=%s, started_at=%s) exited UNCLEANLY (no exit path ran — SIGKILL / OOM / "
         "VM death, or a process kill issued by the agent or one of its descendants, e.g. a pkill/taskkill of "
-        "the host interpreter image; see #113667). last_heartbeat_at=%s last_mem=%s suspected_oom=%s",
+        "the host interpreter image; see #113667). last_heartbeat_at=%s last_mem=%s suspected_oom=%s "
+        "crash_signal=%s",
         evidence.get("prior_pid"), evidence.get("prior_started_at"), evidence.get("last_heartbeat_at"),
         evidence.get("last_heartbeat_mem"), evidence.get("suspected_oom", False),
+        evidence.get("prior_crash_signal"),
     )
 
 

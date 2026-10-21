@@ -195,6 +195,22 @@ loop-liveness watchdog writes to `gateway.error.log` when the loop stops
 dispatching (below), or the one a blocked-loop deadline writes — both are built
 from `sys._current_frames()` and cannot crash the process.
 
+### Fatal-signal crash records (`SIGBUS` / `SIGSEGV` / `SIGABRT`)
+
+A death by fatal signal runs no exit path — not `atexit`, not the gateway's
+shutdown tail — so it used to leave nothing a later boot could read. The gateway
+now arms `faulthandler` for those signals with a descriptor opened once at boot
+and writes every life's record to `~/.hermes/logs/gateway-crash.log`: one JSON
+header line per boot (`ts`, `pid`, `python`, `platform`, `signals`), then the
+faulting thread's stack if the life ended on a fatal signal. Only the thread that
+received the signal is dumped, for the reason above.
+
+The next boot reads that tail and names the cause: `gateway-exit-diag.log` gains
+`prior_crash_signal` / `prior_crash_ts` on its `gateway.previous_unclean_exit`
+row, plus a distinct `gateway.soak_window_reset` row with
+`reason: crash_signal`, so "the process died hard" and "the process died hard of
+`SIGBUS`" are different rows.
+
 ### Built-in event-loop liveness watchdog
 
 On every platform the gateway runs an out-of-loop watchdog thread that probes

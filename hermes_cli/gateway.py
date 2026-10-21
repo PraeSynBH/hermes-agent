@@ -4590,6 +4590,13 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     )
     _atexit.register(lambda: _exit_diag("atexit.hook", sys_exc=repr(sys.exc_info())))
 
+    # A fatal signal runs no exit path at all — not this atexit hook, not the SystemExit arm
+    # below (2026-10-21: pid 12392 died of SIGBUS with no exit-diag row, PRA-6669). Arm the
+    # recorder before the loop so even a crash during startup leaves a record; it is
+    # idempotent, so the runner's later arm keeps this descriptor.
+    from gateway.crash_recorder import arm as _arm_crash_recorder
+    _arm_crash_recorder()
+
     _respawn_storm_backoff()
 
     def _hard_exit_after_gateway_teardown(code: int) -> None:
