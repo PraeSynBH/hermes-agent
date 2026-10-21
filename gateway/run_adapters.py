@@ -995,11 +995,19 @@ class GatewayAdapterLifecycleMixin:
         connected = 0
         claimed = self._primary_resource_claims(active)
         # Demand feeds the ceiling's ranking; read it once, off the loop, before the boot set is
-        # recorded (which publishes the first serving decision).
+        # recorded (which publishes the first serving decision). Boot starts that read as a task
+        # beside the boot imports (SOU-3125) — awaiting the SAME task here, after runner init, is
+        # what makes the 15–22 s of plugin discovery overlap startup instead of extending it.
+        # ``snapshot()`` itself never reads, so a cold rank only means this was skipped.
         from hermes_cli import gateway_multiplex_capacity
         if gateway_multiplex_capacity.profile_ceiling() is not None:
             from hermes_cli import gateway_multiplex_demand
-            await asyncio.to_thread(gateway_multiplex_demand.refresh)
+            started = getattr(self.config, "_demand_prewarm_task", None)
+            with _log_suppressed(logging.DEBUG, "demand pre-warm failed", exc_info=True):
+                if started is not None:
+                    await started
+                else:
+                    await asyncio.to_thread(gateway_multiplex_demand.refresh)
         profile_homes = _multiplex_profile_homes(self.config)
         self._served_profile_signatures = {}
         transient_failed = set()

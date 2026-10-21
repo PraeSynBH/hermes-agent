@@ -695,6 +695,27 @@ async def _start_gateway_run_runner(runner, _signal_initiated_shutdown: list) ->
     return None
 
 
+def _start_gateway_early_demand_prewarm(config: Any) -> None:
+    """Start the demand snapshot's one authoritative read beside boot (SOU-3125).
+
+    ``gateway_multiplex_demand.snapshot()`` no longer reads (a cold call cost 15–22 s of one-time
+    plugin discovery — inside cold boot, and on the event loop). Without this task the boot rank
+    would stay cold until the first reconcile tick. Started here, the read overlaps runner init,
+    control-socket setup and profile-scope resolution; the adapter startup awaits the SAME task
+    before the served set is recorded, so the published decision is built on real facts without
+    boot waiting for them serially. Never raises: no task just means the documented cold rank.
+    """
+    try:
+        from hermes_cli import gateway_multiplex_capacity as capacity
+        if capacity.profile_ceiling() is None:
+            return
+        import asyncio
+        from hermes_cli import gateway_multiplex_demand as demand
+        config._demand_prewarm_task = asyncio.create_task(asyncio.to_thread(demand.refresh))
+    except Exception:
+        logger.debug("early demand pre-warm did not start", exc_info=True)
+
+
 def _start_gateway_early_environment_probe() -> None:
     """Background-start the host toolchain probe the warm-up and first prompt read (idempotent;
     honours ``agent.environment_probe: false``). Never raises: the warm-up still runs it lazily."""
@@ -749,6 +770,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # The first turn's prompt needs the host toolchain probe (five subprocess calls); start it now
     # so it runs beside the boot imports instead of serially inside the pre-READY warm-up.
     _start_gateway_early_environment_probe()
+    # Beside the probe, not before the adapters: the demand read must overlap the rest of boot, and
+    # the rank it feeds is cold (priority-only) until it lands — by design for <= 30 s (SOU-3125).
+    if getattr(resolved_config, 'multiplex_profiles', False):
+        _start_gateway_early_demand_prewarm(resolved_config)
     profile_homes = (_multiplex_profile_homes(resolved_config)
                      if getattr(resolved_config, 'multiplex_profiles', False) else [])
     if profile_homes and not _launch_home_may_multiplex(resolved_config):
