@@ -40,6 +40,31 @@ _PROFILE_SIGNATURE_FILES = ("config.yaml", ".env")
 _OWN_GATEWAY_PROBE_TIMEOUT_SECS = 5.0
 
 
+def _load_profile_serving_config(profile_home: Path) -> tuple[Dict[str, Any], Any, Optional[str]]:
+    """``(runtime config, gateway config, open-policy violation)`` for a profile about to be served.
+
+    Runs in a worker thread (``asyncio.to_thread``) because it reads that profile's YAML and walks
+    the plugin tree and every installed entry point — three times over, since two of these reads
+    discover plugins as a side effect. Inline on the loop that walk is what the 2026-10-19
+    starvation dump caught: ``task_step`` -> ``gen_iternext`` -> ``_io_open`` inside
+    ``importlib.metadata.entry_points`` (PRX-5524). ``asyncio.to_thread`` copies the context, so the
+    profile scope entered here belongs to the worker: every read below sees THIS profile, wherever
+    the loop's own ambient scope points. Only gateway-state mutations stay on the loop.
+    """
+    from gateway.run import (
+        _load_gateway_config, _own_policy_open_startup_violation, _profile_runtime_scope,
+    )
+    from gateway.config import load_gateway_config
+    from hermes_cli.plugins import discover_plugins
+    with _profile_runtime_scope(profile_home, hydrate_secrets=False):
+        runtime_cfg = _load_gateway_config()
+        discover_plugins()  # idempotent; registers this profile's plugins process-wide
+        cfg = load_gateway_config()
+        # Reads the same config + plugin entries, and discovers plugins; keep it in this scope.
+        violation = _own_policy_open_startup_violation(cfg)
+    return runtime_cfg, cfg, violation
+
+
 def _stat_signature(path: Path) -> Optional[tuple]:
     try:
         return file_signature(os.stat(path))

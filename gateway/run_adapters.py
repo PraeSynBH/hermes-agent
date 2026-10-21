@@ -1092,28 +1092,25 @@ class GatewayAdapterLifecycleMixin:
         ``MultiplexConfigError`` (open dm/group policy). Port-binding platforms are NOT refused: the
         default profile owns the single shared listener and a secondary's port-binders are built in
         shared-listener mode (``/p/<profile>/...``) by ``_start_one_profile_adapters``."""
-        from gateway.run import (
-            MultiplexConfigError, _load_gateway_config,
-            _own_policy_open_startup_violation, _profile_runtime_scope,
-        )
-        from gateway.config import load_gateway_config
+        from gateway.run import MultiplexConfigError, _profile_runtime_scope
         from hermes_cli.env_loader import hydrate_profile_secret_sources
         # Hydrate external secret sources off-loop ONCE: sync hydration would stall every heartbeat.
         await asyncio.to_thread(hydrate_profile_secret_sources, profile_home)
         # A platform that left core for a catalog plugin is installed before discovery below.
         from gateway.run_startup import recover_left_core_in
         await asyncio.to_thread(recover_left_core_in, profile_home, hydrate_secrets=False)
+        # Config + plugin discovery off-loop too: the entry-point walk is the loop stall PRX-5524
+        # traced (``gen_iternext`` -> ``_io_open``). Only the gateway-state mutations stay here.
+        from gateway.run_profile_reconcile import _load_profile_serving_config
+        profile_runtime_cfg, profile_cfg, violation = await asyncio.to_thread(
+            _load_profile_serving_config, profile_home)
+        from hermes_cli.plugins import get_plugin_manager
         with _profile_runtime_scope(profile_home, hydrate_secrets=False):
-            profile_runtime_cfg = _load_gateway_config()
-            from hermes_cli.plugins import discover_plugins, get_plugin_manager
-            discover_plugins()
             self._subscribe_plugin_rewire(get_plugin_manager(), profile_name, profile_home)
             # This profile's `hooks:` block: start() registered before any profile scope existed.
             self._register_config_hooks(
                 "shell-hook/webhook registration failed for profile '%s'", profile_name, level=logging.WARNING,
             )
-            profile_cfg = load_gateway_config()
-            violation = _own_policy_open_startup_violation(profile_cfg)
         self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
         if violation:
             raise MultiplexConfigError(
