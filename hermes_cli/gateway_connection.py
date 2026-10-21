@@ -192,6 +192,19 @@ class GatewayConnection:
         # owner will not bind it to is refused as the thin client refuses it, never attached plain.
         self.launch_api_key_typed = False
 
+    @property
+    def new_work(self) -> bool:
+        """This process has a turn to place, so admission must reach an owner that can take it.
+
+        A finite run (``hermes -q``/``-z``, or a ``chat -q`` child: ``HERMES_SINGLE_QUERY_SESSION``)
+        creates a session and submits exactly one prompt. A restart's after-turn wait is attachable
+        but its claim path is closed (PRX-5787), so attaching to it spends the spawn to die at the
+        first ``session.create`` with ``runtime_draining`` (PRX-5791). An interactive viewer attaches
+        anyway: answering the prompt parked on its own turn is why the wait stays reachable.
+        """
+        from agent.session_source import ONESHOT_SOURCE, session_source_for
+        return session_source_for("cli") == ONESHOT_SOURCE
+
     @classmethod
     def shared(cls):
         with cls._shared_lock:
@@ -283,7 +296,7 @@ class GatewayConnection:
             from hermes_cli.gateway_client import connect_gateway
             connect = connect_gateway
         try:
-            async with connect() as client:
+            async with connect(**({"new_work": True} if self.new_work else {})) as client:
                 if self.epoch:
                     await self._resubscribe(client)
                 self.epoch += 1

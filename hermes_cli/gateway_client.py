@@ -74,6 +74,10 @@ UPDATE_FENCE_POLL_INTERVAL_S = 2.0
 # still `starting` (a cold boot longer than the per-call cap), so the rest of the admission budget
 # is spent watching an owner that IS coming up instead of reporting it as a failure.
 BOOT_POLL_INTERVAL_S = 1.0
+# A restart's after-turn wait (`draining`/`restart_wait`) is re-observed this often by a client that
+# has new work to place. That owner answers identify in milliseconds and its drain is bounded by its
+# own cap, so a drain shorter than a second costs a wake-up rather than a run (PRX-5791).
+DRAIN_POLL_INTERVAL_S = 1.0
 # The bound on sampling the owner's loop at the moment this run dies at admission: the owner is
 # already stalling, so the probe is allowed less than the slack a healthy loop answers in
 # milliseconds, and a no-answer is reported as a floor (``owner_loop>2s``), never as healthy.
@@ -470,11 +474,13 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, 
 
 
 @asynccontextmanager
-async def connect_gateway(endpoint=None, subject=None):
+async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
     """Attach to this home's owner. ``endpoint``: an already-discovered ready owner to dial as-is
     (maintenance that must never start a gateway); default ensures one, starting it if needed.
     ``subject``: mint the ticket for this principal (the caller's authenticated dashboard user)
-    rather than the socket identity; only a peer the owner already trusts may name one."""
+    rather than the socket identity; only a peer the owner already trusts may name one.
+    ``new_work``: this client has a turn to place, so it must not attach to an owner that is only
+    held reachable for its in-flight work (a restart's after-turn wait) — see ``admit_owner``."""
     from websockets.asyncio.client import connect
     from hermes_constants import get_hermes_home
     from hermes_cli.gateway_runtime import (DEFAULT_ENSURE_TIMEOUT, attachable, boot_evidence,
@@ -538,7 +544,7 @@ async def connect_gateway(endpoint=None, subject=None):
     async def admit_owner(home):
         """Ensure an owner, waiting out what legitimately takes time instead of failing at it.
 
-        Two states are WAITS inside this run's one admission budget, not verdicts:
+        Three states are WAITS inside this run's one admission budget, not verdicts:
 
         * ``update_paused`` — an update owns the install for minutes (2026-10-19: 18:54-19:03Z) and
           every run started in that window died in under a second on
@@ -551,17 +557,26 @@ async def connect_gateway(endpoint=None, subject=None):
           (PRX-5625: 21 runs in 24 h in this company, 151 host-wide). Keep observing it for as long
           as the budget lasts; a boot that outlives the budget is named as a boot, not as a
           mystery string.
+        * a restart's after-turn wait (``draining``/``restart_wait``) for a client that has NEW WORK
+          (``new_work``) — that owner stays attachable so a turn parked on approval/clarify can be
+          answered (#139041), but its claim path is closed from T=0 of the drain (PRX-5787). A
+          spawn that attaches to it boots and dies at its first ``session.create``/submit with
+          ``runtime_draining``: 101 failed heartbeat runs across the 21:38 and 23:05-23:25 drains,
+          every one a run spent on a wait. Wait for the owner that replaces it instead — the drain
+          is bounded by the owner's own cap and the boot after it is the ``starting`` wait above
+          (PRX-5791). An interactive client keeps attaching: answering the parked prompt is its job.
         """
         nonlocal phase
         fence = None
         boot = None
+        drain = None
         while True:
             # The per-attempt cap is the boot deadline (now above the measured boot cost); the
             # whole loop is bounded by the one admission budget, so a lower cap can only cost
             # re-observation, never a run.
             cap = left(DEFAULT_ENSURE_TIMEOUT)
             if cap <= 0:
-                if fence is None and boot is None:
+                if fence is None and boot is None and drain is None:
                     raise spent("Gateway connection failed; no local fallback "
                                 f"(phase={phase}, elapsed={time.monotonic() - started:.1f}s, "
                                 "admission budget spent before an owner could be ensured)")
@@ -573,6 +588,13 @@ async def connect_gateway(endpoint=None, subject=None):
                     break
                 phase = "update-fence"
                 await asyncio.sleep(min(UPDATE_FENCE_POLL_INTERVAL_S, left(UPDATE_FENCE_POLL_INTERVAL_S)))
+                continue
+            if new_work and result.state == "draining" and attachable(result):
+                drain = f"{result.state}: {result.reason_code or 'draining'}"
+                if left(1.0) <= 0:
+                    break
+                phase = "runtime-drain"
+                await asyncio.sleep(min(DRAIN_POLL_INTERVAL_S, left(DRAIN_POLL_INTERVAL_S)))
                 continue
             if result.state == "starting":
                 boot = f"{result.state}: {result.reason_code or 'not_ready'}"
@@ -591,6 +613,12 @@ async def connect_gateway(endpoint=None, subject=None):
             raise spent(f"Gateway connection failed; no local fallback (phase=runtime-boot, "
                         f"elapsed={time.monotonic() - started:.1f}s, owner was still booting at "
                         f"the budget: {boot}, boot deadline {DEFAULT_ENSURE_TIMEOUT:g}s{evidence})")
+        if drain is not None:
+            # The drain outlived the budget: the owner is going away, not serving this run, and
+            # nothing was ever submitted (so a retry chain may legitimately re-dispatch it).
+            raise spent(f"Gateway connection failed; no local fallback (phase=runtime-drain, "
+                        f"elapsed={time.monotonic() - started:.1f}s, the owner was still in its "
+                        f"restart wait at the budget: {drain}; nothing was submitted)")
         # The fence outlived the budget. This is not owner starvation — an install update holds the
         # install — so the failure keeps the class a retry chain already handles (the owner is
         # draining, not starving) and spends its words on WHO held it and how long we waited.
