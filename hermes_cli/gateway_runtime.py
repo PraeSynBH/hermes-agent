@@ -283,8 +283,20 @@ def _served_by_multiplexer(home: Path, *, timeout: float) -> GatewayDiscovery | 
         if host_serves_named_profile(root, home) is False:
             return None
         return named
-    except (FileNotFoundError, ConnectionRefusedError, TimeoutError, DiscoveryError,
-            OSError, ValueError, TypeError):
+    except (FileNotFoundError, ConnectionRefusedError):
+        return None  # nothing is listening on the root: this host has no multiplexer here
+    except TimeoutError:
+        # The root ACCEPTED the connection and did not answer. That is not "no multiplexer": reading
+        # it as one sent the caller to the profile's own start path, where the borrowable
+        # ``gateway.lock`` (held by the very multiplexer) supplied the word "starting" and the run
+        # spent its whole budget on a boot that was not happening — 4 runs 2026-10-20T23:03-00:21Z,
+        # `elapsed=120.0s ... owner was still booting at the budget`, on a daemon serving sessions
+        # the entire time (PRX-5774). The retryable control-timeout verdict keeps the run in the
+        # observation loop, which re-probes inside its own budget and names the stall only if it
+        # really outlives it.
+        return GatewayDiscovery("inaccessible", reason_code="control_timeout",
+                                detail=_control_timeout_detail(root, timeout))
+    except (DiscoveryError, OSError, ValueError, TypeError):
         return None
     result = _endpoint(payload, home, control_home=root)
     if result.state == "inaccessible" and result.reason_code == "profile_mismatch":
