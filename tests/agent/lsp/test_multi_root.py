@@ -14,13 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from agent.lsp.client import _folder
-from agent.lsp.manager import LSPService, _UNTRUSTED_SHARED
+from agent.lsp.manager import LSPService
 from agent.lsp.servers import SERVERS, ServerContext, ServerDef, SpawnSpec
 from agent.lsp.workspace import clear_cache
 
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
-
 
 
 @pytest.fixture(autouse=True)
@@ -123,59 +121,5 @@ def test_single_root_server_still_spawns_per_root(two_repos, mock_pyright, monke
         assert spawns["value"] == 2
         assert set(svc._clients) == {("pyright", str(repo_a)), ("pyright", str(repo_b))}
         assert not folders_log.exists()
-    finally:
-        svc.shutdown()
-
-
-def test_untrusted_roots_share_one_multi_root_client(two_repos, mock_pyright, monkeypatch, tmp_path):
-    """Roots the operator never opened are the common gateway case (agent worktrees, run scratch
-    dirs): one server for all of them, not one process each.  Regression for the live gateway
-    holding five ``pyright`` processes (~1 GiB) for five untrusted worktrees.
-    """
-    repo_a, repo_b = two_repos
-    spawns, folders_log, install = mock_pyright
-    install(multi_root=True)
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    svc = _service()
-    try:
-        monkeypatch.chdir(str(elsewhere))
-        svc.get_diagnostics_sync(str(repo_a / "x.py"))
-        svc.get_diagnostics_sync(str(repo_b / "x.py"))
-
-        assert spawns["value"] == 1
-        assert set(svc._clients) == {("pyright", _UNTRUSTED_SHARED)}
-        client = next(iter(svc._clients.values()))
-        assert client.workspace_folders == [str(repo_a), str(repo_b)]
-        events = [json.loads(line) for line in folders_log.read_text(encoding="utf-8").splitlines()]
-        assert [(e["event"]["removed"], e["event"]["added"]) for e in events] == [([], [_folder(str(repo_b))])]
-    finally:
-        svc.shutdown()
-
-
-def test_root_that_becomes_trusted_moves_off_the_untrusted_client(two_repos, mock_pyright, monkeypatch, tmp_path):
-    """Trust only grows, so a root first served by the untrusted client must migrate to the trusted
-    one — and the untrusted client must not keep serving it (two servers for one root is the
-    duplication this service exists to prevent).
-    """
-    repo_a, _repo_b = two_repos
-    spawns, _folders_log, install = mock_pyright
-    install(multi_root=True)
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    svc = _service()
-    try:
-        monkeypatch.chdir(str(elsewhere))
-        svc.get_diagnostics_sync(str(repo_a / "x.py"))
-        assert set(svc._clients) == {("pyright", _UNTRUSTED_SHARED)}
-
-        monkeypatch.chdir(str(repo_a))
-        svc.get_diagnostics_sync(str(repo_a / "x.py"))
-
-        # The trusted client took the root over; the untrusted one had nothing else to serve.
-        assert spawns["value"] == 2
-        assert set(svc._clients) == {("pyright", "")}
-        client = next(iter(svc._clients.values()))
-        assert client.workspace_folders == [str(repo_a)]
     finally:
         svc.shutdown()

@@ -12,7 +12,6 @@ returns only diagnostics not in it).  Off unless config enables it.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import fnmatch
 import logging
 import math
@@ -37,12 +36,6 @@ MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait bu
 
 _Key = tuple[str, str]
 _Diags = list[dict[str, Any]]
-
-# ``_Key[1]`` sentinel for the client serving *untrusted* roots of a multi-root server.  Trusted
-# roots share the ``""`` key; untrusted ones must not join it (they are spawned with the restricted
-# spec — no project interpreter — and a shared process keeps the trust it was spawned with), so
-# before this bucket each untrusted root got a private key and therefore a private process.
-_UNTRUSTED_SHARED = "\x00untrusted"
 
 
 def _float_or(value: Any, default: float) -> float:
@@ -81,15 +74,10 @@ def parse_trusted_workspaces(value: Any) -> list[str]:
 
 
 def _client_key(srv: ServerDef, root: str, trusted: bool) -> _Key:
-    """Cache key for the client serving ``root``: a multi-root server (pyright) runs ONE process for
-    all trusted roots and ONE for all untrusted roots, so a session that touches thirty worktrees
-    still spawns two servers, not thirty.  Untrusted roots never join the trusted client (a shared
-    process keeps the trust its first root spawned it with) and vice versa, which is why the
-    untrusted client has a sentinel key of its own instead of a root.  Single-root servers are
-    keyed per resolved project root."""
-    if not srv.multi_root:
-        return (srv.server_id, root)
-    return (srv.server_id, "" if trusted else _UNTRUSTED_SHARED)
+    """Cache key for the client serving ``root``: multi-root servers share one process per
+    ``server_id`` across trusted roots; everything else, untrusted roots included, is keyed per
+    resolved project root (a shared process keeps the trust its first root spawned it with)."""
+    return (srv.server_id, "" if srv.multi_root and trusted else root)
 
 
 class _BackgroundLoop:
@@ -304,11 +292,9 @@ class LSPService:
         return is_trusted_workspace(root, self._trusted_workspaces, self._operator_roots)
 
     def _live_key(self, srv: ServerDef, root: str) -> _Key:
-        """The client key holding ``root`` right now (under ``_state_lock``): the client actually in
-        ``_clients``/``_spawning`` for this root when one exists, else the key this root maps to
-        today.  A single-root server keeps one key per root forever; a multi-root server's key
-        depends on trust, which only grows, so a root that becomes trusted moves to the trusted
-        client (:meth:`_attach_root` detaches it from the untrusted one)."""
+        """The client key for ``root`` (under ``_state_lock``): a multi-root server started while
+        ``root`` was untrusted keeps its own client after ``root`` becomes trusted, so it is found and
+        released rather than orphaned."""
         own = (srv.server_id, root)
         return own if own in self._clients or own in self._spawning else _client_key(srv, root, self._trusted(root))
 
@@ -602,10 +588,9 @@ class LSPService:
             return None
         with self._state_lock:
             key = self._live_key(srv, root)
-            # Derived from the key, not re-read: trust only grows, so a second read could store an
+            # Derived with the key: trust only grows, so one read before the lock could store an
             # untrusted spawn under the shared multi-root key every trusted root then attaches to.
-            # The untrusted bucket of a multi-root server is untrusted by construction.
-            trusted = key[1] == "" or (key[1] != _UNTRUSTED_SHARED and self._trusted(root))
+            trusted = key[1] == "" or self._trusted(root)
             client = self._clients.get(key)
             if client is not None and client.is_running:
                 self._last_used[key] = time.time()
@@ -640,48 +625,19 @@ class LSPService:
                     self._last_used[key] = time.time()
                 eventlog.log_active(srv.server_id, root)
             spawning.set_result(client)
-            return await self._attach_root(srv, client, root) if client is not None else None
+            return client
         finally:
             with self._state_lock:
                 self._spawning.pop(key, None)
             if not spawning.done():
                 spawning.cancel()  # owner cancelled/failed mid-spawn: release the waiters
 
-    async def _attach_root(self, srv: ServerDef, client: LSPClient, root: str) -> LSPClient:
-        """Multi-root servers: announce ``root`` to the shared process instead of spawning another,
-        then drop it from any other client of the same server.
-
-        The detach is what makes a trust transition cost one process instead of two: a root first
-        seen untrusted was attached to the untrusted client, and once it is trusted this call puts
-        it on the trusted one — without the detach the old client would keep the folder (and its
-        memory) alive for the rest of the idle timeout while the root ran two servers.
-        """
-        if not srv.multi_root:
-            return client
-        await client.add_workspace_folder(root)
-        await self._detach_root_from_others(srv, client, root)
+    @staticmethod
+    async def _attach_root(srv: ServerDef, client: LSPClient, root: str) -> LSPClient:
+        """Multi-root servers: announce ``root`` to the shared process instead of spawning another."""
+        if srv.multi_root:
+            await client.add_workspace_folder(root)
         return client
-
-    async def _detach_root_from_others(self, srv: ServerDef, keep: LSPClient, root: str) -> None:
-        """:meth:`_attach_root`'s other half; a client left with no workspace folders is shut down."""
-        with self._state_lock:
-            stale = [(key, c) for key, c in self._clients.items()
-                     if c is not keep and c.server_id == srv.server_id and root in c.workspace_folders]
-            doomed = {key for key, c in stale if c.workspace_folders == [root]}
-            for key in doomed:
-                self._clients.pop(key, None)
-                self._last_used.pop(key, None)
-        for key, old in stale:
-            if key in doomed:
-                eventlog.log_released([(old.server_id, old.workspace_root)],
-                                      "root moved to a client with the right trust")
-                with contextlib.suppress(Exception):
-                    await old.shutdown()
-                continue
-            try:
-                await old.remove_workspace_folder(root)
-            except Exception as e:  # a server already dying: the root is gone from the map either way
-                logger.debug("LSP folder removal of %s from %s failed: %s", root, old.server_id, e)
 
     async def _spawn_client(self, srv: ServerDef, root: str, trusted: bool) -> Optional[LSPClient]:
         """Resolve the binary and start a client; ``None`` (after logging) when either fails."""
