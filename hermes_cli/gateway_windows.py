@@ -16,6 +16,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -60,6 +61,32 @@ _TASK_RESTART_INTERVAL = "PT1M"
 _TASK_RESTART_COUNT = 999
 
 _GATEWAY_ENV = (("PYTHONIOENCODING", "utf-8"), ("HERMES_GATEWAY_DETACHED", "1"), ("HERMES_SUPERVISED_CHILD", "1"))
+
+
+def _stdin_is_tty() -> bool | None:
+    """``sys.stdin.isatty()``; None when stdin is closed/invalid."""
+    try:
+        return bool(sys.stdin and sys.stdin.isatty())
+    except (ValueError, OSError):
+        return None
+
+
+def _absorb_windows_console_controls() -> None:
+    """Make a detached Windows gateway ignore console-control broadcasts from sibling CLIs."""
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        sigbreak = getattr(signal, "SIGBREAK", None)  # Windows only; absent on POSIX stubs
+        if sigbreak is not None:
+            signal.signal(sigbreak, signal.SIG_IGN)
+    except (OSError, ValueError):
+        pass  # SetConsoleCtrlHandler unavailable (rare) — best-effort
+    # signal only hooks SIGINT/SIGBREAK; SetConsoleCtrlHandler(NULL, TRUE) ignores ALL console
+    # control events (CTRL_CLOSE/CTRL_LOGOFF included), as background services should.
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, 1)  # type: ignore[attr-defined]
+    except (OSError, AttributeError):
+        pass
 
 
 def _schtasks_encoding() -> str:

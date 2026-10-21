@@ -27,7 +27,7 @@ def housekeeping_media_caches() -> None:
     from tools.bot_mode_dm import cleanup_bot_dm_cache
     from tools.bot_relay import cleanup_bot_relay_artifacts
     from agent.provider_media import MEDIA_CACHE_MAX_AGE_HOURS
-    from gateway.run import _housekeeping_chore
+    from gateway.run_housekeeping_chores import _housekeeping_chore
 
     for cache_name, cleanup_fn in (
         ("Image", cleanup_image_cache), ("Document", cleanup_document_cache),
