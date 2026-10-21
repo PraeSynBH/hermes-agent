@@ -319,6 +319,7 @@ Subcommands:
 | `start` | Start the installed systemd/launchd background service. |
 | `stop` | Stop the service (or foreground process). |
 | `restart` | Restart the service. |
+| `request-restart` | Ask a **running, supervised** gateway to restart itself: SIGUSR1 → refuse new turns, drain in-flight ones (the caller's turn ends normally), exit, and let the supervisor relaunch it. This is the only restart a process **inside** the gateway may issue — the terminal pre-execution guard allows this exact command and still refuses every other lifecycle spelling. Refuses (exit `1`) when no gateway is running, when it declares no supervisor, or when the caller is not a descendant of that gateway. |
 | `status` | Show service status. |
 | `list` | List **all profiles** and whether each profile's gateway is currently running (with PID where available). Handy when you run multiple profiles side-by-side and want a single overview. |
 | `install` | Install as a systemd (Linux) or launchd (macOS) background service. |

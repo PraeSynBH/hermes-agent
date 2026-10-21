@@ -89,7 +89,7 @@ def test_every_other_lifecycle_shape_still_refuses(tmp_path, command):
 def test_a_script_that_spells_a_restart_still_refuses(tmp_path):
     """The allowance is on the executed argv, never on a script that could hide the real verb."""
     script = tmp_path / "deploy.sh"
-    script.write_text("#!/bin/bash\nhermes gateway restart\n", encoding="utf-8")
+    script.write_text("#!/usr/bin/env bash\nhermes gateway restart\n", encoding="utf-8")
 
     blocked = _guard(tmp_path, f"bash {shlex.quote(str(script))}")
 
