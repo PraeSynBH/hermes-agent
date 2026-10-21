@@ -173,6 +173,19 @@ docs/superpowers/*
 # logs, and per-session caches are never artifacts of the codebase.
 .hermes/
 
+# graphify knowledge-graph output (GRAPH_REPORT.md, graph.json, cache/, wiki/).
+# `graphify .` writes it at onboarding and `graphify update .` rewrites it after
+# every code change, so it exists in any checkout an agent works in. It is
+# host-specific, regenerable and hundreds of MB here — never code, and never
+# committable (blob-size). Ignoring it also keeps a *shared* checkout green for
+# `python scripts/check`: the no-tmp guard and the blob-size guard both skip
+# git-ignored untracked paths, so this is what stops the graph's own .json
+# contents from being scanned as first-party text. The `!graphify-out/.gitkeep`
+# companion in the graphify onboarding guide cannot take effect under a
+# directory-level ignore; nothing in this tree is meant to be committed, so it
+# is deliberately not added.
+graphify-out/
+
 # Desktop/bootstrap install marker written into the managed checkout root by the
 # bootstrap installer. It is Hermes-managed runtime state, never a code change —
 # ignore it so `hermes update`'s `git stash push --include-untracked` does not
