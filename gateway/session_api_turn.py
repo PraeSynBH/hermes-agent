@@ -325,7 +325,16 @@ def recover_api_turns(adapter):
             recover_authority_api_turns(adapter, authority)
 
 
-def recover_authority_api_turns(adapter, authority):
+def _recoverable_api_sessions(authority):
+    """Store half of the API-turn recovery: the refs the owner loop must schedule.
+
+    Every read and write here is synchronous SQLite (the media sweeps, the queued-target query, and
+    per target the restore — its own row plus its admissions), so this half runs on a worker thread
+    whenever a caller can yield: boot and a hot profile serve both do it while the loop serves every
+    other profile (PRX-5780: the serve path's ``recover_served_native_rows`` sibling was the same
+    class). Only ``_schedule`` needs the loop, so it is the only caller-side step. A refused target
+    is logged and skipped; a store that cannot answer leaves its rows queued for the next start.
+    """
     from hermes_state_runtime import list_session_admissions
     from gateway.session_ingress_media import collect_unheld_api_images
     import logging
@@ -335,6 +344,7 @@ def recover_authority_api_turns(adapter, authority):
     with authority.db._read_ctx() as conn:
         targets = [row[0] for row in conn.execute(
             "SELECT DISTINCT target_session_id FROM session_admissions WHERE principal_id='api' AND status='queued'")]
+    refs = []
     for sid in targets:
         try:
             ref = restore_api_session(authority, sid)
@@ -344,9 +354,22 @@ def recover_authority_api_turns(adapter, authority):
             for row in pending:
                 if row['status'] == 'queued':
                     check_api_turn(authority, ref, row['payload'])
-            authority._schedule(ref)
+            refs.append(ref)
         except RuntimeStoreError as exc:
             logging.getLogger(__name__).warning('API session %s paused: %s', sid, exc.reason)
+    return refs
+
+
+def recover_authority_api_turns(adapter, authority):
+    """The inline flavour, for a caller already off the loop (boot's own thread) or a test."""
+    for ref in _recoverable_api_sessions(authority):
+        authority._schedule(ref)
+
+
+async def recover_authority_api_turns_offloop(adapter, authority):
+    """A hot serve's pass: the store work in a worker, only the task scheduling on the loop."""
+    for ref in await asyncio.to_thread(_recoverable_api_sessions, authority):
+        authority._schedule(ref)
 
 
 async def run_api_turn(adapter, *, approval_notify_callback=None, approval_session_key=None, **kwargs):

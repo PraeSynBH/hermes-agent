@@ -627,7 +627,7 @@ async def serve_profile_runtime(runner, name, home):
             # synchronous SQLite (45-122 s loaded), and this runs while the loop serves the others.
             await recover_local_sessions_offloop(authority, schedule=True)
             await recover_webhook_finalizations(authority)
-            _recover_published_api_turns(runner, authority)
+            await _recover_published_api_turns(runner, authority)
         if getattr(runner, 'session_control_server', None) is not None:
             await _ensure_hosted_service(runner, authority)
     except BaseException:
@@ -652,14 +652,15 @@ def _drop_retired_local_adapter(authority):
         del adapters[Platform.LOCAL]
 
 
-def _recover_published_api_turns(runner, authority):
+async def _recover_published_api_turns(runner, authority):
     """Boot recovers queued API turns when the launch API adapter is published
-    (``recover_api_turns``); a profile served after that runs the same pass on its own store."""
+    (``recover_api_turns``); a profile served after that runs the same pass on its own store — on a
+    worker thread, because this runs inside a 30 s reconcile tick whose every read is SQLite."""
     from gateway.config import Platform
     api = (getattr(runner, 'adapters', None) or {}).get(Platform.API_SERVER)
     if api is not None:
-        from gateway.session_api_turn import recover_authority_api_turns
-        recover_authority_api_turns(api, authority)
+        from gateway.session_api_turn import recover_authority_api_turns_offloop
+        await recover_authority_api_turns_offloop(api, authority)
 
 
 async def recover_served_native_rows(runner):
