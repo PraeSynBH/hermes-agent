@@ -1796,7 +1796,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         retry_interval = interval
         while True:
             await asyncio.sleep(retry_interval)
-            session = process_registry.get(session_id)
+            # Off-loop: ``get`` answers from memory in steady state, but a session that is no longer
+            # in either store (the tick that closes a finished watcher) falls back to the retained
+            # results — a directory scan plus a JSON read per file. On the loop that read is one of
+            # PRX-5524's blocked-loop dumps: _run_process_watcher -> process_registry.get.
+            session = await asyncio.to_thread(process_registry.get, session_id)
             if session is None:
                 break
             async with self._completion_event_scope(watcher):
