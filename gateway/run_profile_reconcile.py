@@ -136,9 +136,13 @@ class GatewayProfileReconcileMixin:
             if not self._running:
                 return
             try:
-                await self._sync_hooks_on_consent_change()
-                if self._multiplex_on():
-                    await self.reconcile_served_profiles(reason="watcher")
+                # Wall time of the tick, summarised (~10 min) beside the dumps: this ticker is the
+                # entry point of five of PRX-5524's blocked-loop dumps, so its trend is the evidence.
+                from gateway.loop_tick_timing import timed
+                with timed('profile_reconcile'):
+                    await self._sync_hooks_on_consent_change()
+                    if self._multiplex_on():
+                        await self.reconcile_served_profiles(reason="watcher")
             except asyncio.CancelledError:
                 raise
             except Exception:

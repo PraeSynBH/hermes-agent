@@ -554,8 +554,10 @@ class GatewayGoalsMixin:
                     if profile_home is not None and not await self._run_in_executor_with_context(
                             profile_has_active_loop, profile_home):
                         continue
-                    async with _scope(profile_home):
-                        await _scan_one_store(profile_name)
+                    from gateway.loop_tick_timing import timed
+                    with timed('loop_wakeup_scan'):
+                        async with _scope(profile_home):
+                            await _scan_one_store(profile_name)
             except Exception as exc:
                 logger.debug("loop wakeup watcher error: %s", exc)
             await asyncio.sleep(interval)
