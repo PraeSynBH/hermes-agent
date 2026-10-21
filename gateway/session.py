@@ -1113,13 +1113,18 @@ class SessionStore(
             entry = self._entry_locked(session_key)
             if entry is None or entry.model_override == cleaned:
                 return
-            # Publish only after persistence so a failed clear remains retryable.
-            data, generation = self._snapshot_routing_locked()
+            entries, generation = self._capture_routing_locked()
             # Snapshot reconciliation may replace the entry after database recovery.
             entry = self._entries[session_key]
-            data[session_key] = replace(entry, model_override=cleaned).to_dict()
-            self._persist_routing_data(data, generation)
-            entry.model_override = cleaned
+            candidate = replace(entry, model_override=cleaned).to_dict()
+        # Serialize, persist, and only then publish (a failed clear stays retryable) — all outside
+        # ``_lock``: the index rewrite is unbounded I/O and every loop-side reader waits on it.
+        data = self._entries_as_dicts(entries)
+        data[session_key] = candidate
+        self._persist_routing_data(data, generation)
+        with self._lock:
+            if self._entries.get(session_key) is entry:
+                entry.model_override = cleaned
 
     def set_session_yolo(self, session_key: str, enabled: Optional[bool]) -> bool:
         """Persist the lane's ``/yolo`` bypass (None: back to the launch policy); False when the key has no
@@ -1157,6 +1162,7 @@ class SessionStore(
                 source_value=old_entry.platform.value if old_entry.platform else "unknown",
                 display_name=old_entry.display_name, parent_session_id=old_entry.session_id,
             )
+        self._save()
         self._finish_route_transition(
             session_key, end_session_id=old_entry.session_id, end_reason="session_reset",
             create_kwargs=db_create_kwargs, origin=old_entry.origin,
@@ -1165,14 +1171,17 @@ class SessionStore(
         return new_entry
 
     def _replace_route_locked(self, session_key, old_entry, session_id, now, **fields) -> SessionEntry:
-        """Publish a fresh entry (inheriting origin/platform/chat_type) and save. Lock held."""
+        """Publish a fresh entry (inheriting origin/platform/chat_type). Lock held.
+
+        Publishes only: the caller saves with ``_save()`` after releasing ``_lock``, or the index
+        rewrite would run inside the critical section (PRX-5789).
+        """
         new_entry = SessionEntry(
             session_key=session_key, session_id=session_id, created_at=now, updated_at=now,
             origin=old_entry.origin, platform=old_entry.platform, chat_type=old_entry.chat_type,
             transport_profile=old_entry.transport_profile, **fields,
         )
         self._entries[session_key] = new_entry
-        self._save()
         return new_entry
 
     def rekey_profile_routing(self, old_name: str, new_name: str) -> int:
@@ -1198,8 +1207,8 @@ class SessionStore(
                 if origin is not None and getattr(origin, "profile", None) == old:
                     origin = _dc_replace(origin, profile=new)
                 self._entries[new_key] = _dc_replace(entry, session_key=new_key, origin=origin)
-            if moving:
-                self._save()
+        if moving:
+            self._save()
         return len(moving)
 
     def purge_profile_routing(self, profile: str) -> int:
@@ -1218,8 +1227,8 @@ class SessionStore(
             dropped = [key for key in self._entries if key.startswith(ns)]
             for key in dropped:
                 self._entries.pop(key, None)
-            if dropped:
-                self._save()
+        if dropped:
+            self._save()
         return len(dropped)
 
     def remove_by_session_id(self, session_id: str) -> int:
@@ -1242,8 +1251,8 @@ class SessionStore(
                 hints = getattr(self, "_session_owner_hints", None)
                 if hints is not None:
                     hints.pop(session_id, None)
-                self._save()
         if dropped:
+            self._save()
             logger.info("SessionStore removed %d routing entr%s for deleted session %s",
                         len(dropped), "y" if len(dropped) == 1 else "ies", session_id)
         return len(dropped)
@@ -1285,6 +1294,7 @@ class SessionStore(
                     if preserve_prompt_pin and old_entry.prompt_pin is not None else None
                 ),
             )
+        self._save()
 
         if self._db_for_key(session_key) and old_entry.session_id:
             self._promote_session_reset(

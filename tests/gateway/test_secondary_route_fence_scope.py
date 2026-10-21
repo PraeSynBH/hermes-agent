@@ -195,8 +195,7 @@ async def test_a_shared_fence_an_earlier_release_wrote_still_guards_every_route(
         _past_the_horizon(served.launch.db)
         key = 'agent:alpha:telegram:9'
         store._entries[key] = _entry(key, 'gone')
-        with store._lock:
-            store._save()
+        store._save()
         assert key not in _durable(store)
         assert key not in json.loads((store.sessions_dir / 'sessions.json').read_text())
         store._save_sessions_json({key: store._entries.pop(key).to_dict()})  # an earlier release's unfiltered mirror
@@ -252,8 +251,7 @@ async def test_a_delayed_snapshot_cannot_restore_a_pruned_route_once_its_fence_a
 
         served.alpha.db.create_session(sid, source='telegram')
         store._entries[key] = _entry(key, sid)
-        with store._lock:
-            store._save()
+        store._save()
         assert key in _durable(store) and key in _mirror(store), 'the recreated id was refused a route'
         _restart(store)
         assert store._entries[key].session_id == sid
@@ -273,8 +271,7 @@ async def test_a_pruned_id_routes_again_after_the_owner_alone_sweeps_past_the_ho
 
         served.alpha.db.create_session(sid, source='telegram')
         store._entries[key] = _entry(key, sid)
-        with store._lock:
-            store._save()
+        store._save()
         assert key in _durable(store), 'an expired shared fence refused the recreated route'
         assert key in _mirror(store), 'an expired shared fence kept the recreated route out of sessions.json'
         _restart(store)
@@ -386,8 +383,7 @@ async def test_a_pruned_route_stays_out_of_the_mirror_and_a_reused_id_keeps_one_
                 'request_id': 'r', 'source': 'gui', 'cwd': str(tmp_path), 'model': 'frozen', 'toolsets': []})
             sid = ref.session_id
             store._entries[key] = _routed_entry(key, sid, '333')
-            with store._lock:
-                store._save()  # a full save while mirror writes are on
+            store._save()  # a full save while mirror writes are on
             assert key in _mirror(store)
             store._write_sessions_json = mirror
             await _prune(served, ref)
@@ -402,8 +398,7 @@ async def test_a_pruned_route_stays_out_of_the_mirror_and_a_reused_id_keeps_one_
         status, text = await _create(served, sid)  # the launch profile reuses the id
         assert status == 201, text
         store._entries[launch_key] = _routed_entry(launch_key, sid, '444')
-        with store._lock:
-            store._save()
+        store._save()
         _restart(store)
         routes = sorted(k for k, v in _durable(store).items() if json.loads(v).get('session_id') == sid)
         assert routes == [launch_key], routes
@@ -430,8 +425,7 @@ async def test_a_malformed_retirement_value_fences_its_route_without_aborting_a_
                   'agent:alpha:telegram:3': 'fine'}
         for key, sid in routes.items():
             store._entries[key] = _entry(key, sid)
-        with store._lock:
-            store._save()
+        store._save()
         assert set(_durable(store)) == {'agent:alpha:telegram:3'}, 'a malformed value aborted the whole-index save'
         for key in ('agent:alpha:telegram:1', 'agent:alpha:telegram:2'):
             store._routing_db.save_gateway_routing_entry(
