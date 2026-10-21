@@ -4,7 +4,6 @@ load/save paths (state.db gateway_routing primary, sessions.json legacy mirror).
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import json
 import threading
@@ -259,9 +258,32 @@ class SessionPersistenceMixin:
         self._db_handle_cache.close_all(_close)
 
     def _ensure_loaded(self) -> None:
-        """Load sessions index from disk if not already loaded."""
+        """Load sessions index from disk if not already loaded, then persist what the load changed."""
         with self._lock:
             self._ensure_loaded_locked()
+        self._flush_load_saves()
+
+    def _flush_load_saves(self) -> None:
+        """Persist what a cold load decided, with ``_lock`` released.
+
+        ``_ensure_loaded_locked`` runs inside a caller's critical section, so the whole-index
+        rewrite it owes (the retired-route import above all) is only recorded there: serializing the
+        index, the ``gateway_routing`` transaction and the sessions.json fsync are unbounded on a
+        loaded host, and a >10 s hold on ``_lock`` is exactly what a loop-side reader — the
+        ``restore_local_session`` frame in PRX-5789's dump — waits on.
+        """
+        rewriting = getattr(self, "_mirror_rewrite_pending", False)
+        if not (rewriting or getattr(self, "_load_save_pending", False)):
+            return
+        self._mirror_rewrite_pending = self._load_save_pending = False
+        self._save()
+        if rewriting and not getattr(self, "_write_sessions_json", True):
+            # That save left an existing mirror as it was: strip the routes from it directly,
+            # or every later start imports them again.
+            try:
+                self.strip_retired_mirror_routes()
+            except Exception:
+                logger.warning("gateway.session: could not strip retired routes from sessions.json", exc_info=True)
 
     def _entry_locked(self, session_key: str) -> Optional[SessionEntry]:
         """Load the index and return the entry for *session_key*. Lock held."""
@@ -361,15 +383,10 @@ class SessionPersistenceMixin:
         self._routing_fallback_baseline = None if db_load_succeeded else self._entries_as_dicts()
         if mirror_retired and db_load_succeeded:
             # Rewrite the mirror while the fences that kept those routes out still hold: a prune's
-            # ages out, and the import would then restore the retired route.
-            self._save()
-            if not getattr(self, "_write_sessions_json", True):
-                # That save left an existing mirror as it was: strip the routes from it directly,
-                # or every later start imports them again.
-                try:
-                    self.strip_retired_mirror_routes()
-                except Exception:
-                    logger.warning("gateway.session: could not strip retired routes from sessions.json", exc_info=True)
+            # ages out, and the import would then restore the retired route. The write happens with
+            # ``_lock`` released (``_flush_load_saves``): this load runs inside a caller's lock.
+            self._mirror_rewrite_pending = True
+            self._load_save_pending = True
         # A hard crash skips graceful shutdown and leaves sessions.json pointing at ended sessions.
         self._prune_stale_sessions_locked()
 
@@ -443,7 +460,7 @@ class SessionPersistenceMixin:
         for key in stale_keys:
             del self._entries[key]
         if stale_keys or recovered_keys:
-            self._save()
+            self._load_save_pending = True  # written by ``_flush_load_saves``, outside ``_lock``
 
     def _stale_entry_verdict(self, key: str, entry, row):
         """For a routing entry whose row has ended: ``"prune"``, a replacement entry (repoint), or
@@ -504,13 +521,38 @@ class SessionPersistenceMixin:
             "a crashed gateway", key, entry.session_id, row["end_reason"])
         return "prune"
 
-    def _entries_as_dicts(self) -> dict[str, Any]:
-        """Serializable snapshot of ``_entries``. Lock held."""
-        return {key: entry.to_dict() for key, entry in self._entries.items()}
+    def _entries_as_dicts(self, entries: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """Serializable form of *entries* (default ``_entries``).
+
+        Pure CPU, and the expensive half of a whole-index save: pass a mapping captured by
+        ``_capture_routing_locked`` so it runs with ``_lock`` released.
+        """
+        source = self._entries if entries is None else entries
+        return {key: entry.to_dict() for key, entry in source.items()}
 
     def _save(self) -> None:
-        """Persist the routing index while the caller holds ``_lock``."""
-        self._persist_routing_data(*self._snapshot_routing_locked())
+        """Persist the routing index: capture under ``_lock``, write after releasing it.
+
+        A caller that already holds ``_lock`` (a route transition applying several changes at once)
+        captures with ``_capture_routing_locked`` and calls ``_persist_routing_snapshot`` after its
+        critical section — never this.
+        """
+        self._save_entries()
+
+    def _capture_routing_locked(self) -> tuple[dict[str, Any], int]:
+        """``(entries, generation)``: the whole of a full save that needs ``_lock``. Lock held.
+
+        A shallow copy of the mapping is atomic to take; serializing those entries, writing
+        ``gateway_routing`` and fsyncing ``sessions.json`` are not — over ten seconds of that under
+        ``_lock`` on a loaded host is what blocked the loop's ``restore_local_session`` in PRX-5789.
+        """
+        self._reconcile_recovered_routing_locked()
+        return dict(self._entries), self._next_routing_generation_locked()
+
+    def _persist_routing_snapshot(self, snapshot: tuple[dict[str, Any], int]) -> None:
+        """Persist what ``_capture_routing_locked`` captured. Never called with ``_lock`` held."""
+        entries, generation = snapshot
+        self._persist_routing_data(self._entries_as_dicts(entries), generation)
 
     def _next_routing_generation_locked(self) -> int:
         """Bump and return the shared routing counter (lock held). Full snapshots AND single-entry
@@ -549,7 +591,11 @@ class SessionPersistenceMixin:
         self._routing_fallback_baseline = None
 
     def _snapshot_routing_locked(self) -> tuple[dict[str, Any], int]:
-        """Capture immutable routing data and a monotonic generation."""
+        """Capture immutable routing data and a monotonic generation. Lock held.
+
+        Serialized under the caller's lock — use ``_capture_routing_locked`` +
+        ``_persist_routing_snapshot`` outside it on any path the event loop can reach.
+        """
         self._reconcile_recovered_routing_locked()
         return self._entries_as_dicts(), self._next_routing_generation_locked()
 
@@ -601,13 +647,13 @@ class SessionPersistenceMixin:
 
     def _save_entries(self) -> None:
         """Snapshot latest state under ``_lock`` and persist after releasing it."""
+        self._flush_load_saves()
         with self._lock:
-            data, generation = self._snapshot_routing_locked()
-        self._persist_routing_data(data, generation)
+            snapshot = self._capture_routing_locked()
+        self._persist_routing_snapshot(snapshot)
 
     def _save_entry(
-        self, session_key: str, *, entry_data: Optional[dict[str, Any]] = None,
-        lock_held: bool = False) -> None:
+        self, session_key: str, *, entry_data: Optional[dict[str, Any]] = None) -> None:
         """Persist ONE routing entry via UPSERT — the per-turn fast path (a full rewrite fsyncs a
         multi-MB sessions.json). The key -> session_id mapping never changes here: structural
         transitions use the full rewrite (which also refreshes the sessions.json mirror; it may lag
@@ -615,9 +661,16 @@ class SessionPersistenceMixin:
         ``_save_lock`` the upsert is skipped if a full snapshot or a newer fast save of this key
         already persisted (the reverse case lives in ``_persist_routing_data``). No DB or a failed
         upsert falls back to the full rewrite. ``entry_data`` persists a candidate BEFORE it is
-        published to the live entry (failure-atomic transitions); the fallback carries it too."""
-        guard = contextlib.nullcontext() if lock_held else self._lock
-        with guard:
+        published to the live entry (failure-atomic transitions); the fallback carries it too.
+
+        Never called with ``_lock`` held: the UPSERT is I/O, and on a loaded host one fsync of the
+        sqlite file is unbounded — a caller that had ``_lock`` across it is what made a loop-side
+        ``restore_local_session`` wait >10 s (PRX-5789).
+        """
+        # A cold load records the rewrite it owes (retired-mirror import, stale prune) instead of
+        # writing it under the caller's lock; this is the first save after it, so it goes out here.
+        self._flush_load_saves()
+        with self._lock:
             entry = self._entries.get(session_key)
             if entry is None:
                 return
@@ -643,8 +696,9 @@ class SessionPersistenceMixin:
                     "to full index rewrite", session_key, exc)
         if entry_data is not None:
             # Full-snapshot fallback carrying the candidate transition.
-            with guard:
-                fallback_data = self._entries_as_dicts()
+            with self._lock:
+                entries = dict(self._entries)
+            fallback_data = self._entries_as_dicts(entries)
             fallback_data[session_key] = dict(entry_data)
             self._persist_routing_data(fallback_data, revision)
         else:

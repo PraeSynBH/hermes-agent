@@ -121,23 +121,23 @@ class SessionLifecycleMixin:
         return "suspended" if entry.suspended else None
 
     def _update_entry(self, session_key: str, mutate) -> bool:
-        """Apply ``mutate(entry)`` under ``_lock`` and full-save; False when the entry is missing
-        or *mutate* returned False (nothing to persist)."""
+        """Apply ``mutate(entry)`` under ``_lock``, then save after releasing it; False when the
+        entry is missing or *mutate* returned False (nothing to persist)."""
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None or mutate(entry) is False:
                 return False
-            self._save()
-            return True
+        self._save()
+        return True
 
     def _update_all_entries_locked(self, mutate) -> int:
-        """Apply ``mutate(entry) -> bool`` to every entry under ``_lock``; save once if any
-        returned True. Returns the count that did."""
+        """Apply ``mutate(entry) -> bool`` to every entry under ``_lock``; save once, outside the
+        lock, if any returned True. Returns the count that did."""
         with self._lock:
             self._ensure_loaded_locked()
             changed = sum(1 for entry in self._entries.values() if mutate(entry))
-            if changed:
-                self._save()
+        if changed:
+            self._save()
         return changed
 
     def suspend_session(self, session_key: str) -> bool:
@@ -147,9 +147,8 @@ class SessionLifecycleMixin:
         """
         return self._update_entry(session_key, lambda e: setattr(e, "suspended", True))
 
-    def _set_turn_marker_locked(self, session_key: str, entry: SessionEntry, token, started_at) -> None:
-        """Persist the active-turn pair BEFORE publishing it in memory, so a failed write can
-        neither leak an unowned token nor drop a live one. Lock held."""
+    def _turn_marker_candidate(self, entry: SessionEntry, token, started_at):
+        """``(candidate, touched, observed_token)`` for the active-turn pair. Lock held."""
         candidate = entry.to_dict()
         candidate["active_turn_token"] = token
         candidate["active_turn_started_at"] = _iso(started_at)
@@ -158,24 +157,36 @@ class SessionLifecycleMixin:
             # Keeps the legacy 120s startup heuristic working for an older binary during a rolling
             # downgrade/upgrade window.
             candidate["updated_at"] = touched.isoformat()
-        self._save_entry(session_key, entry_data=candidate, lock_held=True)
-        entry.active_turn_token = token
-        entry.active_turn_started_at = started_at
-        if touched is not None:
-            entry.updated_at = touched
+        return candidate, touched, entry.active_turn_token
+
+    def _persist_turn_marker(self, session_key, entry, prepared, token, started_at, touched) -> None:
+        """Persist the active-turn pair BEFORE publishing it in memory, so a failed write can
+        neither leak an unowned token nor drop a live one. Never called with ``_lock`` held: the
+        single-entry UPSERT is I/O, and this runs per turn (PRX-5789)."""
+        observed = prepared[2]
+        self._save_entry(session_key, entry_data=prepared[0])
+        with self._lock:
+            if self._entries.get(session_key) is not entry or entry.active_turn_token != observed:
+                return  # the route moved or a newer turn owns the marker meanwhile
+            entry.active_turn_token = token
+            entry.active_turn_started_at = started_at
+            if touched is not None:
+                entry.updated_at = touched
 
     def mark_turn_active(self, session_key: str) -> Optional[str]:
         """Persist exact ownership of the running agent turn; returns the opaque token for
         :meth:`clear_turn_active`. Re-marking replaces the previous token so a stale asynchronous
         unwind cannot clear a newer turn."""
         token = uuid.uuid4().hex
+        # Aware UTC, unlike the local wall clock elsewhere: the next process compares it with
+        # epoch transcript timestamps and may run in another zone (DST, container vs unit TZ).
+        started_at = datetime.now(UTC)
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None:
                 return None
-            # Aware UTC, unlike the local wall clock elsewhere: the next process compares it with
-            # epoch transcript timestamps and may run in another zone (DST, container vs unit TZ).
-            self._set_turn_marker_locked(session_key, entry, token, datetime.now(UTC))
+            prepared = self._turn_marker_candidate(entry, token, started_at)
+        self._persist_turn_marker(session_key, entry, prepared, token, started_at, prepared[1])
         return token
 
     def clear_turn_active(self, session_key: str, token: str) -> bool:
@@ -185,7 +196,8 @@ class SessionLifecycleMixin:
             entry = self._entry_locked(session_key)
             if entry is None or entry.active_turn_token != token:
                 return False
-            self._set_turn_marker_locked(session_key, entry, None, None)
+            prepared = self._turn_marker_candidate(entry, None, None)
+        self._persist_turn_marker(session_key, entry, prepared, None, None, None)
         return True
 
     def recover_interrupted_turns(self, max_age_seconds: int = 60 * 60) -> int:
@@ -270,9 +282,8 @@ class SessionLifecycleMixin:
             ]
             for key in removed_keys:
                 self._entries.pop(key, None)
-            if removed_keys:
-                self._save()
         if removed_keys:
+            self._save()
             logger.info("SessionStore pruned %d entries older than %d days",
                         len(removed_keys), max_age_days)
         return len(removed_keys)
