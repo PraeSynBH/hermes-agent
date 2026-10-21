@@ -341,36 +341,25 @@ class TestWholeIndexSaveOutsideLock:
             release.set()
             saver.join(timeout=10)
 
-    def test_a_cold_load_prunes_and_persists_with_the_lock_released(self, tmp_path):
-        """A load that decides the index must be rewritten (a stale route pruned) performs that write
-        with ``_lock`` released. A cold load runs inside a caller's critical section — the same
-        ``restore_local_session`` block that PRX-5789's dump names — and the whole-index rewrite it
-        owes is the same unbounded I/O as any full save."""
-        from gateway.config import GatewayConfig
-        from gateway.session import SessionStore
+    def test_the_per_turn_marker_upsert_persists_with_the_lock_released(self, tmp_path):
+        """``mark_turn_active`` / ``clear_turn_active`` run at every turn boundary of every session
+        and persist the marker BEFORE publishing it. That UPSERT is a sqlite fsync — one caller
+        closer to the loop than a full save — so it must not run under ``_lock`` either, and the
+        publish must still wait for it."""
+        db = _db_with_rows({})
+        store = _make_store(tmp_path, db)
+        entry = _seed_entry(store, "agent:main:telegram:dm:1", "sid_marker")
+        lock_held, published_before_write = [], []
 
-        now = datetime.now()
-        stale = SessionEntry(
-            session_key="agent:main:telegram:dm:1", session_id="sid_ended",
-            created_at=now - timedelta(hours=2), updated_at=now - timedelta(hours=1),
-            platform=Platform.TELEGRAM, chat_type="dm",
-        )
-        db = MagicMock()
-        db.load_gateway_routing_entries.return_value = {stale.session_key: json.dumps(stale.to_dict())}
-        db.get_session.return_value = {"id": "sid_ended", "end_reason": "session_reset"}
-        store = SessionStore(tmp_path / "sessions", GatewayConfig())
-        store._db = db  # pins the routing handle: no real state.db is touched
+        def watching(*_a, **_kw):
+            lock_held.append(store._lock.held)
+            published_before_write.append(entry.active_turn_token)
 
-        held_at_write = []
-        real_persist = store._persist_routing_data
+        db.save_gateway_routing_entry.side_effect = watching
 
-        def checking(data, generation):
-            held_at_write.append(store._lock.locked())
-            real_persist(data, generation)
+        token = store.mark_turn_active(entry.session_key)
+        assert token is not None and entry.active_turn_token == token
+        assert store.clear_turn_active(entry.session_key, token) is True
 
-        store._persist_routing_data = checking  # type: ignore[method-assign]
-        store._ensure_loaded()
-
-        assert stale.session_key not in store._entries, "the ended route was not pruned"
-        assert held_at_write, "the load's rewrite never ran"
-        assert not any(held_at_write), "a load-time save ran while SessionStore._lock was held"
+        assert lock_held == [False, False], "a turn marker was persisted under SessionStore._lock"
+        assert published_before_write == [None, token], "the marker was published before it was written"

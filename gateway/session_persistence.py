@@ -258,32 +258,9 @@ class SessionPersistenceMixin:
         self._db_handle_cache.close_all(_close)
 
     def _ensure_loaded(self) -> None:
-        """Load sessions index from disk if not already loaded, then persist what the load changed."""
+        """Load sessions index from disk if not already loaded."""
         with self._lock:
             self._ensure_loaded_locked()
-        self._flush_load_saves()
-
-    def _flush_load_saves(self) -> None:
-        """Persist what a cold load decided, with ``_lock`` released.
-
-        ``_ensure_loaded_locked`` runs inside a caller's critical section, so the whole-index
-        rewrite it owes (the retired-route import above all) is only recorded there: serializing the
-        index, the ``gateway_routing`` transaction and the sessions.json fsync are unbounded on a
-        loaded host, and a >10 s hold on ``_lock`` is exactly what a loop-side reader — the
-        ``restore_local_session`` frame in PRX-5789's dump — waits on.
-        """
-        rewriting = getattr(self, "_mirror_rewrite_pending", False)
-        if not (rewriting or getattr(self, "_load_save_pending", False)):
-            return
-        self._mirror_rewrite_pending = self._load_save_pending = False
-        self._save()
-        if rewriting and not getattr(self, "_write_sessions_json", True):
-            # That save left an existing mirror as it was: strip the routes from it directly,
-            # or every later start imports them again.
-            try:
-                self.strip_retired_mirror_routes()
-            except Exception:
-                logger.warning("gateway.session: could not strip retired routes from sessions.json", exc_info=True)
 
     def _entry_locked(self, session_key: str) -> Optional[SessionEntry]:
         """Load the index and return the entry for *session_key*. Lock held."""
@@ -383,10 +360,15 @@ class SessionPersistenceMixin:
         self._routing_fallback_baseline = None if db_load_succeeded else self._entries_as_dicts()
         if mirror_retired and db_load_succeeded:
             # Rewrite the mirror while the fences that kept those routes out still hold: a prune's
-            # ages out, and the import would then restore the retired route. The write happens with
-            # ``_lock`` released (``_flush_load_saves``): this load runs inside a caller's lock.
-            self._mirror_rewrite_pending = True
-            self._load_save_pending = True
+            # ages out, and the import would then restore the retired route.
+            self._save_locked()
+            if not getattr(self, "_write_sessions_json", True):
+                # That save left an existing mirror as it was: strip the routes from it directly,
+                # or every later start imports them again.
+                try:
+                    self.strip_retired_mirror_routes()
+                except Exception:
+                    logger.warning("gateway.session: could not strip retired routes from sessions.json", exc_info=True)
         # A hard crash skips graceful shutdown and leaves sessions.json pointing at ended sessions.
         self._prune_stale_sessions_locked()
 
@@ -460,7 +442,7 @@ class SessionPersistenceMixin:
         for key in stale_keys:
             del self._entries[key]
         if stale_keys or recovered_keys:
-            self._load_save_pending = True  # written by ``_flush_load_saves``, outside ``_lock``
+            self._save_locked()  # the load already holds ``_lock``: write it there, not past it
 
     def _stale_entry_verdict(self, key: str, entry, row):
         """For a routing entry whose row has ended: ``"prune"``, a replacement entry (repoint), or
@@ -535,9 +517,21 @@ class SessionPersistenceMixin:
 
         A caller that already holds ``_lock`` (a route transition applying several changes at once)
         captures with ``_capture_routing_locked`` and calls ``_persist_routing_snapshot`` after its
-        critical section — never this.
+        critical section, or uses ``_save_locked`` — never this. ``_lock`` is not reentrant: calling
+        this while holding it deadlocks the caller.
         """
         self._save_entries()
+
+    def _save_locked(self) -> None:
+        """Capture and persist in place — the cold-load path only.
+
+        ``_ensure_loaded_locked`` and the stale prune run inside a caller's critical section by
+        contract (the load mutates ``_entries`` and flips ``_loaded`` under ``_lock``), so the
+        one-shot rewrite they owe is written there, once per process, instead of being deferred
+        past the fences it exists to honour. Every hot path saves through ``_save`` /
+        ``_save_entry`` with ``_lock`` released (PRX-5789).
+        """
+        self._persist_routing_snapshot(self._capture_routing_locked())
 
     def _capture_routing_locked(self) -> tuple[dict[str, Any], int]:
         """``(entries, generation)``: the whole of a full save that needs ``_lock``. Lock held.
@@ -647,7 +641,6 @@ class SessionPersistenceMixin:
 
     def _save_entries(self) -> None:
         """Snapshot latest state under ``_lock`` and persist after releasing it."""
-        self._flush_load_saves()
         with self._lock:
             snapshot = self._capture_routing_locked()
         self._persist_routing_snapshot(snapshot)
@@ -667,9 +660,6 @@ class SessionPersistenceMixin:
         sqlite file is unbounded — a caller that had ``_lock`` across it is what made a loop-side
         ``restore_local_session`` wait >10 s (PRX-5789).
         """
-        # A cold load records the rewrite it owes (retired-mirror import, stale prune) instead of
-        # writing it under the caller's lock; this is the first save after it, so it goes out here.
-        self._flush_load_saves()
         with self._lock:
             entry = self._entries.get(session_key)
             if entry is None:

@@ -147,7 +147,7 @@ def test_failed_mark_persistence_does_not_leak_marker_into_later_save(tmp_path):
     store._save_entry = real_save_entry
     with store._lock:
         store._entries[entry.session_key].updated_at = datetime.now()
-        store._save()
+    store._save()
 
     reloaded = _make_store(tmp_path)
     assert reloaded.recover_interrupted_turns() == 0
@@ -245,7 +245,7 @@ def test_exact_old_active_turn_recovers_even_when_updated_at_is_stale(tmp_path):
         current = store._entries[entry.session_key]
         current.updated_at = datetime.now() - timedelta(hours=2)
         current.active_turn_started_at = datetime.now() - timedelta(minutes=10)
-        store._save()
+    store._save()
 
     # Prove the marker survives a fresh SessionStore and is not relying on the
     # in-memory object that wrote it.
