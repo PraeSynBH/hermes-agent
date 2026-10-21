@@ -20,7 +20,6 @@ import socket
 import stat
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -38,12 +37,20 @@ _MAX_UNIX_PATH = 100  # sun_path limit is 104 on macOS/BSD, 108 on Linux; margin
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 512 * 1024
 _DEFAULT_CLIENT_TIMEOUT = 2.0
-# The control path gets its own workers: requests are short, so two cover a poll plus a burst, and
-# a third concurrent request is refused rather than queued (a silent 40 s queue is undiagnosable).
-_CONTROL_EXECUTOR_WORKERS = 2
+# The control path gets its own workers. Eight, not two: a probe burst, two agents polling ``status``
+# at once, and a dashboard's periodic read arrive together as ordinary traffic, and a pool narrower
+# than its readers turns every such burst into a coin flip on scheduling. A drained pool still
+# refuses fast rather than queueing past the client's deadline (``_CONTROL_QUEUE_WAIT_S``).
+_CONTROL_EXECUTOR_WORKERS = 8
+# How long a request may wait for a free worker before it is refused. Far below the client's 2 s
+# deadline and only ~10x a ``status`` handler: a burst that arrives inside one handler's runtime is
+# answered, while a pool drained by a handler stuck on a slow reconcile still yields a structured
+# refusal instead of a silent queue (PRA-6633).
+_CONTROL_QUEUE_WAIT_S = 0.25
 # Above this, the answer spent real time waiting for a worker — worth a line in a debug log even
-# when nobody reads the response envelope.
-_SLOW_QUEUE_WAIT_MS = 250.0
+# when nobody reads the response envelope. Well under ``_CONTROL_QUEUE_WAIT_S``: a wait long enough
+# to hit the grace is the case most worth logging.
+_SLOW_QUEUE_WAIT_MS = 100.0
 
 
 def _home_hash(home: Path) -> str:
@@ -213,9 +220,11 @@ class GatewayControlServer:
         self._pointer_file: Optional[Path] = None
         self._fallback_root: Optional[Path] = None  # mkdtemp root created for a squatted fallback
         self._file_identities = {}
-        # One token per control worker: a request either takes a free worker or is refused at once,
-        # so this pool never grows a queue behind a handler that is stuck on a slow reconcile.
-        self._control_slots = threading.Semaphore(_CONTROL_EXECUTOR_WORKERS)
+        # One token per control worker: a request either takes a free worker or waits at most
+        # ``_CONTROL_QUEUE_WAIT_S`` for one and is refused, so this pool never grows a queue behind
+        # a handler that is stuck on a slow reconcile. Acquired and released on the loop only — a
+        # blocking acquire here would starve the loop that serves every adapter (PRA-6502).
+        self._control_slots = asyncio.Semaphore(_CONTROL_EXECUTOR_WORKERS)
         self._control_executor: Optional[DaemonThreadPoolExecutor] = None
         self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "identify": build_identify_payload, "status": build_status_payload, **(verb_handlers or {})}
@@ -448,18 +457,27 @@ class GatewayControlServer:
                 writer.close()
 
     async def _answer_off_loop(self, raw: bytes, peer_subject: Optional[str]) -> bytes:
-        """Answer on this server's own pool: a free worker, or an immediate refusal — never a queue.
+        """Answer on this server's own pool: a free worker, a short bounded wait, or a refusal.
 
         Handlers read disk, so they stay off the loop that drives every platform adapter. The pool is
         the server's own rather than the loop's default one: that default carries every
         ``asyncio.to_thread`` in the process — turn tools and the profile reconcile sweep alike — and
         a control answer queued behind them is indistinguishable from a dead gateway to a consumer.
+
+        The wait for a worker is bounded by ``_CONTROL_QUEUE_WAIT_S`` and happens on the loop as a
+        cancellable await, so a burst wider than the pool costs the late arrivals queue time instead
+        of a refusal, and the loop itself is never blocked by the admission decision.
         """
         handoff = time.monotonic()
-        if not self._control_slots.acquire(blocking=False):
+        try:
+            await asyncio.wait_for(self._control_slots.acquire(), timeout=_CONTROL_QUEUE_WAIT_S)
+        except TimeoutError:
             return _busy_response(raw, (time.monotonic() - handoff) * 1000)
-        future = self._control_pool().submit(self._run_handled, raw, peer_subject, handoff)
-        return await asyncio.wrap_future(future)
+        try:
+            future = self._control_pool().submit(self.handle_request_line, raw, peer_subject, handoff)
+            return await asyncio.wrap_future(future)
+        finally:
+            self._control_slots.release()
 
     def _control_pool(self) -> DaemonThreadPoolExecutor:
         """The control pool, created on first use so a server that never serves spawns no threads."""
@@ -468,15 +486,9 @@ class GatewayControlServer:
                 max_workers=_CONTROL_EXECUTOR_WORKERS, thread_name_prefix="hermes-control")
         return self._control_executor
 
-    def _run_handled(self, raw: bytes, peer_subject: Optional[str], handoff: float) -> bytes:
-        try:
-            return self.handle_request_line(raw, peer_subject, handoff)
-        finally:
-            self._control_slots.release()
-
 
 def _busy_response(raw: bytes, waited_ms: float) -> bytes:
-    """Refuse at once when the control pool is drained: a fast structured failure is diagnosable
+    """Refuse once the wait for a free worker has run out: a fast structured failure is diagnosable
     where a silent queue past the client's deadline is not (the client then uses its scan fallback)."""
     payload: dict[str, Any] = {"ok": False, "error": "control_busy", "code": "control_busy",
                                "protocol": CONTROL_PROTOCOL_VERSION, "queue_wait_ms": round(waited_ms, 2)}
