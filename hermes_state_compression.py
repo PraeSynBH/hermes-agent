@@ -131,6 +131,23 @@ _UNSET_ANCESTOR_SQL = """
 """
 
 
+# The ancestor closure of many ids in ONE read (``compression_lineage_roots``): a routing index of
+# thousands of sessions must not cost one read per id. ``json_each`` seeds the recursion from a
+# single bound parameter (no bound-variable ceiling), and ``path`` gives the walk the cycle stop the
+# per-id version gets from its ``ancestors`` set.
+_LINEAGE_ANCESTORS_SQL = """
+    WITH RECURSIVE up(id, parent_session_id, end_reason, model_config, source, path) AS (
+        SELECT s.id, s.parent_session_id, s.end_reason, s.model_config, s.source, '|' || s.id || '|'
+          FROM sessions s JOIN json_each(?) seed ON s.id = seed.value
+        UNION ALL
+        SELECT p.id, p.parent_session_id, p.end_reason, p.model_config, p.source, up.path || p.id || '|'
+          FROM up JOIN sessions p ON p.id = up.parent_session_id
+         WHERE instr(up.path, '|' || p.id || '|') = 0
+    )
+    SELECT id, parent_session_id, end_reason, model_config, source FROM up
+"""
+
+
 def stamp_compression_ancestors(conn, session_id: str) -> None:
     """Copy *session_id*'s ``created_source`` onto compression ancestors that have none.
 
@@ -910,6 +927,41 @@ class SessionCompressionMixin:
             return False
         parent = self.get_session(parent_id)
         return bool(parent and parent.get("end_reason") == "compression")
+
+    def compression_lineage_roots(self, session_ids) -> dict[str, str]:
+        """``logical_owner`` for many ids at once: id -> root of its compression lineage.
+
+        ``get_compression_lineage`` costs two or more synchronous reads per id (the row, its parent,
+        and each continuation), so a caller resolving a routing index of N sessions paid 2N+ reads
+        for N lineage roots — the gateway's 30 s reconcile pass did exactly that on its event loop
+        (PRA-6631). The ancestor closure is one read for any N: a recursive CTE seeded from a single
+        JSON array parameter, with the same edge rule ``_is_compression_child_row`` applies, walked
+        in memory over the rows it returns. An id this store does not hold keeps its own id, exactly
+        as ``get_compression_lineage`` returning ``[]`` leaves ``logical_owner`` at the input.
+        """
+        ids = list(dict.fromkeys(sid for sid in session_ids if sid))
+        if not ids:
+            return {}
+        rows = {row["id"]: dict(row) for row in self._read_all(_LINEAGE_ANCESTORS_SQL, (json.dumps(ids),))}
+        return {sid: self._lineage_root(rows, sid) for sid in ids}
+
+    def _lineage_root(self, rows: dict[str, dict[str, Any]], session_id: str) -> str:
+        """Walk *rows* (one id's ancestor closure) up the compression edges, as the lineage does:
+        an explicit fork child — reset included — is its own conversation, so it is its own root."""
+        current = rows.get(session_id)
+        if current is None:
+            return session_id
+        seen = {session_id}
+        while not self._is_explicit_fork_child_row(current, include_reset=True):
+            parent_id = current.get("parent_session_id")
+            if not parent_id or parent_id in seen:
+                break
+            parent = rows.get(parent_id)
+            if parent is None or parent.get("end_reason") != "compression":
+                break
+            seen.add(parent_id)
+            current = parent
+        return str(current.get("id") or session_id)
 
     def get_compression_lineage(self, session_id: str) -> list[str]:
         """Return compression ancestors through tip in chronological order."""

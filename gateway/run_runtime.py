@@ -779,18 +779,43 @@ async def recover_gateway_native_sessions(runner):
 
 
 async def recover_profile_native_sessions(runner, authority):
-    """Bind one authority's queued native rows to the adapters connected now."""
+    """Bind one authority's queued native rows to the adapters connected now.
+
+    Every read here is synchronous SQLite, so the pass runs on a worker thread: the queued-target
+    set and ONE batched lineage read for the whole routing index (``compression_lineage_roots``),
+    where it used to be a ``logical_owner`` — two or more reads — per entry. On the loop that was
+    O(sessions) synchronous queries, re-paid by the 30 s reconcile watcher every tick (PRA-6631:
+    67 loop stalls > 10 s in 10 h, the frame named in the blocked-loop dump). ``owner_scope``
+    travels with ``to_thread``, so the reads still belong to this profile.
+    """
     from gateway.session_authorities import owner_scope
     with owner_scope(authority):
-        pending = {row['target_session_id'] for row in authority.db._read_all(
-            "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")}
-        bindings = [(owner, entry.origin, runner._adapter_for_source(entry.origin))
-                    for entry in runner.session_store.list_sessions() if entry.origin is not None
-                    for owner in [authority.logical_owner(entry.session_id)] if owner in pending]
+        bindings = await asyncio.to_thread(_native_session_bindings, runner, authority)
         outcome = await authority.recover_native_sessions(bindings)
     for sid, verdict in outcome.items():
         logger.info('Native session startup recovery %s (%s): %s', sid, authority.profile_id, verdict)
     return outcome
+
+
+def _native_session_bindings(runner, authority):
+    """Off-loop half of ``recover_profile_native_sessions``: two reads, whatever the session count.
+
+    A route whose compression lineage merely passes through a queued target is not that target's
+    work — only the lineage ROOT is, which is what ``logical_owner`` answers and what the batched
+    read answers for every entry at once.
+    """
+    pending = {row['target_session_id'] for row in authority.db._read_all(
+        "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")}
+    entries = [entry for entry in runner.session_store.list_sessions() if entry.origin is not None]
+    if not pending or not entries:
+        return []
+    roots = authority.db.compression_lineage_roots([entry.session_id for entry in entries])
+    bindings = []
+    for entry in entries:
+        owner = roots.get(entry.session_id, entry.session_id)
+        if owner in pending:
+            bindings.append((owner, entry.origin, runner._adapter_for_source(entry.origin)))
+    return bindings
 
 
 def publish_gateway_runtime_ready(runner):
