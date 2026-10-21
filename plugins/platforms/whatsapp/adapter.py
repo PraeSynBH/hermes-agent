@@ -9,6 +9,7 @@ import platform
 import re
 import signal
 import subprocess
+import time
 from contextlib import suppress
 from functools import wraps
 from pathlib import Path
@@ -335,6 +336,18 @@ _QUOTED_MIME_BY_BRIDGE_KIND = {
 }
 
 
+# A bridge we adopted instead of spawned gets no Popen to poll, so its death is only visible as failed
+# requests. Six is ~30 s at the poll loop's 5 s error backoff: long enough that a busy bridge is never
+# declared dead, short enough that a paging outage is caught while the alert is still actionable.
+_ADOPTED_BRIDGE_DEAD_STREAK = 6
+
+# The bridge answers /health with a non-connected status while it is logged out or showing a QR, and the
+# poll loop cannot tell that from health: it only sees HTTP 200s. Sample rarely, and report only a
+# sustained status — a Baileys 428 closes for ~3 s before it reconnects.
+_BRIDGE_HEALTH_PROBE_SECS = 15
+_BRIDGE_NOT_CONNECTED_SECS = 60
+
+
 def _needs_bridge(method):
     """Adapter-method decorator: return ``SendResult(error=...)`` when ``_bridge_unavailable()`` says so."""
     @wraps(method)
@@ -387,6 +400,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = self._bridge_log = self._poll_task = self._http_session = None
+        # Failed bridge requests in a row; an adopted bridge has no Popen to poll, so this streak is its
+        # only liveness signal (_check_adopted_bridge_exit). One answered request resets it.
+        self._bridge_unreachable_streak = 0
+        self._bridge_log_offset = 0  # bridge.log size at attach: only later bytes can explain an exit
+        self._last_bridge_health_probe = 0.0
+        self._bridge_not_connected_since = None  # monotonic start of a sustained non-connected /health
         # Set by disconnect() before SIGTERMing so _check_managed_bridge_exit() can tell an intentional exit (-15/-2/0) from a crash.
         self._shutting_down = False
         # Text debounce batching: rapid bursts (forwards, paste-splits) would otherwise each trigger a separate agent turn.
@@ -456,6 +475,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     def _attach_to_bridge(self, managed_process) -> None:
         import aiohttp
         self._bridge_process = managed_process
+        # An adopted bridge has no log handle of its own; naming its log here keeps exit messages and the
+        # logged-out check pointed at the file bridge.js actually writes.
+        self._bridge_log = self._bridge_log or (self._session_path.parent / "bridge.log")
+        with suppress(OSError):
+            self._bridge_log_offset = self._bridge_log.stat().st_size
+        self._bridge_unreachable_streak = 0
+        self._last_bridge_health_probe = 0.0
+        self._bridge_not_connected_since = None
         self._http_session = aiohttp.ClientSession()
         self._poll_task = asyncio.create_task(self._poll_messages())
 
@@ -716,7 +743,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     async def _check_managed_bridge_exit(self) -> Optional[str]:
         returncode = self._bridge_process.poll() if self._bridge_process is not None else None
         if returncode is None:
-            return None
+            # An adopted bridge has no Popen to poll (``_attach_to_bridge(None)``), so its death was
+            # invisible: the poll loop spun on a dead port for 6.5 h (2,571 "Poll error" lines), no
+            # fatal error, no reconnect, and every dashboard still said "connected" (PRA-6622).
+            return await self._check_adopted_bridge_exit() if self._bridge_process is None else None
         # getattr-with-default: tests build the adapter via ``__new__`` without __init__.
         # A container stop (e.g. s6-overlay's stage-3 broadcast) reaches the bridge child (its own session) before the
         # gateway's stop flow reaches this adapter's disconnect(), so ``_shutting_down`` alone
@@ -728,13 +758,70 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if (getattr(self, "_shutting_down", False) or runner_stop) and returncode in {0, -2, -15}:
             logger.info("[%s] Bridge exited during shutdown (code %d).", self.name, returncode)
             return None
-        message = f"WhatsApp bridge process exited unexpectedly (code {returncode})."
+        code, message = self._bridge_gone_cause(f"WhatsApp bridge process exited unexpectedly (code {returncode}).")
+        return await self._declare_bridge_dead(message, code)
+
+    async def _declare_bridge_dead(self, message: str, code: str, *, retryable: bool = True) -> str:
+        """Report a dead bridge once (log, fatal error, platform status) and return what to hand the caller."""
         if not self.has_fatal_error:
             logger.error("[%s] %s", self.name, message)
-            self._set_fatal_error("whatsapp_bridge_exited", message, retryable=True)
+            self._set_fatal_error(code, message, retryable=retryable)
             self._close_bridge_log()
             await self._notify_fatal_error()
         return self.fatal_error_message or message
+
+    def _note_bridge_answered(self) -> None:
+        """A bridge request got an HTTP response: whatever was failing is not a dead bridge."""
+        self._bridge_unreachable_streak = 0
+
+    def _note_bridge_unreachable(self) -> None:
+        """Count one failed bridge request; ``_check_adopted_bridge_exit`` reads the streak."""
+        self._bridge_unreachable_streak = getattr(self, "_bridge_unreachable_streak", 0) + 1
+
+    async def _check_adopted_bridge_exit(self) -> Optional[str]:
+        """Adopted-bridge liveness: an answering bridge resets the streak, a sustained dead one is an exit.
+
+        ``_adopted`` bridges are the ones we did not spawn, so ``_bridge_process`` is ``None`` and nothing
+        polls them. Two signals, because neither alone is sound: the pidfile names a process (a live one
+        means "wedged, not gone" — keep polling; a recorded-but-dead one is proof), and an unbroken streak
+        of failed bridge requests covers the normal adopt case of no pidfile at all (an out-of-process
+        ``hermes whatsapp`` bridge leaves none). One answered request zeroes the streak, so a slow or busy
+        bridge is never mistaken for a dead one.
+        """
+        if getattr(self, "_shutting_down", False) or not self._running:
+            return None
+        streak = getattr(self, "_bridge_unreachable_streak", 0)
+        if streak < _ADOPTED_BRIDGE_DEAD_STREAK:
+            return None
+        pid, recorded_start, _ = _read_bridge_pidfile(self._session_path)
+        if pid is not None and _bridge_pid_is_ours(pid, recorded_start):
+            return None  # process still alive under our pidfile: unreachable, not exited
+        code, message = self._bridge_gone_cause(
+            f"WhatsApp bridge stopped answering on port {self._bridge_port} ({streak} consecutive failed "
+            f"requests; no live bridge for {self._session_path}).")
+        return await self._declare_bridge_dead(message, code)
+
+    def _bridge_gone_cause(self, fallback_message: str) -> tuple[str, str]:
+        """``(code, message)`` naming a logged-out session — the one bridge death a human has to fix.
+
+        bridge.js exits(1) on ``DisconnectReason.loggedOut`` after writing "Logged out." (or a
+        ``logged_out`` pair event), and an exit code alone cannot tell that from a startup crash. Only
+        bytes written after this adapter attached are read, so an old logout in an appended log cannot
+        mislabel a fresh crash.
+        """
+        offset = getattr(self, "_bridge_log_offset", 0) or 0
+        try:
+            with open(self._bridge_log or (self._session_path.parent / "bridge.log"), "rb") as fh:
+                fh.seek(offset)
+                tail = fh.read()[-4000:].decode("utf-8", "replace")
+        except OSError:
+            tail = ""
+        if "Logged out." in tail or "logged_out" in tail:
+            return ("whatsapp_logged_out",
+                    "WhatsApp session is logged out — the linked device is gone, so no message can be sent or "
+                    "received. Re-pair it with `hermes whatsapp` (scan the QR), then the gateway reconnects on its "
+                    f"next attempt. Bridge log: {self._bridge_log or (self._session_path.parent / 'bridge.log')}")
+        return "whatsapp_bridge_exited", fallback_message
 
     def _terminate_bridge(self, *, force: bool) -> None:
         try:
@@ -773,11 +860,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """POST to the bridge; 200 → SendResult(messageId, raw_response), else the error text."""
         try:
             async with self._bridge_req("post", path, timeout, json=payload) as resp:
+                self._note_bridge_answered()
                 if resp.status == 200:
                     data = await resp.json()
                     return SendResult(success=True, message_id=data.get("messageId"), raw_response=data)
                 return SendResult(success=False, error=await resp.text())
         except Exception as e:
+            self._note_bridge_unreachable()
             return SendResult(success=False, error=str(e))
 
     @_needs_bridge
@@ -908,13 +997,45 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             print(f"[{self.name}] {bridge_exit}")
         return bool(bridge_exit)
 
+    async def _check_bridge_channel_health(self) -> Optional[str]:
+        """A bridge that answers ``/health`` with a non-connected status is a dead channel that looks healthy.
+
+        The poll loop only ever sees HTTP 200s, so a logged-out or QR-waiting bridge would serve nothing
+        forever while every status surface said "connected" (PRA-6622). Probed at most once per
+        ``_BRIDGE_HEALTH_PROBE_SECS``, and only a *sustained* non-connected status counts: Baileys closes
+        with 428 routinely and reconnects in ~3 s, so a single sample proves nothing.
+        """
+        now = time.monotonic()
+        if now - getattr(self, "_last_bridge_health_probe", 0.0) < _BRIDGE_HEALTH_PROBE_SECS:
+            return None
+        self._last_bridge_health_probe = now
+        try:
+            ok, data = await self._probe_bridge_health()
+        except Exception:
+            return None  # unreachable is the poll loop's streak's business, not this check's
+        if not ok or not isinstance(data, dict) or data.get("status") == "connected":
+            self._bridge_not_connected_since = None
+            return None
+        since = getattr(self, "_bridge_not_connected_since", None)
+        if since is None:
+            self._bridge_not_connected_since = now
+            return None
+        if now - since < _BRIDGE_NOT_CONNECTED_SECS:
+            return None
+        status = data.get("status", "unknown")
+        code, message = self._bridge_gone_cause(
+            f"WhatsApp bridge is up on port {self._bridge_port} but reports status {status!r} for "
+            f"{int(now - since)}s: the channel accepts nothing and delivers nothing.")
+        return await self._declare_bridge_dead(message, code)
+
     async def _poll_messages(self) -> None:
         while self._running:
-            if not self._http_session or await self._report_bridge_exit():
+            if not self._http_session or await self._report_bridge_exit() or await self._check_bridge_channel_health():
                 break
             try:
                 async with self._bridge_req("get", "messages", 30) as resp:
                     if resp.status == 200:
+                        self._note_bridge_answered()
                         for msg_data in await resp.json():
                             event = await self._build_message_event(msg_data)
                             if event:
@@ -927,6 +1048,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                self._note_bridge_unreachable()
                 if await self._report_bridge_exit():
                     break
                 print(f"[{self.name}] Poll error: {e}")
