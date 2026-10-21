@@ -315,10 +315,18 @@ def gateway_lifecycle_block(
         mounted_host=getattr(env, "host_cwd", None),
         env=env,
     )
+    # A local backend's "remote" read is the same filesystem this walk just read, so asking it is a
+    # shell round trip per path the walk found nothing at — 55 of them for one routine script that
+    # shells out to npm, and because bytes from the backend are never latched (they are not the
+    # local file's bytes) it also disabled the clean-verdict memo for that command entirely
+    # (PRX-5758). Only a remote backend has somewhere else to look.
+    read_remote_script = None if env_type == "local" else (
+        lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES)
+    )
     unsafe, refusal = scan_gateway_lifecycle(
         command,
         cwd=guard_cwd,
-        read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
+        read_remote_script=read_remote_script,
     )
     if unsafe and refusal:
         # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,
