@@ -1401,6 +1401,14 @@ def _read_candidate_script(
             return None, stamp, "next"
         _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
         return None, stamp, "block"
+    if script_text is None and stamp is not None:
+        # The regular file at this path WAS read and its bytes said "not a script" (a compiled
+        # binary). That is a property of those bytes, so it is a latched-safe answer and there is
+        # nothing for the backend to add: it offers the same file. Asking anyway cost a backend
+        # round trip per binary a script names — 49 per walk of a routine 221-line script — and
+        # because backend bytes are never latchable it also disabled the clean-verdict memo for
+        # every command that named one (PRX-5758).
+        return None, stamp, None
     if script_text is not None or read_remote_script is None:
         return script_text, stamp, None
     # Local path missing; the remote backend's output crosses the same trust boundary as a local
@@ -1472,14 +1480,15 @@ def _scan_one_referenced_script(
     )
     if outcome is not None:
         return outcome
-    if not script_text:
-        return "next"
     # These bytes are part of the caller's answer, whichever view read them: a caller's latched
     # verdict depends on every file it read, mentions included (a mention can carry the literal
-    # lifecycle command that blocks it).
+    # lifecycle command that blocks it). A candidate that turned out to be a binary is witnessed by
+    # its bytes too — the skip is stable only while they are.
     own: list[_Witness] = [] if stamp is None else [_witness(resolved, stamp)]
     if dependencies is not None:
         dependencies.extend(own)
+    if not script_text:
+        return "next"
     child_dependencies: list[_Witness] = []
     # Relative references inside a script resolve against that script's directory, not the cwd.
     if _contains_unsafe_gateway_action(
