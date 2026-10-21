@@ -11299,6 +11299,11 @@
             "title": "Unattended",
             "type": "boolean"
           },
+          "one_shot": {
+            "default": false,
+            "title": "One Shot",
+            "type": "boolean"
+          },
           "surface": {
             "anyOf": [
               {

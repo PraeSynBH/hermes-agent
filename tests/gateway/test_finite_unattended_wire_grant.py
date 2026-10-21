@@ -59,6 +59,16 @@ async def test_only_the_local_cli_owner_may_submit_an_unattended_turn(monkeypatc
             assert refused.get('error', {}).get('message') == 'invalid_params', (request_id, refused)
             assert not [row for row in list_session_admissions(authority.db, session_id=sessions[name])
                         if row['request_id'] == request_id]
+        # PRX-5850: the waiter-less declaration shares that gate, so no other producer (a Kanban
+        # attempt, an API run, a bot chat) can declare away its own pause.
+        owned = await _rpc(cli_owner, 'prompt.submit', session_id=sessions['cli'], input_id='own-waiver',
+                           text='wake', finite=True, one_shot=True)
+        assert owned.get('result', {}).get('status') == 'queued', owned
+        refused = await _rpc(operator, 'prompt.submit', session_id=sessions['cli'], input_id='operator-waiver',
+                             text='wake', finite=True, one_shot=True)
+        assert refused.get('error', {}).get('message') == 'invalid_params', refused
+        assert not [row for row in list_session_admissions(authority.db, session_id=sessions['cli'])
+                    if row['request_id'] == 'operator-waiver']
         # A plain finite turn (``-q``) stays available to every submitter.
         assert 'result' in await _rpc(operator, 'prompt.submit', session_id=sessions['cli'], input_id='q',
                                       text='hi', finite=True)

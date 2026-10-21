@@ -43,17 +43,30 @@ def finite_turn_scope(finite, unattended=False):
 
 def admit_finite(params, *, submitter=None):
     """Validate a submission's finite flags. *submitter* ``(connection, ref)`` marks a wire client: it may
-    ask for an unattended (auto-approving) turn only as the local CLI principal on its own CLI session."""
+    ask for an unattended (auto-approving) turn only as the local CLI principal on its own CLI session.
+
+    ``one_shot`` is the submitting one-shot's declaration that a lost turn of this submission may be
+    settled without a human (PRX-5850): its process exits when the turn settles, so once an owner
+    restart fences the admission there is nobody to consult, and pausing only kills the session for
+    every later run. Same gate as ``unattended`` — a wire client may declare it only as the local CLI
+    principal on its own CLI session, so no other producer (a Kanban card attempt, an API run, a bot
+    chat) can declare away its own pause."""
     if 'unattended' in params and (type(params['unattended']) is not bool
                                    or (params['unattended'] and params.get('finite') is not True)):
         raise RuntimeStoreError('invalid_params')
-    if params.get('unattended') and submitter is not None and not _may_run_unattended(*submitter):
+    if 'one_shot' in params and (type(params['one_shot']) is not bool
+                                 or (params['one_shot'] and params.get('finite') is not True)):
+        raise RuntimeStoreError('invalid_params')
+    if submitter is not None and (params.get('unattended') or params.get('one_shot')) \
+            and not _may_run_unattended(*submitter):
         raise RuntimeStoreError('invalid_params')
     if 'finite' not in params:
         return {}
     if type(params['finite']) is not bool:
         raise RuntimeStoreError('invalid_params')
-    return {'finite': params['finite'], **({'unattended': True} if params.get('unattended') else {})}
+    return {'finite': params['finite'],
+            **({'unattended': True} if params.get('unattended') else {}),
+            **({'one_shot': True} if params.get('one_shot') else {})}
 
 
 def _may_run_unattended(connection, ref):

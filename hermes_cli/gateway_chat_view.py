@@ -309,6 +309,10 @@ class GatewayChatView:
                                         session_id=self.session_id,
                                         input_id=uuid.uuid4().hex, text=text,
                                         **({"finite": True} if self.finite else {}),
+                                        # A one-shot's process exits with the turn, so a turn lost
+                                        # across an owner restart has no waiter to pause for
+                                        # (PRX-5850: the row blocked every later wake instead).
+                                        **({"one_shot": True} if self.finite else {}),
                                         **({"unattended": True} if self.finite and self.unattended else {}))
         if (receipt or {}).get("voice_stopped") is True:
             # TUI-26: a bare stop phrase typed into this LOCAL session's voice chat (another viewer

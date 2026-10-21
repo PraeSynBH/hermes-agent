@@ -210,6 +210,10 @@ class CanonicalSubmitParams(CanonicalSessionParams):
     attachments: list[CanonicalAttachment] | None = None
     finite: bool = False
     unattended: bool = False
+    # The submitting one-shot exits with its turn, so a turn lost across an owner restart may be
+    # settled without a human instead of pausing the session forever (PRX-5850). Same grant as
+    # ``unattended`` in ``gateway/session_finite.py::admit_finite``.
+    one_shot: bool = False
     surface: str | None = None
     voice_context: str | None = None
     interrupted: bool = False
