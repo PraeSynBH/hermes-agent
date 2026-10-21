@@ -5039,6 +5039,12 @@ async def _host_attach_or_none(replace: bool, force: bool = False) -> Optional[b
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
                         verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False) -> bool:
     """Run the process lifecycle; the runner facade remains the public entrypoint."""
+    # Both entry points land here — this facade (hermes gateway run → hermes_cli.gateway.run_gateway,
+    # i.e. every launchd/systemd/Desktop launch) and gateway.run.main() — so the spawn-ledger identity
+    # and the orphan sweep live here rather than in main(), where supervised launches never reached
+    # them and the gateway stayed invisible to reconcile_orphans (PRA-6652).
+    from gateway.run_identity import prepare_process
+    prepare_process()
     from gateway.run_bootstrap import start_gateway as bootstrap
     return await bootstrap(config, replace, verbosity, force, idle_exit)
 
@@ -5066,12 +5072,6 @@ def main():
     os.environ.setdefault("AI_AGENT", "hermes-agent")
     os.environ.setdefault("HERMES_AGENT", "true")
 
-    def _register_identity() -> None:
-        # Ledger registration + Windows job-object attach so update-time reapers can identify this gateway.
-        from hermes_cli.process_identity import attach_self_to_kill_on_close_job, register_self
-        register_self("gateway")
-        attach_self_to_kill_on_close_job()
-
     def _arm_watchdog() -> None:
         # Armed before config load / DB opens so a pre-loop deadlock is respawned by the supervisor instead
         # of wedging as a live-PID zombie. GatewayRunner disarms it.
@@ -5083,16 +5083,10 @@ def main():
         from hermes_cli.stdio import configure_windows_stdio
         configure_windows_stdio()
 
-    def _reconcile_orphans() -> None:
-        # The startup reconciler: reaps every ledger-PROVEN orphan across REAPABLE_PURPOSES
-        # (superseded gateways, serve/dashboard backends whose home nothing claims any more,
-        # stdio MCP helpers whose spawner is gone). Runs after _register_identity so this process
-        # is the newest entry; proof-only, so a supervised gateway or a lone detached daemon is
-        # never a candidate (PRA-6594 / PRA-6599).
-        from hermes_cli.process_identity import reconcile_orphans
-        reconcile_orphans()
-
-    for _step in (_register_identity, _reconcile_orphans, _arm_watchdog, _utf8_stdio):
+    # Spawn-ledger identity + the orphan sweep are NOT here: start_gateway() runs them, because the
+    # installed service entry point (hermes gateway run → hermes_cli.gateway.run_gateway) reaches that
+    # facade without ever calling main() (PRA-6652).
+    for _step in (_arm_watchdog, _utf8_stdio):
         _best_effort(_step)
 
     # pm startup contract (PATH provisioning for the store's tools), then
