@@ -25,6 +25,22 @@ def _housekeeping_chore(label: str, fn, *args, **kwargs) -> None:
         logger.debug("%s error: %s", label, exc)
 
 
+def _run_due_chores(chores, tick_count: int) -> None:
+    """Run the chores due on this tick, as one timed unit (``housekeeping_tick`` in the tick-cost log).
+
+    The housekeeping tick runs on its own thread, but its cost is still a loop-starvation probe:
+    a chore that schedules onto the gateway loop and waits (channel directory refresh, the low-disk
+    prompt) inflates the tick exactly when the loop is busy, while a chore wedged in a blocking read
+    inflates it without touching the loop at all. The number is what separates those two readings,
+    and it separates them from a slow disk, which only a per-chore figure would (PRX-5790).
+    """
+    from gateway.loop_tick_timing import timed
+    with timed('housekeeping_tick'):
+        for every, label, fn in chores:
+            if tick_count % every == 0:
+                _housekeeping_chore(label, fn)
+
+
 def _housekeeping_channel_directory(adapters, loop) -> None:
     from gateway.channel_directory import build_channel_directory
     if loop is not None:

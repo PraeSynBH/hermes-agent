@@ -2205,6 +2205,7 @@ from gateway.run_plugin_rewire import GatewayPluginRewireMixin
 from gateway.run_housekeeping_chores import (
     _housekeeping_channel_directory, _housekeeping_chore, _housekeeping_curator,
     _housekeeping_misfire_catch_up, _housekeeping_paste_sweep, _housekeeping_plugin_update_check,
+    _run_due_chores,
 )
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -4510,9 +4511,7 @@ def _start_gateway_housekeeping(
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
-        for every, label, fn in chores:
-            if tick_count % every == 0:
-                _housekeeping_chore(label, fn)
+        _run_due_chores(chores, tick_count)
         wait_for_next_tick(stop_event, interval, queue_watch, _housekeeping_chore)
     logger.info("Gateway housekeeping stopped")
 

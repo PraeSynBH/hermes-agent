@@ -12,22 +12,37 @@ tick costs its caller, not a measure of loop occupancy: a tick that hands its st
 So the summary is advisory evidence beside the dumps and the loopback p95, never a substitute for
 them: a tick's wall time falling from seconds to milliseconds is the fix landing; a tick still at
 seconds with no dump is the worker hop doing its job. Every counter is process-local and monotonic.
+
+The cold-start-vs-load question on PRX-5524 (the first ~2 min after boot, or only under load1 > 100)
+is settled by reading one line per watcher per minute against ``uptime`` at the same timestamps:
+``p95`` over the window is the load-coupled reading, ``boot_max`` keeps the boot spike visible after
+it has rolled out of the window.
+
+Cost: two ``time.monotonic()`` calls per tick plus a dict write — no timers, no threads, no
+per-tick allocation beyond the float. ``sorted()`` runs once per watcher per interval, in the
+interval's own tick, and the ring sorts at most ``WINDOW`` floats.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
 import logging
+import math
 import time
 
 logger = logging.getLogger(__name__)
 
-# One INFO line per interval naming every ticker's count / p50 / max. 10 minutes keeps the trend
-# readable in ``hermes logs`` through an 8 h shift (~48 lines) without touching a hot path's cost.
-SUMMARY_INTERVAL_S = 600.0
-# Ring size per ticker: the last 64 ticks, enough for a nearest-rank p50 that follows a change in
-# load within minutes on the 1 s ticker and within half an hour on the 30 s one.
+# One line per watcher per minute: the interval has to be fine enough to line the numbers up
+# against ``uptime`` (load1) at the same timestamp, which is the whole point of the card.
+SUMMARY_INTERVAL_S = 60.0
+# Ring size per watcher. At one line a minute this covers the last ~60 ticks of the 1 s watcher (a
+# minute of load) and the last 32 min of the 30 s one; a nearest-rank p95 over it is 3 ticks off the
+# worst, so the line reports the tail instead of hiding it behind a mean.
 WINDOW = 64
+# One tick this long is a stall candidate on its own (the watchdog dumps at 10 s), so it gets a
+# WARNING immediately — but at most one per watcher per interval, or a starved loop floods the log
+# with a warning per second and buries everything else.
+SLOW_TICK_S = 1.0
 
 _counters: dict[str, dict] = {}
 _last_summary = 0.0
@@ -37,27 +52,41 @@ def _counter(name: str) -> dict:
     rec = _counters.get(name)
     if rec is None:
         rec = _counters[name] = {'count': 0, 'total': 0.0, 'max': 0.0, 'last': 0.0,
-                                 'window': [0.0] * WINDOW, 'at': 0}
+                                 'window': [0.0] * WINDOW, 'at': 0,
+                                 'slow': 0, 'slow_total': 0, 'warned_at': None}
     return rec
 
 
-def _nearest_rank_p50(samples) -> float:
+def _nearest_rank(samples, q: float) -> float:
+    """Nearest-rank percentile of *samples* (0 < q <= 1); 0.0 for an empty window."""
     ordered = sorted(samples)
-    return ordered[max(0, (len(ordered) - 1) // 2)] if ordered else 0.0
+    if not ordered:
+        return 0.0
+    return ordered[min(len(ordered) - 1, max(0, math.ceil(q * len(ordered)) - 1))]
 
 
 def snapshot() -> dict[str, dict]:
-    """One read-only view of every ticker's counters (``count`` ticks start at zero on import)."""
+    """One read-only view of every watcher's counters (``count`` starts at zero on import).
+
+    Window statistics (``window_count``, ``p50_s``, ``p95_s``, ``max_window_s``) describe the last
+    ``WINDOW`` ticks; ``max_s`` / ``mean_s`` / ``count`` are since import, because a boot spike has
+    to stay readable after it rolls out of the ring.
+    """
     view = {}
     for name, rec in _counters.items():
         filled = min(rec['count'], WINDOW)
         window = rec['window'][:filled]
         view[name] = {
             'count': rec['count'],
+            'window_count': filled,
             'last_s': rec['last'],
             'mean_s': (rec['total'] / rec['count']) if rec['count'] else 0.0,
-            'p50_s': _nearest_rank_p50(window),
+            'p50_s': _nearest_rank(window, 0.50),
+            'p95_s': _nearest_rank(window, 0.95),
             'max_s': rec['max'],
+            'max_window_s': max(window) if window else 0.0,
+            'slow_since_summary': rec['slow'],
+            'slow_total': rec['slow_total'],
         }
     return view
 
@@ -69,20 +98,53 @@ def reset() -> None:
     _last_summary = 0.0
 
 
-def log_summary(now: float | None = None) -> str | None:
-    """Emit the trend line if the interval elapsed; returns the line it logged (else None)."""
+def _ms(seconds: float) -> str:
+    """Milliseconds, keeping a digit where the value has one: ``0.02ms`` and ``1250ms`` both read."""
+    millis = seconds * 1000.0
+    if millis < 1.0:
+        return f"{millis:.2f}"
+    if millis < 10.0:
+        return f"{millis:.1f}"
+    return f"{millis:.0f}"
+
+
+def _line(name: str, value: dict) -> str:
+    line = (f"Tick cost {name} n={value['window_count']}"
+            f" p50={_ms(value['p50_s'])}ms"
+            f" p95={_ms(value['p95_s'])}ms"
+            f" max={_ms(value['max_window_s'])}ms"
+            f" boot_max={_ms(value['max_s'])}ms")
+    if value['slow_since_summary']:
+        line += f" slow={value['slow_since_summary']}/{value['slow_total']}"
+    return line
+
+
+def log_summary(now: float | None = None) -> list[str] | None:
+    """Emit one line per watcher if the interval elapsed; returns the lines it logged (else None).
+
+    Each line stands alone under the module's logger (``gateway.loop_tick_timing``) so a sweep can
+    grep one watcher across a boot, and so the record's own timestamp is the timestamp to compare
+    against load1.
+    """
     global _last_summary
     now = time.monotonic() if now is None else now
-    if not _counters or (now - _last_summary) < SUMMARY_INTERVAL_S:
+    if not _counters:
+        return None
+    if _last_summary <= 0.0:
+        # The first tick opens the window instead of closing an empty one: a line at boot would
+        # carry n=1, while the first line a minute later carries the whole boot minute.
+        _last_summary = now
+        return None
+    if (now - _last_summary) < SUMMARY_INTERVAL_S:
         return None
     _last_summary = now
-    parts = []
+    lines = []
     for name, value in sorted(snapshot().items()):
-        parts.append(f"{name} n={value['count']} p50={value['p50_s'] * 1000.0:.0f}ms"
-                     f" max={value['max_s'] * 1000.0:.0f}ms")
-    line = 'Loop tick timing (wall time inside the tick): ' + '; '.join(parts)
-    logger.info(line)
-    return line
+        line = _line(name, value)
+        logger.info(line)
+        lines.append(line)
+        _counters[name]['slow'] = 0
+    return lines
 
 
 def record(name: str, seconds: float, *, now: float | None = None) -> None:
@@ -94,14 +156,31 @@ def record(name: str, seconds: float, *, now: float | None = None) -> None:
     rec['max'] = max(rec['max'], seconds)
     rec['window'][rec['at'] % WINDOW] = seconds
     rec['at'] += 1
+    if seconds >= SLOW_TICK_S:
+        rec['slow'] += 1
+        rec['slow_total'] += 1
+        at = time.monotonic() if now is None else now
+        warned_at = rec['warned_at']
+        if warned_at is None or (at - warned_at) >= SUMMARY_INTERVAL_S:
+            rec['warned_at'] = at
+            logger.warning("Tick %s took %.0fms (>= %.0fms); further slow ticks of this watcher are"
+                           " counted, not logged, until the next summary",
+                           name, seconds * 1000.0, SLOW_TICK_S * 1000.0)
     log_summary(now)
 
 
 @contextmanager
-def timed(name: str):
-    """Time one pass (or one unit of work) of ticker *name*; recorded even when it raises."""
+def timed(name: str, *, per_tick_debug: bool = True):
+    """Time one pass (or one unit of work) of watcher *name*; recorded even when it raises.
+
+    ``per_tick_debug=False`` for the fast watchers (the 1 s hosted-room worker): their per-tick line
+    is 86 400 records a day at DEBUG, and the per-minute summary already carries count/p50/p95/max.
+    """
     start = time.monotonic()
     try:
         yield
     finally:
-        record(name, time.monotonic() - start)
+        elapsed = time.monotonic() - start
+        record(name, elapsed)
+        if per_tick_debug:
+            logger.debug("tick %s %.1fms", name, elapsed * 1000.0)
