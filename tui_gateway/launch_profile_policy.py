@@ -17,6 +17,7 @@ Two facts anchor this module:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -153,12 +154,39 @@ def launch_secret_scope(launch_home: str | Path) -> dict[str, str]:
     return scope
 
 
+def prepare_launch_profile_scope(launch_home: str | Path) -> tuple[dict[str, str], Optional[dict], Optional[str]]:
+    """Blocking half of a launch-profile scope: ``(secrets, terminal policy, terminal failure)``.
+
+    Both maps are built here, in one pass, so a loop caller can read them on a worker thread
+    (``async_launch_profile_scope_if_multiplexed``) instead of parsing ``config.yaml`` and reading
+    ``.env`` inline. The gateway's 15 s loop-wakeup tick and its 1 s hosted-room tick both enter this
+    scope with no turn on the stack, and PRX-5524's blocked-loop dump sampled the loop inside exactly
+    that read. The YAML loader is signature-cached process-wide, so the parse happens once and every
+    later entry is a stat that this worker does; the flag that excused this read ("already-hydrated
+    sources") was wrong for ``.env``, which is re-read on every entry.
+    """
+    from tools.terminal_scope import TerminalPolicyUnavailable, build_profile_terminal_scope
+
+    home = Path(launch_home)
+    secrets = launch_secret_scope(home)
+    try:
+        return secrets, build_profile_terminal_scope(home, env_overlay=launch_terminal_env()), None
+    except TerminalPolicyUnavailable as exc:
+        return secrets, None, str(exc)
+
+
 @contextlib.contextmanager
-def launch_profile_runtime_scope(launch_home: str | Path) -> Iterator[None]:
+def launch_profile_runtime_scope(
+        launch_home: str | Path,
+        prepared: Optional[tuple[dict[str, str], Optional[dict], Optional[str]]] = None) -> Iterator[None]:
     """Bind the launch profile's own runtime scope for one body: HERMES_HOME override naming the
-    launch home, ``launch_secret_scope``, and its terminal policy over the frozen launch
+    launch home, the launch secret mapping, and its terminal policy over the frozen launch
     ``TERMINAL_*`` overlay. For hosts whose launch-profile bodies are not RPC sessions (the
     standalone messaging gateway after a hosted room activated multiplexing, #112878).
+
+    ``prepared`` is this scope's maps, already built off-loop by
+    :func:`prepare_launch_profile_scope`; omitted, they are built here exactly as before. Binding is
+    ContextVar-only either way, so the worker's read and the loop's binding never split the scope.
 
     The home override is bound even though the launch home IS the process home: under multiplexing
     "override unset" is the fail-closed signal for an UNBOUND context (``serves_routed_profile``,
@@ -168,14 +196,15 @@ def launch_profile_runtime_scope(launch_home: str | Path) -> Iterator[None]:
     (``gateway/run.py::_profile_runtime_scope``); the launch profile is a tenant like any other."""
     from agent.secret_scope import reset_secret_scope, set_secret_scope
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-    from tools.terminal_scope import install_profile_terminal_scope, reset_terminal_scope
+    from tools.terminal_scope import install_built_profile_terminal_scope, reset_terminal_scope
 
     home = Path(launch_home)
+    secrets, terminal_scope, terminal_error = prepared or prepare_launch_profile_scope(home)
     home_token = secret_token = terminal_token = None
     try:
         home_token = set_hermes_home_override(str(home))
-        secret_token = set_secret_scope(launch_secret_scope(home))  # own home: no foreign stamp
-        terminal_token = install_profile_terminal_scope(home, env_overlay=launch_terminal_env())
+        secret_token = set_secret_scope(secrets)  # own home: no foreign stamp
+        terminal_token = install_built_profile_terminal_scope(terminal_scope, terminal_error)
         yield
     finally:
         if terminal_token is not None:
@@ -207,7 +236,23 @@ def launch_profile_scope_if_multiplexed():
 
 @contextlib.asynccontextmanager
 async def async_launch_profile_scope_if_multiplexed():
-    """``async with`` twin of :func:`launch_profile_scope_if_multiplexed` (no I/O of its own: the
-    launch scope is rebuilt from already-hydrated sources, so there is nothing to move off-loop)."""
-    with launch_profile_scope_if_multiplexed():
+    """``async with`` twin of :func:`launch_profile_scope_if_multiplexed`, with the read off-loop.
+
+    Entering the launch scope reads ``.env`` and ``config.yaml`` (and the managed-dir/secret-source
+    stat pass behind them). Every async caller of this seam is a gateway ticker with no turn on the
+    stack — the 15 s loop-wakeup watcher, the notification watchers — so an inline read here is
+    loop I/O forever: ``run_goals.py::_loop_wakeup_watcher`` ->
+    ``async_launch_profile_scope_if_multiplexed`` -> ``load_yaml_file_readonly`` is one of the stacks
+    in PRX-5524's blocked-loop dump. The maps are built in a worker thread; only the ContextVar
+    binding happens on the loop, which is what keeps the whole body inside one scope.
+    """
+    from agent.secret_scope import is_multiplex_active
+    if not is_multiplex_active():
+        with contextlib.nullcontext():
+            yield
+        return
+    from hermes_constants import get_process_hermes_home
+    home = get_process_hermes_home()
+    prepared = await asyncio.to_thread(prepare_launch_profile_scope, home)
+    with launch_profile_runtime_scope(home, prepared):
         yield

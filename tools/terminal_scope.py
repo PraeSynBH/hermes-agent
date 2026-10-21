@@ -201,14 +201,26 @@ def _resolve_scope_cwd_placeholder(scope: dict[str, str]) -> None:
         scope["TERMINAL_CWD"] = resolved
 
 
+def install_built_profile_terminal_scope(
+    scope: Optional[dict[str, str]], error: Optional[str] = None) -> Token:
+    """Install a policy BUILT elsewhere (a worker thread); a failed build installs the refusal scope.
+
+    The install itself is a ContextVar token, never I/O: a caller that read ``.env``/``config.yaml``
+    off the loop (``tui_gateway/launch_profile_policy.py``) installs here without re-reading them.
+    """
+    if error is not None:
+        logger.warning("terminal policy unavailable: %s", error)
+        return _terminal_scope_var.set(TerminalPolicyRefusal(error))
+    return set_terminal_scope(scope)
+
+
 def install_profile_terminal_scope(
     hermes_home: Any, *, env_overlay: Optional[dict[str, str]] = None) -> Token:
     """Build AND install a profile's policy; on failure install the refusal scope. Never raises."""
     try:
         return set_terminal_scope(build_profile_terminal_scope(hermes_home, env_overlay=env_overlay))
     except TerminalPolicyUnavailable as exc:
-        logger.warning("terminal policy unavailable: %s", exc)
-        return _terminal_scope_var.set(TerminalPolicyRefusal(str(exc)))
+        return install_built_profile_terminal_scope(None, str(exc))
 
 
 @contextmanager
