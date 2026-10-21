@@ -1,6 +1,6 @@
 """Gateway subcommand for hermes CLI.
 
-Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
+Handles: hermes gateway [run|start|stop|restart|request-restart|status|install|uninstall|setup]
 """
 
 import asyncio
@@ -20,7 +20,7 @@ import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from hermes_cli import gateway_service_owner, setup_platforms
+from hermes_cli import gateway_service_owner, gateway_supervised_restart, setup_platforms
 
 # UV's bundled Python ships a minimal PATH; ensure launchctl/systemctl are discoverable.
 if os.name == "posix":
@@ -5670,14 +5670,14 @@ def _cmd_migrate(args):
 
 _GATEWAY_SUBCOMMANDS = {
     None: _cmd_run, "run": _cmd_run, "setup": _cmd_setup, "install": _cmd_install,
-    "uninstall": _cmd_uninstall, "start": _cmd_start, "stop": _cmd_stop, "restart": _cmd_restart,
-    "status": _cmd_status, "list": _cmd_list, "migrate-legacy": _cmd_migrate_legacy, "migrate": _cmd_migrate,
+    "uninstall": _cmd_uninstall, "request-restart": gateway_supervised_restart.cmd_request_restart,
+    "start": _cmd_start, "stop": _cmd_stop, "restart": _cmd_restart, "status": _cmd_status,
+    "list": _cmd_list, "migrate-legacy": _cmd_migrate_legacy, "migrate": _cmd_migrate,
 }
 
 
 def _gateway_command_inner(args):
-    handler = _GATEWAY_SUBCOMMANDS.get(getattr(args, "gateway_command", None))
-    if handler is not None:
+    if (handler := _GATEWAY_SUBCOMMANDS.get(getattr(args, "gateway_command", None))) is not None:
         handler(args)
 
 

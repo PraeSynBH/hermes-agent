@@ -104,6 +104,53 @@ def restart_externally_supervised_gateway(supervised_pid: int) -> None:
     sys.exit(1)
 
 
+def cmd_request_restart(args=None) -> None:
+    """``hermes gateway request-restart``: the ONE restart a process inside the gateway may ask for.
+
+    Every other lifecycle spelling is refused from inside (``_refuse_from_inside_gateway`` and the
+    terminal pre-exec guard): its fallbacks — ``launchctl kickstart -k``, SIGTERM, the manual
+    stop + foreground run — kill the calling process before it can finish, so an agent session in a
+    supervised gateway could never deploy a module change without a human shell or the daily launchd
+    restart job. The handoff this function performs is the path that design exists for: SIGUSR1 to
+    the running gateway (``gateway/run.py`` → ``request_restart(via_service=True)``), which refuses
+    new turns, drains in-flight ones (this CLI has already exited), stops, and lets the supervisor
+    relaunch it. Nothing is killed here, so nothing needs an outside shell.
+
+    Refuses — rather than degrading to a stop — when the SIGUSR1 handoff cannot be taken: no running
+    gateway, a gateway that declares no supervisor (nothing would relaunch it after the drain), or a
+    caller that is not a descendant of that gateway (``_request_gateway_self_restart``'s ancestor
+    test; a process that is not inside the gateway must use ``hermes gateway restart``).
+    """
+    from gateway.status import get_running_pid
+    from hermes_cli.gateway import _request_gateway_self_restart, _print_lines, print_error
+
+    pid = get_running_pid()
+    if pid is None:
+        print_error("No running gateway in this profile — nothing to hand a restart to.")
+        sys.exit(1)
+    if not gateway_declares_external_supervisor(pid):
+        print_error(
+            f"Refusing: gateway PID {pid} declares no supervisor, so a drain-first exit would leave it down.\n"
+            "`hermes gateway restart` from a shell outside the gateway is the only restart for an "
+            "unsupervised gateway."
+        )
+        sys.exit(1)
+    if not _request_gateway_self_restart(pid):
+        print_error(
+            f"Refusing: this process is not a descendant of gateway PID {pid}, so it cannot hand the "
+            "restart back (or the signal could not be sent).\n"
+            "Run `hermes gateway restart` from a shell outside the running gateway."
+        )
+        sys.exit(1)
+    print("✓ Service restart requested")
+    _print_lines(
+        "",
+        f"  Gateway PID {pid} drains in-flight turns, then exits; its supervisor relaunches it.",
+        "  The turn that asked for this ends normally. A fresh PID is not observable from here:",
+        "  verify with `hermes gateway status` once it is back.",
+    )
+
+
 def refuse_restart_of_service_managed_gateway(pid: int | None) -> None:
     """Refuse the manual restart fallback when systemd owns the gateway under ANY unit name.
 

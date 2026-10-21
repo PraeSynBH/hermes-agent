@@ -151,6 +151,15 @@ def build_gateway_parser(
     _flag(gateway_restart, "-y", "--yes", "--interrupt", dest="interrupt", help=_INTERRUPT_HELP.format(verb="restart"))
     _add_compat_platform_flag(gateway_restart)
 
+    gateway_subparsers.add_parser(
+        "request-restart",
+        help="Ask the running gateway to drain and restart itself (in-session handoff)",
+        description="The one restart a process INSIDE the supervised gateway may ask for: SIGUSR1 to "
+            "the running gateway, which refuses new turns, drains in-flight ones, then exits so its "
+            "supervisor relaunches it. Nothing is signalled to the caller. Refuses unless the gateway "
+            "declares a supervisor and this process is its descendant. Every other lifecycle spelling "
+            "(restart/stop/uninstall, launchctl, systemctl) still requires a shell outside the gateway.")
+
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
     _flag(gateway_status, "--deep", help="Deep status check")
     _flag(gateway_status, "-l", "--full",

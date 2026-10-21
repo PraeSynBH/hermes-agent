@@ -497,6 +497,31 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     return _contains_launchctl_gateway_lifecycle(normalized) or contains_host_interpreter_kill(normalized)
 
 
+# The ONE gateway lifecycle shape a process inside the supervised gateway may run (PRX-5771).
+# `hermes gateway request-restart` does nothing but the SIGUSR1 handoff: the gateway refuses new
+# turns, drains in-flight ones (the caller's own turn ends normally), stops, and its supervisor
+# relaunches it. Nothing is signalled to the caller, so the block's rationale ("the gateway would
+# kill this command before it could complete") does not apply — and every agent-side remedy the
+# refusal names (a separate shell, `at`, a launchd job) is itself out of reach from in there.
+# Matched on the EXACT argv only: any other verb, any extra token (`--all`, `; hermes gateway
+# restart`, a background `&`) and every wrapper spelling fall through to the scan below.
+_SELF_RESTART_HANDOFF_ARGV = ("hermes", "gateway", "request-restart")
+_SELF_RESTART_HANDOFF_EXE_RE = re.compile(r"(?i)^hermes(?:\.(?:exe|cmd|bat|com|ps1))?$")
+
+
+def is_self_restart_handoff_command(text: str) -> bool:
+    """True only for a bare ``hermes gateway request-restart`` — the in-session drain-first handoff."""
+    if not text:
+        return False
+    try:
+        tokens = _line_tokens(_SHELL_LINE_CONTINUATION.sub(" ", text).strip())
+    except ValueError:
+        return False
+    if len(tokens) != len(_SELF_RESTART_HANDOFF_ARGV) or not _SELF_RESTART_HANDOFF_EXE_RE.match(tokens[0]):
+        return False
+    return tuple(tokens[1:]) == _SELF_RESTART_HANDOFF_ARGV[1:]
+
+
 # Whole-walk work limits. The per-file cap and depth bound above limit one read, not the walk: a
 # command can reference arbitrarily many scripts, and the pure-Python shlex pass (quadratic on a
 # giant token) once held the GIL for minutes. These caps bound one whole walk and are charged

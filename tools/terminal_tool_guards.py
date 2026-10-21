@@ -266,7 +266,10 @@ def gateway_lifecycle_block(
     ``systemctl``/``launchctl``/``hermes gateway restart|stop|uninstall``
     targeting hermes-gateway would SIGTERM the gateway — and this very
     subprocess — before completing, so the service may never come back.
-    Applies unconditionally (``force=True`` cannot bypass it). Gated on the
+    Applies unconditionally (``force=True`` cannot bypass it), with ONE
+    allowance: ``hermes gateway request-restart``, the drain-first SIGUSR1
+    handoff that signals nothing here and is refused by the verb itself for
+    any caller that is not the gateway's descendant. Gated on the
     SUPERVISED-gateway probe, not the raw ``_HERMES_GATEWAY`` marker: that
     marker leaks into every process that merely imports gateway.run (hermes
     serve, CLI, web server), which must still be able to restart the gateway;
@@ -286,9 +289,17 @@ def gateway_lifecycle_block(
         contains_host_interpreter_kill,
         contains_launchctl_registration_command,
         contains_launchctl_removal_command,
+        is_self_restart_handoff_command,
         lifecycle_scan_root_within_budget,
         scan_gateway_lifecycle,
     )
+    # The one lifecycle shape that is safe FROM here: `hermes gateway request-restart` only asks the
+    # gateway to drain and exit back to its supervisor (SIGUSR1, nothing signalled to this process).
+    # The verb itself refuses a caller that is not the gateway's descendant, so this opens no
+    # restart route a process outside the gateway lacked. Exact argv only — see
+    # cron.lifecycle_guard.is_self_restart_handoff_command (PRX-5771).
+    if is_self_restart_handoff_command(command):
+        return None
     # Keep the specific launchctl diagnostic when this optional pre-scan fits the
     # budget. The full fail-closed guard below still runs when it does not, so
     # oversized roots never reach shlex here.
@@ -350,7 +361,10 @@ def gateway_lifecycle_block(
             "launchd job the session does not own. The gateway would "
             "kill this command before it could complete (SIGTERM propagates "
             "to child processes). Run `hermes gateway restart` from a "
-            "separate shell outside the running gateway.",
+            "separate shell outside the running gateway. "
+            "To deploy code into THIS gateway, use `hermes gateway request-restart` "
+            "(the drain-first handoff: the gateway finishes this turn, then its "
+            "supervisor relaunches it).",
             "error",
         )
     return None
