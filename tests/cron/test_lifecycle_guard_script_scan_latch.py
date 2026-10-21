@@ -148,6 +148,33 @@ def test_the_current_profile_is_part_of_the_verdict(tmp_path, script_reads, monk
     )
 
 
+def test_a_binary_the_script_names_is_read_locally_and_never_latched_as_backend_bytes(tmp_path, script_reads):
+    """A compiled binary is not a script; re-reading it from the backend is a same-file round trip.
+
+    The walk meets every executable a script shells out to (a routine script that calls npm puts
+    ``/opt/homebrew/bin/npm`` and then npm's whole JS tree in front of it). Asking the backend about
+    a binary the local read already rejected cost a round trip each, and because backend bytes can
+    never be latched it also turned the clean-verdict memo off for the whole command (PRX-5758).
+    """
+    binary = tmp_path / "tool"
+    binary.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 64)  # Mach-O 64-bit
+    script = _write(tmp_path / "routine.sh", "#!/bin/bash", f"{shlex.quote(str(binary))} --version")
+
+    asked: list[str] = []
+
+    def remote(path):
+        asked.append(path)
+        return ""
+
+    assert guard(_bash(script), read_remote_script=remote) is False
+    assert asked == [], f"the backend was asked to read {asked}"
+    first_call = len(script_reads)
+    assert first_call == 2, f"one walk reads the script and the binary it names, saw {script_reads}"
+
+    assert guard(_bash(script), read_remote_script=remote) is False
+    assert len(script_reads) == first_call, "the binary's bytes are a witness, so this call is stats"
+
+
 def test_a_blocked_script_is_never_latched(tmp_path, script_reads):
     """Only clean verdicts are remembered: a refusal or a block is re-derived and reported."""
     script = _write(tmp_path / "blocked.sh", "#!/bin/bash", LIFECYCLE)

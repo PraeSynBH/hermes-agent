@@ -1678,6 +1678,9 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
 
         # Path only exists on the remote backend; locally it is absent, so the
         # guard must fall back to a bounded env.execute('head -c ...') read.
+        # The env must actually BE remote for that to be anywhere else to look: a local env's
+        # backend read is a shell round trip to the same filesystem (PRX-5758), which is why this
+        # declares the ssh backend rather than relying on a fake env behind env_type="local".
         script = "/remote/workspace/remote.sh"
         calls = []
 
@@ -1693,6 +1696,10 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         fake_env = _RemoteEnv()
         fake_env.cwd = "/remote/workspace"
         self._patch_env(monkeypatch, fake_env, inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_get_env_config",
+            lambda: {"env_type": "ssh", "cwd": "/remote/workspace", "timeout": 60, "lifetime_seconds": 3600},
+        )
 
         result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
 
