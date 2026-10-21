@@ -13,6 +13,7 @@ label, because a session that cannot put a job back must never be able to take o
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -1549,6 +1550,7 @@ def _latch_hit(stamp: tuple[str, int, int]) -> Optional[tuple[_Witness, ...]]:
 
     ``None`` means "walk again": no entry, or one whose witnesses no longer hold (the entry is
     dropped, so the next write cannot revive a stale lineage)."""
+    _load_persisted_latches()
     key = _verdict_key(stamp)
     witnesses = _script_verdict_cache.get(key)
     if witnesses is None:
@@ -1567,6 +1569,121 @@ def _latch_clean_script(stamp: tuple[str, int, int], witnesses: list[_Witness]) 
     _script_verdict_cache.move_to_end(key)
     while len(_script_verdict_cache) > _SCRIPT_VERDICT_CACHE_LIMIT:
         _script_verdict_cache.popitem(last=False)
+    _persist_latches()
+
+
+# --- the memo outlives the process ------------------------------------------------------------
+#
+# A gateway restart is exactly when the memo is lost and the cost lands: the first scan after every
+# boot paid a full walk of a script the previous process had already proved clean (40-119 ms cold
+# against 0.3 ms warm, PRX-5784). The entries are a pure function of file bytes plus the profile, so
+# they are worth keeping on disk — under the same contract as the in-memory memo, never weaker:
+#
+#   * the file is a CACHE, not an authority. Any read/parse/shape failure is an empty memo, and an
+#     entry is only ever served through `_latch_hit`, which re-stats every witness first. A stale
+#     entry therefore cannot outlive the bytes it was derived from, and a corrupt one cannot block.
+#   * it is per home (`get_hermes_home()`) and keyed by profile, like the memory entries.
+#   * only clean verdicts are written, by the same call that latches them in memory.
+_LATCH_STATE_PATH = ("cache", "lifecycle-guard-latch.json")
+_LATCH_STATE_SCHEMA_VERSION = 1
+_LATCH_STATE_MAX_BYTES = 512 * 1024
+_latch_state_loaded = False
+
+
+def _latch_state_path() -> Optional[Path]:
+    """Where the durable memo lives for the profile running the guard (``None`` if unresolvable)."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home()).joinpath(*_LATCH_STATE_PATH)
+    except Exception:  # HOME unresolvable, profile deleted mid-run, … — memory-only is fine
+        return None
+
+
+def _decode_latch_entry(entry: object) -> Optional[tuple[tuple[str, int, int, Optional[str]], tuple[_Witness, ...]]]:
+    """One on-disk entry → ``(key, witnesses)``; ``None`` for anything malformed.
+
+    Strict on purpose: a wrong witness list would answer a future scan from bytes nobody scanned, so
+    a bad field drops the entry rather than being coerced.
+    """
+    if not isinstance(entry, dict):
+        return None
+    path = entry.get("path")
+    modified, size = entry.get("mtimeNs"), entry.get("size")
+    profile = entry.get("profile")
+    raw_witnesses = entry.get("witnesses")
+    if not isinstance(path, str) or not path or not isinstance(modified, int) or not isinstance(size, int):
+        return None
+    if profile is not None and not isinstance(profile, str):
+        return None
+    if not isinstance(raw_witnesses, list):
+        return None
+    witnesses: list[_Witness] = []
+    for witness in raw_witnesses:
+        if not isinstance(witness, list) or len(witness) != 2 or not isinstance(witness[0], str):
+            return None
+        stamp = witness[1]
+        if stamp is None:
+            witnesses.append((witness[0], None))
+            continue
+        if not isinstance(stamp, list) or len(stamp) != 2 or not all(isinstance(part, int) for part in stamp):
+            return None
+        witnesses.append((witness[0], (stamp[0], stamp[1])))
+    return (path, modified, size, profile), tuple(witnesses)
+
+
+def _load_persisted_latches() -> None:
+    """Seed the in-memory memo from disk, once per process, before the first latch lookup."""
+    global _latch_state_loaded
+    if _latch_state_loaded:
+        return
+    _latch_state_loaded = True
+    state_path = _latch_state_path()
+    if state_path is None:
+        return
+    try:
+        if state_path.stat().st_size > _LATCH_STATE_MAX_BYTES:
+            return
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return
+    for entry in entries[-_SCRIPT_VERDICT_CACHE_LIMIT:]:
+        decoded = _decode_latch_entry(entry)
+        if decoded is None:
+            continue
+        key, witnesses = decoded
+        _script_verdict_cache.setdefault(key, witnesses)
+
+
+def _persist_latches() -> None:
+    """Publish the current memo atomically; a failed write leaves the previous file alone."""
+    state_path = _latch_state_path()
+    if state_path is None:
+        return
+    entries = [
+        {
+            "path": key[0],
+            "mtimeNs": key[1],
+            "size": key[2],
+            "profile": key[3],
+            "witnesses": [[path, None if stamp is None else [stamp[0], stamp[1]]] for path, stamp in witnesses],
+        }
+        for key, witnesses in _script_verdict_cache.items()
+    ]
+    try:
+        from utils import atomic_json_write
+
+        atomic_json_write(
+            state_path,
+            {"schemaVersion": _LATCH_STATE_SCHEMA_VERSION, "entries": entries},
+            mode=0o600,
+        )
+    except Exception:
+        # A cache write is never worth failing a guard scan over.
+        logger.debug("lifecycle guard could not persist its clean-verdict memo", exc_info=True)
 
 
 # --- recursive walk ---------------------------------------------------------------------------
@@ -1581,6 +1698,47 @@ def _unchargeable_outcome(
         return "block"
     budget.partial = True
     return "stop"
+
+
+# A referenced file whose shebang names an interpreter that is not a POSIX shell is not shell
+# source. Its body is still scanned for a LITERAL lifecycle command — `os.system("hermes gateway
+# restart")` and `subprocess.run(["launchctl", "kickstart", …])` read as one — but its tokens are
+# not shell commands, so nothing in it is a script reference and the walk stops there. Descending
+# anyway is what made the first scan of a routine 221-line shell script pay for npm's JS tree:
+# `#!/usr/bin/env node` → `lib/cli.js` → `lib/cli/validate-engines.js` → a 6.6 KB `package.json`
+# whose workspaces globs yielded ~40 nonexistent "scripts" (PRX-5784).
+_SHEBANG_LINE = re.compile(r"^#![ \t]*(.+)$")
+
+
+def _shebang_interpreter(text: str) -> Optional[str]:
+    """Basename of the interpreter a script's shebang names; ``None`` without a shebang.
+
+    Reads the ``env`` shape too: ``#!/usr/bin/env [-S] [-i] [NAME=VALUE]… <interpreter> [args]``.
+    """
+    match = _SHEBANG_LINE.match(text.split("\n", 1)[0].strip())
+    if not match:
+        return None
+    words = match.group(1).split()
+    if not words:
+        return None
+    if Path(words[0]).name != "env":
+        return Path(words[0]).name
+    for word in words[1:]:
+        if word in ("-S", "--split-string") or word.startswith("-") or "=" in word:
+            continue
+        return Path(word).name
+    return None
+
+
+def _interpreter_body_is_terminal(text: str) -> bool:
+    """Whether *text* is a non-shell interpreter script (node, python, ruby, …).
+
+    Such a body is scanned only for a literal command: it references no shell script the walk could
+    follow. Shell shebangs (`#!/bin/sh`, `#!/usr/bin/env bash`) keep the full recursive walk, and a
+    shebang-less file keeps it too (an include without a shebang is still shell source).
+    """
+    interpreter = _shebang_interpreter(text)
+    return bool(interpreter) and interpreter not in _SHELL_EXECUTABLES
 
 
 def _read_candidate_script(
@@ -1699,6 +1857,7 @@ def _scan_one_referenced_script(
         script_text, cwd=_resolve_script_directory(str(resolved)) or cwd, depth=depth + 1,
         visited=visited, budget=budget, read_remote_script=read_remote_script,
         executed=candidate_executed, dependencies=child_dependencies,
+        descend=not _interpreter_body_is_terminal(script_text),
     ):
         return "block"
     if dependencies is not None:
@@ -1716,16 +1875,22 @@ def _scan_one_referenced_script(
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
-    dependencies: Optional[list[_Witness]] = None,
+    dependencies: Optional[list[_Witness]] = None, descend: bool = True,
 ) -> bool:
     """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
-    depth, size, device, live SQLite, cloud) is "nothing to scan" there, never a block (#113944)."""
+    depth, size, device, live SQLite, cloud) is "nothing to scan" there, never a block (#113944).
+
+    ``descend=False`` is a non-shell interpreter body (see ``_interpreter_body_is_terminal``): the
+    direct scan above still applies — a literal command inside it is a real one — but its tokens are
+    not shell commands, so there is no payload and no referenced script to follow (PRX-5784)."""
     # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
     if not budget.charge_text(command):
         return _budget_exhausted(budget, "text", depth) if executed else False
     if _direct_lifecycle_scan(command):
         return True
+    if not descend:
+        return False
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return executed
 
