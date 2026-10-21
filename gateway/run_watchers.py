@@ -39,10 +39,14 @@ class GatewaySessionWatchersMixin:
 
     async def _session_housekeeping_watcher(self, interval: int = 300):
         """Reclaim resources without ending durable conversations."""
+        from gateway.loop_tick_timing import timed
         await asyncio.sleep(60)
         while self._running:
             try:
-                await self._session_housekeeping()
+                # On the loop: the agent-cache sweeps and the hourly store prune are loop work
+                # (PRX-5790), so a tick that costs seconds here is loop occupancy, not a thread.
+                with timed('session_housekeeping'):
+                    await self._session_housekeeping()
             except Exception as e:
                 logger.debug("Session housekeeping error: %s", e)
             await _interruptible_sleep(self, interval)

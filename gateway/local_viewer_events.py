@@ -178,10 +178,14 @@ def publish_control_if_changed(turn) -> None:
     published on the gateway loop, in order with the slash commands' publishes; revision-gated, so
     other tools publish nothing."""
     from gateway.session_control_actions import publish_if_changed_offloop
+    from gateway.loop_tick_timing import timed
     authority, canonical_id, _generation = turn._approval_owner
 
     async def republish():
-        await publish_if_changed_offloop(authority, canonical_id)
+        # Timed on the LOOP side, where it lands: the read is off-loop (publish_if_changed_offloop)
+        # but the compare/publish and the hop back cost loop time, once per tool of every live turn.
+        with timed('control_repaint'):
+            await publish_if_changed_offloop(authority, canonical_id)
     turn._schedule(republish(), "session.control.update after a tool")
 
 

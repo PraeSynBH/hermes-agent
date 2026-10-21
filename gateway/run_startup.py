@@ -865,7 +865,9 @@ class GatewayStartupMixin:
         """Keep the room worker alive for the messaging gateway lifetime."""
         from gateway.loop_tick_timing import timed
         while self._running:
-            with timed('hosted_room_worker'):
+            # The 1 s one: per-tick DEBUG would be ~86k records a day, so this watcher reports
+            # through the per-minute summary instead (PRX-5790).
+            with timed('hosted_room_worker', per_tick_debug=False):
                 await self._ensure_hosted_room_worker()
             await asyncio.sleep(interval)
 
