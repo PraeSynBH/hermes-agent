@@ -19,6 +19,8 @@ import re
 import shlex
 import stat
 import sys
+from collections import OrderedDict
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
@@ -485,6 +487,7 @@ class _LifecycleScanBudget:
     __slots__ = (
         "bytes_remaining",
         "lines_remaining",
+        "partial",
         "paths_remaining",
         "refusal",
         "remote_reads_remaining",
@@ -497,6 +500,10 @@ class _LifecycleScanBudget:
         self.paths_remaining = _MAX_LIFECYCLE_SCAN_PATHS
         self.remote_reads_remaining = _MAX_LIFECYCLE_SCAN_REMOTE_READS
         self.refusal: Optional[str] = None
+        # Set when this walk's answer is not a pure function of the local files it stamped: it
+        # stopped short of every candidate it was given (a lowered quota), or a script's text came
+        # from the remote backend rather than the file. Such an answer is never latched as clean.
+        self.partial = False
 
     def charge_text(self, text: str) -> bool:
         """Charge *text* before tokenization; False when it does not fit."""
@@ -639,16 +646,38 @@ def _split_segments(tokens: list[str], *, keep_controls: bool = False) -> Iterat
         yield segment
 
 
+# Tokenization is a pure function of the line and it dominates every guard scan, so it is remembered
+# per distinct line for the process lifetime. One walk re-tokenizes the same text several times: the
+# data-exemption masker, the two launchd verb directions, the `sh -c` payload walk and the
+# referenced-script walk each tokenize the whole command, and the recursion repeats all of it at
+# every script level — a 221-line routine script measured ~3000 shlex calls per walk (PRX-5758).
+# Nothing has to be invalidated: an edited script yields different lines, hence a miss.
+_TOKEN_CACHE_LINES = 1024
+_TOKEN_CACHE_LINE_CHARS = 4096  # a longer line is tokenized, just not retained
+
+
+@lru_cache(maxsize=_TOKEN_CACHE_LINES)
+def _cached_shlex_tokens(line: str) -> tuple[str, ...]:
+    return tuple(_shlex_tokens(line))
+
+
+def _line_tokens(line: str) -> list[str]:
+    """Tokens for one shell line, memoized by the line's text (see ``_cached_shlex_tokens``)."""
+    if len(line) > _TOKEN_CACHE_LINE_CHARS:
+        return _shlex_tokens(line)
+    return list(_cached_shlex_tokens(line))
+
+
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield shell-tokenized command segments per logical line; a line shlex rejects (unbalanced
     quotes) falls back to per-physical-line tokenization."""
     for line in _split_logical_lines(command.replace("\\\n", "")):
         try:
-            tokens = _shlex_tokens(line)
+            tokens = _line_tokens(line)
         except ValueError:
             for physical_line in line.splitlines():
                 try:
-                    yield from _split_segments(_shlex_tokens(physical_line))
+                    yield from _split_segments(_line_tokens(physical_line))
                 except ValueError:
                     continue
             continue
@@ -658,7 +687,13 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
 def _executable_name(token: str) -> str:
     """Command name of an executable token. ``Path(token).name`` is "" for ``.``, ``..`` and ``/``;
     the POSIX dot-source builtin is spelled ``.``, so fall back to the raw token or ``.
-    ./helper.sh`` would escape the sourced-script scan."""
+    ./helper.sh`` would escape the sourced-script scan.
+
+    A token with no separator in it is its own name, which is the overwhelmingly common case and used
+    to cost a ``pathlib.Path`` construction per segment per pass; path-shaped tokens keep pathlib so
+    platform separators (and a trailing slash) are read exactly as before."""
+    if "/" not in token and "\\" not in token:
+        return token
     return Path(token).name or token
 
 
@@ -893,7 +928,7 @@ def _mask_data_sink_arguments(text: str) -> str:
             lines_out.append(line)
             continue
         try:
-            tokens = _shlex_tokens(line)
+            tokens = _line_tokens(line)
         except ValueError:
             lines_out.append(line)
             continue
@@ -1251,11 +1286,224 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
     return script_text or "", None
 
 
+# --- clean-verdict memo -----------------------------------------------------------------------
+#
+# The walk is pure work over file BYTES, so its answer for a script is a property of that script and
+# of everything the script references — never of the call. It used to be re-derived from scratch on
+# every terminal call: a 221-line, 9.7 KB routine script cost 1.1-2.5 s (7 recursion levels, ~3000
+# tokenizations) inside a bounded guard worker, which under the gateway's GIL convoy at load >165
+# could not finish in the fixed 45 s ceiling, so the command was refused instead of run (PRX-5758).
+#
+# A CLEAN subtree verdict is latched per script, keyed by (resolved path, st_mtime_ns, st_size, the
+# profile running the guard), and invalidated by anything the verdict rested on changing: the entry
+# stores a WITNESS for every path the walk touched — the exact bytes it scanned, or "nothing
+# scannable here" for a path that was missing/not a regular file — and a hit re-stats all of them.
+# Only clean verdicts are latched: a block or a refusal is recomputed and reported every time, so
+# this can never turn a block into an allow, and a miss is always a full scan.
+#
+# Two ambient facts the bytes alone do not carry, each its own hole if ignored:
+#   * the CURRENT PROFILE — `hermes -p <profile> gateway restart` is only blocked when <profile> is
+#     the one running the guard, and one gateway process serves many profiles (cron/AGENTS.md,
+#     "per-profile process assumptions are the bug class"), so the profile is part of the key.
+#   * a path the walk found NOTHING at (not created yet, or a directory) — a verdict that skipped it
+#     is only clean while it stays absent, so its absence is a witness and its appearance a miss.
+# A hit extends the caller's witness list with the whole latched subtree (flattened), never just the
+# one stamp: otherwise a grandchild edit would leave the parent's entry holding.
+_SCRIPT_VERDICT_CACHE_LIMIT = 256
+
+# ``(path, None)`` = the path held nothing scannable; ``(path, (mtime_ns, size))`` = these bytes.
+_Witness = tuple[str, Optional[tuple[int, int]]]
+_script_verdict_cache: OrderedDict[tuple[str, int, int, Optional[str]], tuple[_Witness, ...]] = OrderedDict()
+
+
+def _script_stamp(path: Path) -> Optional[tuple[str, int, int]]:
+    """Identity of the bytes at *path*: ``(resolved path, mtime_ns, size)``. ``None`` when *path* is
+    not a regular file we could have scanned (missing, directory, device, unreadable), i.e. nothing
+    to latch."""
+    try:
+        metadata = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    return (str(path), metadata.st_mtime_ns, metadata.st_size)
+
+
+def _witness(path: Path, stamp: Optional[tuple[str, int, int]]) -> _Witness:
+    """Witness for one path a walk touched: its bytes' identity, or its absence."""
+    return (str(path), None if stamp is None else (stamp[1], stamp[2]))
+
+
+def _witness_holds(witness: _Witness) -> bool:
+    try:
+        metadata = os.stat(witness[0])
+    except (OSError, ValueError):
+        return witness[1] is None
+    if not stat.S_ISREG(metadata.st_mode):
+        return witness[1] is None
+    return witness[1] == (metadata.st_mtime_ns, metadata.st_size)
+
+
+def _verdict_key(stamp: tuple[str, int, int]) -> tuple[str, int, int, Optional[str]]:
+    return (*stamp, _current_profile_name())
+
+
+def _latch_hit(stamp: tuple[str, int, int]) -> Optional[tuple[_Witness, ...]]:
+    """The latched witnesses for a still-clean *stamp*, else ``None``.
+
+    ``None`` means "walk again": no entry, or one whose witnesses no longer hold (the entry is
+    dropped, so the next write cannot revive a stale lineage)."""
+    key = _verdict_key(stamp)
+    witnesses = _script_verdict_cache.get(key)
+    if witnesses is None:
+        return None
+    if all(_witness_holds(witness) for witness in witnesses):
+        return witnesses
+    _script_verdict_cache.pop(key, None)
+    return None
+
+
+def _latch_clean_script(stamp: tuple[str, int, int], witnesses: list[_Witness]) -> None:
+    """Remember one clean verdict with every witness it rested on. Called only for a complete,
+    untruncated executed-view walk (see ``_contains_unsafe_gateway_action``)."""
+    key = _verdict_key(stamp)
+    _script_verdict_cache[key] = tuple(witnesses)
+    _script_verdict_cache.move_to_end(key)
+    while len(_script_verdict_cache) > _SCRIPT_VERDICT_CACHE_LIMIT:
+        _script_verdict_cache.popitem(last=False)
+
+
 # --- recursive walk ---------------------------------------------------------------------------
+
+def _unchargeable_outcome(
+    budget: _LifecycleScanBudget, what: str, depth: int, candidate_executed: bool
+) -> str:
+    """This candidate cannot be charged: an EXECUTED one fails closed, a mention ends the walk (the
+    remaining candidates are mentions too, and a walk that stopped short is never latched)."""
+    if candidate_executed:
+        _budget_exhausted(budget, what, depth)
+        return "block"
+    budget.partial = True
+    return "stop"
+
+
+def _read_candidate_script(
+    script_path: Path, stamp: Optional[tuple[str, int, int]], *, depth: int,
+    budget: _LifecycleScanBudget, read_remote_script: Optional[_ReadRemoteScriptFn],
+    candidate_executed: bool,
+) -> tuple[Optional[str], Optional[tuple[str, int, int]], Optional[str]]:
+    """Read one candidate's text: ``(text, stamp, outcome)``. *outcome* is ``None`` when *text* is
+    ready to scan, else the walk's next move (``"block"``/``"next"``/``"stop"``). *stamp* becomes
+    ``None`` when the text came from the backend, whose bytes are not the local file's."""
+    script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
+    if unsafe:
+        if not candidate_executed:
+            return None, stamp, "next"
+        _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
+        return None, stamp, "block"
+    if script_text is not None or read_remote_script is None:
+        return script_text, stamp, None
+    # Local path missing; the remote backend's output crosses the same trust boundary as a local
+    # read — sanitize identically (binary skip + size fail-closed).
+    if not budget.charge_remote_read():
+        return None, stamp, _unchargeable_outcome(budget, "remote reads", depth, candidate_executed)
+    # Backend bytes are not these file's bytes, so nothing here is a pure function of the stamps.
+    budget.partial = True
+    remote_text, unsafe = _sanitize_remote_script_text(
+        read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
+    )
+    if not unsafe:
+        return remote_text, None, None
+    if not candidate_executed:
+        return None, None, "next"
+    _refuse_unreadable(
+        budget, script_path,
+        f"`{script_path}` read from the backend exceeds the scan cap "
+        f"({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget",
+    )
+    return None, None, "block"
+
+
+def _scan_one_referenced_script(
+    script_path: Path, candidate_executed: bool, *, cwd: Optional[str], depth: int,
+    visited: set[Path], budget: _LifecycleScanBudget,
+    read_remote_script: Optional[_ReadRemoteScriptFn],
+    dependencies: Optional[list[_Witness]],
+) -> str:
+    """Scan one referenced script and the scripts it references: ``"block"`` when the walk must
+    refuse, ``"next"`` when this candidate contributes nothing, ``"stop"`` when the walk cannot go
+    on. Called only for a candidate the caller has not told us to fail closed on."""
+    if _on_cloud_path(script_path):
+        if not candidate_executed:
+            return "next"
+        _refuse_unreadable(
+            budget, script_path,
+            f"`{script_path}` lives on a cloud-synced path (iCloud Drive / "
+            "~/Library/CloudStorage) that the guard refuses to open",
+        )
+        return "block"
+    resolved = _resolve_lenient(script_path)
+    if resolved in visited:
+        return "next"
+    # Latch lookup before the read: a clean verdict for these exact bytes turns the whole subtree
+    # (this script AND everything it references) into a few stats. Entries are only ever stored from
+    # the executed view, so serving them to a mention is the strictly stronger verdict. The caller
+    # inherits the ENTIRE latched witness list, so a change anywhere below this script invalidates
+    # the caller's entry too.
+    stamp = _script_stamp(resolved)
+    if stamp is not None:
+        latched = _latch_hit(stamp)
+        if latched is not None:
+            if dependencies is not None:
+                dependencies.extend(latched)
+            return "next"
+    elif dependencies is not None:
+        # Nothing scannable here, so this candidate contributes nothing — a verdict resting on that
+        # is clean only while the path stays unscannable, so record its absence as a witness.
+        dependencies.append(_witness(resolved, None))
+    if not budget.charge_path():
+        return _unchargeable_outcome(budget, "paths", depth, candidate_executed)
+    visited.add(resolved)
+    # Never read more than the walk can still afford to tokenize; a file larger than the remainder
+    # fails closed exactly like an oversized one.
+    script_text, stamp, outcome = _read_candidate_script(
+        script_path, stamp, depth=depth, budget=budget,
+        read_remote_script=read_remote_script, candidate_executed=candidate_executed,
+    )
+    if outcome is not None:
+        return outcome
+    if not script_text:
+        return "next"
+    # These bytes are part of the caller's answer, whichever view read them: a caller's latched
+    # verdict depends on every file it read, mentions included (a mention can carry the literal
+    # lifecycle command that blocks it).
+    own: list[_Witness] = [] if stamp is None else [_witness(resolved, stamp)]
+    if dependencies is not None:
+        dependencies.extend(own)
+    child_dependencies: list[_Witness] = []
+    # Relative references inside a script resolve against that script's directory, not the cwd.
+    if _contains_unsafe_gateway_action(
+        script_text, cwd=_resolve_script_directory(str(resolved)) or cwd, depth=depth + 1,
+        visited=visited, budget=budget, read_remote_script=read_remote_script,
+        executed=candidate_executed, dependencies=child_dependencies,
+    ):
+        return "block"
+    if dependencies is not None:
+        dependencies.extend(child_dependencies)
+    if (
+        candidate_executed and stamp is not None and not budget.partial
+        and _script_stamp(resolved) == stamp
+    ):
+        # The scanned bytes are still the bytes at *stamp* (a rewrite mid-scan is a miss, never a
+        # stale entry), the walk ran to completion, and nothing in the subtree blocked.
+        _latch_clean_script(stamp, own + child_dependencies)
+    return "next"
+
 
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
+    dependencies: Optional[list[_Witness]] = None,
 ) -> bool:
     """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
@@ -1268,10 +1516,14 @@ def _contains_unsafe_gateway_action(
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return executed
 
-    def recurse(text: str, cwd: Optional[str], executed: bool) -> bool:
+    def recurse(
+        text: str, cwd: Optional[str], executed: bool,
+        child_dependencies: Optional[list[_Witness]] = None,
+    ) -> bool:
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
             read_remote_script=read_remote_script, executed=executed,
+            dependencies=child_dependencies,
         )
 
     # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
@@ -1282,7 +1534,8 @@ def _contains_unsafe_gateway_action(
     walk_command = strip_inert_heredoc_bodies(command)
 
     for payload in _iter_shell_command_payloads(walk_command):
-        if recurse(payload, cwd, executed):
+        # A payload is the same text, executed — its script reads are this level's dependencies.
+        if recurse(payload, cwd, executed, dependencies):
             return True
 
     # Paths named only inside a masked body are still READ: an interpreter body that hands
@@ -1294,53 +1547,14 @@ def _contains_unsafe_gateway_action(
         candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)]
 
     for script_path, candidate_executed in candidates:
-        # Do not touch a FileProvider path even to discover whether the file is hydrated.
-        if _on_cloud_path(script_path):
-            if candidate_executed:
-                return _refuse_unreadable(
-                    budget, script_path,
-                    f"`{script_path}` lives on a cloud-synced path (iCloud Drive / "
-                    "~/Library/CloudStorage) that the guard refuses to open",
-                )
-            continue
-        resolved = _resolve_lenient(script_path)
-        if resolved in visited:
-            continue
-        if not budget.charge_path():
-            if candidate_executed:
-                return _budget_exhausted(budget, "paths", depth)
-            break  # remaining candidates are all mentions
-        visited.add(resolved)
-        # Never read more than the walk can still afford to tokenize; a file larger than the
-        # remainder fails closed exactly like an oversized one.
-        script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
-        if unsafe:
-            if candidate_executed:
-                return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
-            continue
-        if script_text is None and read_remote_script is not None:
-            # Local path missing; the remote backend's output crosses the same trust boundary as a
-            # local read — sanitize identically (binary skip + size fail-closed).
-            if not budget.charge_remote_read():
-                if candidate_executed:
-                    return _budget_exhausted(budget, "remote reads", depth)
-                break
-            script_text, unsafe = _sanitize_remote_script_text(
-                read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
-            )
-            if unsafe:
-                if candidate_executed:
-                    return _refuse_unreadable(
-                        budget, script_path,
-                        f"`{script_path}` read from the backend exceeds the scan cap "
-                        f"({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget",
-                    )
-                continue
-        if not script_text:
-            continue
-        # Relative references inside a script resolve against that script's directory, not the cwd.
-        if recurse(script_text, _resolve_script_directory(str(resolved)) or cwd, candidate_executed):
+        outcome = _scan_one_referenced_script(
+            script_path, candidate_executed, cwd=cwd, depth=depth, visited=visited,
+            budget=budget, read_remote_script=read_remote_script, dependencies=dependencies,
+        )
+        if outcome == "block":
             return True
+        if outcome == "stop":
+            break
     return False
 
 

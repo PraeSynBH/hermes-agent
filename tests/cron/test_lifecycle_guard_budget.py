@@ -73,15 +73,21 @@ def test_lifecycle_scan_root_within_budget_is_not_a_verdict(monkeypatch):
 
 
 def test_unique_path_budget_bounds_reads_and_fails_closed(monkeypatch, tmp_path):
+    """A walk that has to READ more paths than the cap fails closed.
+
+    Both commands name FRESH scripts: a script the guard already walked clean is answered from its
+    latch without a read, so it spends no path (that is the point of the latch — the budget bounds
+    work, and there is none left to do). The cap is asserted on the scripts that are actually read.
+    """
     monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_PATHS", 2)
-    for i in range(3):
+    for i in range(5):
         (tmp_path / f"s{i}.sh").write_text("echo ok\n", encoding="utf-8")
 
-    two = " && ".join(f"bash {shlex.quote(str(tmp_path / f's{i}.sh'))}" for i in range(2))
-    three = " && ".join(f"bash {shlex.quote(str(tmp_path / f's{i}.sh'))}" for i in range(3))
+    def command(*indexes):
+        return " && ".join(f"bash {shlex.quote(str(tmp_path / f's{i}.sh'))}" for i in indexes)
 
-    assert guard(two) is False
-    assert guard(three) is True
+    assert guard(command(0, 1)) is False
+    assert guard(command(2, 3, 4)) is True
 
 
 def test_repeated_path_does_not_spend_unique_path_budget(monkeypatch, tmp_path):
@@ -114,15 +120,17 @@ def test_cumulative_text_budget_bounds_recursive_scan(monkeypatch, tmp_path):
     """Two scripts individually under the per-file cap exceed the walk cap.
 
     Relative references keep the root command short so the budget arithmetic
-    is about the scripts, not the tmp_path length."""
+    is about the scripts, not the tmp_path length. The second command names two
+    scripts the first never walked: a latched script is not tokenized again and
+    so spends no text budget, and this asserts the cap on the text that IS scanned."""
     monkeypatch.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_BYTES", 48)
-    (tmp_path / "a.sh").write_text("echo " + "a" * 10 + "\n", encoding="utf-8")  # 16
-    (tmp_path / "b.sh").write_text("echo " + "b" * 10 + "\n", encoding="utf-8")  # 16
+    for letter in "abcd":
+        (tmp_path / f"{letter}.sh").write_text("echo " + letter * 10 + "\n", encoding="utf-8")  # 16
     cwd = str(tmp_path)
 
     # 9 (root) + 16 fits in 48; 19 (root) + 16 + 16 does not → fail closed.
     assert guard("bash a.sh", cwd=cwd) is False
-    assert guard("bash a.sh;bash b.sh", cwd=cwd) is True
+    assert guard("bash c.sh;bash d.sh", cwd=cwd) is True
 
 
 
