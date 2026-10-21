@@ -247,6 +247,14 @@ async def ensure_hosted_service(runner):
 
 
 async def _ensure_hosted_service(runner, authority):
+    # Steady state, checked BEFORE the scope: the 1 s hosted-room watcher re-enters this for every
+    # serving authority forever, and entering ``owner_scope`` rebuilds that profile's secret and
+    # terminal policy (managed-dir stat, ``.env`` read, ``config.yaml`` parse on a cold cache) — the
+    # frame three of PRX-5524's blocked-loop dumps sampled. A prepared service needs neither, so its
+    # tick is two getattrs.
+    service = getattr(authority, 'hosted_room_service', None)
+    if service is not None and getattr(service, '_transport_installed', False):
+        return
     with owner_scope(authority):
         service = getattr(authority, 'hosted_room_service', None)
         if service is None:
