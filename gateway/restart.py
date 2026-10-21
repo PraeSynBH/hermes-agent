@@ -53,10 +53,14 @@ DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT = float(DEFAULT_CONFIG["agent"]["rest
 # resume_pending); an interrupted *cron* run is a permanent failure in jobs.json and an interrupted
 # /v1 run fails its waiting caller — a 0s drain silently destroys work.
 DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT = float(DEFAULT_CONFIG["agent"]["cron_drain_timeout"])
-# Watchdog leash held back for post-drain work (interrupt agents, kill subprocesses, mark jobs,
-# disconnect adapters). Waiting for cron past that trades a job killed *and recorded* for one
-# SIGKILLed mid-write and wedged at ``last_status=running`` forever.
-CRON_DRAIN_CLEANUP_RESERVE_S = 10.0
+# Post-drain work: interrupt agents, kill subprocesses, settle, disconnect adapters, checkpoint and
+# close SQLite. MEASURED, not assumed — `Gateway stopped (total teardown 11.00s)` at the 2026-10-21
+# 05:59 restart. A reserve below this is what made the watchdog fire mid-teardown (PRX-5828).
+POST_DRAIN_CLEANUP_BUDGET_S = 12.0
+POST_DRAIN_CLEANUP_SAFETY_S = 2.0
+# Watchdog leash held back for post-drain work. Waiting for cron past that trades a job killed *and
+# recorded* for one SIGKILLed mid-write and wedged at ``last_status=running`` forever.
+CRON_DRAIN_CLEANUP_RESERVE_S = POST_DRAIN_CLEANUP_BUDGET_S + POST_DRAIN_CLEANUP_SAFETY_S
 # systemd TimeoutStopSec headroom after the stop-path drain budget, and the floor when that
 # budget is still the default immediate (0s) chat drain. Keep in lockstep with generate_systemd_unit().
 # See #94759.
@@ -72,11 +76,26 @@ SYSTEMD_TIMEOUT_STOP_SEC_FLOOR = 60.0
 # SIGKILLs at N seconds, mid-SQLite-write on a busy restart, which is the
 # unclean-exit half of the state.db corruption class.
 LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S = 60
-LAUNCHD_STOP_CLEANUP_RESERVE_S = 10.0
 # How far before launchd's SIGKILL the thread watchdog must fire so its
 # faulthandler dump + os._exit actually land (the dump is sub-second; the
 # margin covers a slow disk).
 LAUNCHD_WATCHDOG_DUMP_MARGIN_S = 2.0
+# The watchdog bounds a SEQUENCE of phases, not one drain (PRX-5828): notify the active sessions,
+# drain them, then tear down. Each phase has its own bound and each bound is fine on its own; their
+# SUM was not, because the drain cap was sized from a single 10 s reserve while the leash counted
+# from SIGTERM. With notify 1.2-5.6 s + a 50 s cap + an 11 s teardown (62.2-66.6 s) against a 58 s
+# lease, a turn finishing late in the drain amputated the teardown — 7 `interrupted` heartbeat rows
+# at 15:55:19Z, on an event loop parked in select(). Notify is measured (1.21 s at the 15:54
+# restart, 5.57 s at 14:07); teardown and the dump margin are in the reserve below.
+LAUNCHD_NOTIFY_BUDGET_S = 6.0
+# Everything the drain cap must leave room for inside the watchdog's own deadline: the dump margin
+# (the leash is counted from stop(), the dump fires just before launchd's SIGKILL) + notify + the
+# post-drain phases. So on the clamped 60 s budget: 60 - 2 - 6 - 12 - 2 = 38 s of drain, and
+# 6 + 38 + 14 = 58 s of phases under the 58 s leash. Every term is a measured or reserved budget —
+# never a bare default a later capper silently shrinks.
+LAUNCHD_STOP_CLEANUP_RESERVE_S = (
+    LAUNCHD_WATCHDOG_DUMP_MARGIN_S + LAUNCHD_NOTIFY_BUDGET_S + CRON_DRAIN_CLEANUP_RESERVE_S
+)
 
 _LAUNCHD_EXIT_TIMEOUT_RE = re.compile(r"^\s*exit timeout\s*=\s*(\d+)\s*$", re.MULTILINE)
 
@@ -176,6 +195,12 @@ def resolve_launchd_capped_drain(
     and close SQLite) still completes before launchd escalates to SIGKILL.
     Never *extends* the drain — an operator who configured a short one
     keeps it.
+
+    The default reserve is the *sum* of the phases the SIGTERM-to-exit window
+    carries besides the drain (notify + post-drain cleanup + the watchdog's
+    dump margin, :data:`LAUNCHD_STOP_CLEANUP_RESERVE_S`): a reserve that only
+    covers the teardown still leaves notify to eat the margin, which is how a
+    50 s cap against a 58 s leash amputated an 11 s teardown (PRX-5828).
     """
 
     drain = _seconds(drain_timeout)
@@ -183,6 +208,27 @@ def resolve_launchd_capped_drain(
     if budget <= 0.0:
         return drain
     return min(drain, max(budget - _seconds(cleanup_reserve_s), 0.0))
+
+
+def describe_launchd_drain_cap(
+    effective_drain: float, configured_drain: float, exit_timeout_s: float | None,
+    watchdog_leash_s: float,
+) -> str:
+    """The audit line for a capped launchd drain, with the whole phase arithmetic spelled out.
+
+    A cap that is silently a ``default - 10`` is how PRX-5828 happened: the reader of the log could
+    not see that notify + drain + teardown were being summed against a lease none of them was sized
+    for. This prints every term, so "the cap is too big" and "teardown took longer than budget" are
+    distinguishable from the log alone.
+    """
+    timeout = 0.0 if exit_timeout_s is None else _seconds(exit_timeout_s)
+    return (
+        f"Shutdown drain capped to {_seconds(effective_drain):.0f}s "
+        f"(configured {_seconds(configured_drain):.0f}s) for the live launchd exit timeout of "
+        f"{timeout:.0f}s: notify {LAUNCHD_NOTIFY_BUDGET_S:.0f}s + drain + teardown "
+        f"{CRON_DRAIN_CLEANUP_RESERVE_S:.0f}s must fit the {_seconds(watchdog_leash_s):.0f}s watchdog "
+        f"leash — launchd SIGKILLs at {timeout:.0f}s"
+    )
 
 
 def effective_stop_drain_timeout(runner: object) -> float:
@@ -206,8 +252,8 @@ def effective_stop_watchdog_delay(runner: object, watchdog_delay: float) -> floa
 
     ``watchdog_delay`` is the supervisor-agnostic leash (effective drain +
     grace). Under launchd a signal-driven stop is SIGKILLed at the live
-    ``ExitTimeOut`` — with a 60s budget the default leash (50 + 60 = 110s)
-    can never fire, so the forensic stack dump and ``os._exit`` the watchdog
+    ``ExitTimeOut`` — with a 60s budget the leash (38 + 60 = 98s) can never
+    fire, so the forensic stack dump and ``os._exit`` the watchdog
     exists for are lost. Clamp the leash to ``ExitTimeOut -
     LAUNCHD_WATCHDOG_DUMP_MARGIN_S`` so the dump lands before SIGKILL. Same
     duck-typing / fail-open rules as :func:`effective_stop_drain_timeout`.

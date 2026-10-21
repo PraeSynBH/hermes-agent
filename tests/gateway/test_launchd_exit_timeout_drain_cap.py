@@ -97,7 +97,10 @@ def _runner(*, drain: float, launchd: float | None, by_signal: bool):
 
 def test_effective_drain_capped_only_for_signal_stops_under_launchd():
     signal_stop = _runner(drain=180.0, launchd=60.0, by_signal=True)
-    assert effective_stop_drain_timeout(signal_stop) == 50.0
+    # The cap is ExitTimeOut minus every phase the stop still has to run (notify + teardown + the
+    # watchdog's dump margin), never a bare reserve: see test_shutdown_watchdog_phase_budget.py for
+    # the arithmetic itself (PRX-5828).
+    assert effective_stop_drain_timeout(signal_stop) == _CAPPED
     # In-band restart (SIGUSR1 → after-turn → stop()) is not launchd-timed.
     assert effective_stop_drain_timeout(_runner(drain=180.0, launchd=60.0, by_signal=False)) == 180.0
     # Not launchd-owned (systemd, s6, foreground): configured drain stands.
@@ -121,4 +124,4 @@ def test_sigterm_handler_marks_stop_as_signal_driven_unless_planned_takeover(mon
     runner.stop = lambda: asyncio.sleep(0)
     run_mod._start_gateway_make_shutdown_signal_handler(runner, [False])(signal.SIGTERM)
     assert runner._stop_requested_by_signal is (not takeover)
-    assert effective_stop_drain_timeout(runner) == (180.0 if takeover else 50.0)
+    assert effective_stop_drain_timeout(runner) == (180.0 if takeover else _CAPPED)
