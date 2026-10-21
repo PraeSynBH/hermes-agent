@@ -13,6 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
+from datetime import UTC
+from pathlib import Path
 
 import pytest
 
@@ -20,7 +25,7 @@ import gateway.drain_control as dc
 from gateway.run import GatewayRunner
 from gateway.platforms.event import MessageEvent, MessageType
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
-from datetime import UTC
+from tests.waiting import wait_until
 
 
 # ---------------------------------------------------------------------------
@@ -40,12 +45,12 @@ class TestMarkerContract:
         assert dc.read_drain_request() is None
 
     def test_write_then_present(self, home):
-        payload = dc.write_drain_request(principal="nas")
+        payload = dc.write_drain_request(principal="drain-control")
         assert dc.drain_requested() is True
         assert payload["action"] == "drain"
-        assert payload["principal"] == "nas"
+        assert payload["principal"] == "drain-control"
         body = dc.read_drain_request()
-        assert body is not None and body["principal"] == "nas"
+        assert body is not None and body["principal"] == "drain-control"
 
 
 class TestSuppressNotification:
@@ -58,12 +63,12 @@ class TestSuppressNotification:
     """
 
     def test_default_false(self, home):
-        payload = dc.write_drain_request(principal="nas")
+        payload = dc.write_drain_request(principal="drain-control")
         assert payload["suppress_notification"] is False
         assert dc.drain_notification_suppressed() is False
 
     def test_flag_round_trips_true(self, home):
-        payload = dc.write_drain_request(principal="nas", suppress_notification=True)
+        payload = dc.write_drain_request(principal="drain-control", suppress_notification=True)
         assert payload["suppress_notification"] is True
         body = dc.read_drain_request()
         assert body is not None and body["suppress_notification"] is True
@@ -77,7 +82,7 @@ class TestSuppressNotification:
 
 class TestInstantiationEpoch:
     def test_write_stamps_current_epoch(self, home):
-        payload = dc.write_drain_request(principal="nas")
+        payload = dc.write_drain_request(principal="drain-control")
         assert payload["epoch"] == dc.current_instantiation_epoch()
         body = dc.read_drain_request()
         assert body is not None and body["epoch"] == dc.current_instantiation_epoch()
@@ -89,7 +94,7 @@ class TestInstantiationEpoch:
         # across a machine restart. The freshly-restarted gateway (new epoch)
         # must treat it as absent, NOT re-engage drain.
         monkeypatch.setattr(dc, "current_instantiation_epoch", lambda: "epoch-OLD")
-        dc.write_drain_request(principal="nas")  # stamps "epoch-OLD"
+        dc.write_drain_request(principal="drain-control")  # stamps "epoch-OLD"
         assert dc.drain_requested() is True  # same epoch → active
 
         # Simulate the restart: a brand-new instantiation epoch.
@@ -100,6 +105,7 @@ class TestInstantiationEpoch:
         assert dc.drain_requested() is False
 
 
+    @pytest.mark.platforms("linux")
     def test_current_epoch_empty_when_proc_unreadable(self, monkeypatch):
         # When neither /proc identity source is readable, the epoch is "" so
         # the staleness check is disabled rather than crashing.
@@ -120,12 +126,51 @@ class TestInstantiationEpoch:
             dc.current_instantiation_epoch.cache_clear()
 
 
-# ---------------------------------------------------------------------------
-# requested_at max-age (#85433: same-epoch orphaned marker, no restart)
-# ---------------------------------------------------------------------------
+@pytest.mark.platforms("macos")
+class TestDarwinInstantiationEpoch:
+    """SOU-3249: off Linux the epoch was ``""``, so no marker could ever read as stale — the
+    restart-surviving guard was disabled on the only host acceptance harnesses run on."""
+
+    def _epoch_with_boot_time(self, monkeypatch, boot_time):
+        import psutil
+
+        monkeypatch.setattr(psutil, "boot_time", lambda: boot_time)
+        dc.current_instantiation_epoch.cache_clear()
+        return dc.current_instantiation_epoch()
+
+    def test_epoch_is_a_boot_stamp(self, monkeypatch):
+        try:
+            assert self._epoch_with_boot_time(monkeypatch, 1_700_000_000.9) == "darwin-boot:1700000000"
+        finally:
+            dc.current_instantiation_epoch.cache_clear()
+
+    def test_a_reboot_makes_a_surviving_marker_stale(self, home, monkeypatch):
+        try:
+            self._epoch_with_boot_time(monkeypatch, 1_700_000_000.9)
+            dc.write_drain_request(principal="drain-control")
+            assert dc.drain_requested() is True  # same boot → honoured
+            self._epoch_with_boot_time(monkeypatch, 1_700_009_999.0)  # the machine rebooted
+        finally:
+            dc.current_instantiation_epoch.cache_clear()
+        # The marker survived on the durable volume; the new boot must ignore it.
+        assert dc.drain_request_path().exists() is True
+        assert dc.drain_requested() is False
+
+    def test_real_host_epoch_is_not_empty(self):
+        # The lane that runs acceptance harnesses must be able to prove its own boot identity.
+        dc.current_instantiation_epoch.cache_clear()
+        try:
+            assert dc.current_instantiation_epoch().startswith("darwin-boot:")
+        finally:
+            dc.current_instantiation_epoch.cache_clear()
 
 
 class TestMarkerMaxAge:
+
+    def test_max_age_stays_under_the_canary_threshold(self):
+        # 45 min of fleet silence pages CanaryDeadmanDown, so a leaked marker's own bound must be
+        # well inside it (SOU-3249: 3600 s made one leaked harness marker a guaranteed page).
+        assert dc.DRAIN_REQUEST_MAX_AGE_SECONDS <= 15 * 60
 
     def test_expired_marker_reads_as_absent(self, home):
         # THE #85433 REGRESSION. A drain-gated action completes WITHOUT a
@@ -133,7 +178,7 @@ class TestMarkerMaxAge:
         # cancelled the drain. The orphan must not wedge the gateway forever.
         from datetime import datetime, timedelta, timezone
 
-        dc.write_drain_request(principal="nas", suppress_notification=True)
+        dc.write_drain_request(principal="drain-control", suppress_notification=True)
         body = dc.read_drain_request()
         assert body is not None
         body["requested_at"] = (
@@ -189,7 +234,7 @@ class TestMarkerMaxAge:
         from datetime import datetime, timedelta, timezone
 
         def _write_expired(offset_seconds):
-            dc.write_drain_request(principal="nas")
+            dc.write_drain_request(principal="drain-control")
             body = dc.read_drain_request()
             assert body is not None
             body["requested_at"] = (
@@ -218,7 +263,7 @@ class TestMarkerMaxAge:
         # so a deliberately long drain stays honoured.
         from datetime import datetime, timedelta, timezone
 
-        dc.write_drain_request(principal="nas")
+        dc.write_drain_request(principal="drain-control")
         body = dc.read_drain_request()
         assert body is not None
         body["requested_at"] = (
@@ -227,8 +272,109 @@ class TestMarkerMaxAge:
         ).isoformat()
         dc.drain_request_path().write_text(json.dumps(body), encoding="utf-8")
         assert dc.drain_requested() is False  # expired…
-        dc.write_drain_request(principal="nas")  # …keep-alive re-write
+        dc.write_drain_request(principal="drain-control")  # …keep-alive re-write
         assert dc.drain_requested() is True
+
+
+# ---------------------------------------------------------------------------
+# Principal trust boundary + writer liveness (SOU-3249)
+# ---------------------------------------------------------------------------
+
+
+def _marker_body(**overrides):
+    """A hand-written marker: the shape an out-of-tree harness produces."""
+    from datetime import datetime
+
+    body = {
+        "action": "drain",
+        "requested_at": datetime.now(UTC).isoformat(),
+        "principal": "drain-control",
+        "epoch": dc.current_instantiation_epoch(),
+        "suppress_notification": False,
+    }
+    body.update(overrides)
+    return body
+
+
+def _write_marker(body):
+    dc.drain_request_path().write_text(json.dumps(body), encoding="utf-8")
+
+
+class TestPrincipalTrustBoundary:
+    """A drain refuses admission fleet-wide, so only the authenticated seams may ask for one."""
+
+    def test_acceptance_harness_marker_is_not_honoured(self, home):
+        # THE SOU-3249 PAYLOAD. The PRX-5802 harness hand-wrote exactly this
+        # (paperclip/prx-5802-drain-gate/measure4.py:135-147) at 2026-10-21T12:17:08Z; the live
+        # gateway refused admission for 60 min and paged CanaryDeadmanDown.
+        _write_marker(_marker_body(principal="prx-5802 acceptance v5", epoch="", suppress_notification=True))
+        assert dc.drain_requested() is False
+        assert dc.drain_notification_suppressed() is False
+
+    def test_unknown_principal_written_through_the_api_is_inert(self, home):
+        payload = dc.write_drain_request(principal="prx-5802 acceptance v5", suppress_notification=True)
+        assert payload["test_only"] is True
+        assert payload["suppress_notification"] is False  # a harness may never silence the signal
+        assert dc.drain_requested() is False
+
+    def test_test_only_flag_is_refused_even_for_a_trusted_principal(self, home):
+        payload = dc.write_drain_request(principal="drain-control", test_only=True)
+        assert payload["test_only"] is True
+        assert payload["suppress_notification"] is False
+        assert dc.drain_requested() is False
+
+    def test_corrupt_marker_still_drains(self, home):
+        # Fail-safe toward quiescing is unchanged: a half-written file carries no principal to
+        # refuse, and un-quiescing a fleet mid-update is the worse failure.
+        dc.drain_request_path().write_text("{not json", encoding="utf-8")
+        assert dc.drain_requested() is True
+
+
+# A writer that outlives its own marker unless the reader notices it is gone: it writes, reports
+# the path, and then blocks on stdin (which is what a killed harness looks like).
+_CHILD_WRITER = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import gateway.drain_control as dc
+dc.write_drain_request(principal="drain-control")
+print(dc.drain_request_path(), flush=True)
+sys.stdin.read()
+"""
+
+
+class TestWriterLiveness:
+
+    def test_marker_from_a_sigkilled_writer_is_not_honoured(self, home):
+        # THE SOU-3249 REGRESSION. SIGKILL runs no finally and no atexit, so the marker outlives
+        # its writer; the live gateway must stop honouring it on the next watcher tick instead of
+        # refusing admission until the max-age.
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _CHILD_WRITER, str(Path(dc.__file__).resolve().parents[1])],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            env={**os.environ, "HERMES_HOME": str(home)},
+        )
+        assert proc.stdin is not None and proc.stdout is not None
+        try:
+            assert proc.stdout.readline().strip() == str(dc.drain_request_path())
+            assert dc.drain_requested() is True  # a live writer still holds the drain
+        finally:
+            proc.kill()
+            proc.wait(timeout=60)
+            for stream in (proc.stdin, proc.stdout):
+                if stream is not None:
+                    stream.close()
+        assert wait_until(lambda: dc.drain_requested() is False,
+                          what="the dead writer's marker to be ignored")
+
+    def test_a_recycled_pid_is_not_the_writer(self, home):
+        import psutil
+        from hermes_cli.process_identity import process_birth
+
+        # Same pid as this (live) process, born an hour earlier: a different incarnation, so the
+        # marker is an orphan and not a live drain. Bare PID existence proves nothing.
+        _write_marker(_marker_body(writer_pid=os.getpid(),
+                                   writer_birth=process_birth(psutil.Process()) - 3600))
+        assert dc.drain_requested() is False
 
 
 # ---------------------------------------------------------------------------
