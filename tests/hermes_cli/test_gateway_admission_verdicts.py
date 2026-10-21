@@ -251,6 +251,87 @@ def test_a_garbage_ticket_grant_is_an_admission_error_not_a_traceback(monkeypatc
     assert "phase=session-ticket" in line and "invalid_control_response" in line, line
 
 
+def _draining_discovery(runtime):
+    """A restart's after-turn wait as ``ensure`` hands it out: draining, but dialable (#139041)."""
+    from types import SimpleNamespace
+
+    endpoint = SimpleNamespace(api_origin="http://127.0.0.1:1", profile_id="p", instance_id="waiting-owner",
+                               code_sha="0b10", control_home=None)
+    return runtime.GatewayDiscovery("draining", endpoint=endpoint, reason_code="restart_wait")
+
+
+@pytest.mark.platforms("posix")
+def test_new_work_waits_out_the_restart_wait_owner_instead_of_attaching(monkeypatch):
+    """A spawn must not attach to a restart's after-turn wait (PRX-5791).
+
+    The wait owner is attachable on purpose — the turn parked on approval/clarify has to be
+    answerable (#139041) — but PRX-5787 closed its claim path from T=0. A finite run that dialled it
+    booted, printed ``Error: runtime_draining`` at its first ``session.create`` and exited 1: 101
+    heartbeat runs across the 21:38 and 23:05-23:25 drains, every one a spawn spent on a wait. A run
+    with new work waits for the owner that replaces the wait, inside its one admission budget.
+    """
+    from hermes_cli import gateway_client, gateway_runtime
+
+    observed: list[float | None] = []
+    monkeypatch.setattr(gateway_client, "DRAIN_POLL_INTERVAL_S", 0.02)
+    monkeypatch.setattr(gateway_client, "admission_budget_seconds", lambda: 0.3)
+
+    def ensure(*args, **kwargs):
+        observed.append(kwargs.get("timeout"))
+        return _draining_discovery(gateway_runtime)
+
+    monkeypatch.setattr(gateway_runtime, "ensure_gateway_runtime", ensure)
+
+    def attach(*args, **kwargs):
+        raise AssertionError("a run with new work must not attach to a restart-wait owner")
+
+    monkeypatch.setattr(gateway_client, "_session_ticket", attach)
+
+    async def run():
+        async with gateway_client.connect_gateway(new_work=True):
+            raise AssertionError("nothing may be submitted to a shutting-down owner")
+
+    with pytest.raises(gateway_client.GatewayAdmissionTimeout) as caught:
+        asyncio.run(run())
+    line = str(caught.value)
+    assert "phase=runtime-drain" in line and "restart_wait" in line, line
+    assert len(observed) >= 3, f"the drain is re-observed inside the budget, not spent by one call: {observed}"
+
+
+@pytest.mark.platforms("posix")
+def test_an_interactive_client_still_attaches_to_the_restart_wait_owner(monkeypatch):
+    """Why the wait stays reachable at all: its own turn may be parked on a human (#139041)."""
+    from hermes_cli import gateway_client, gateway_runtime
+
+    discovery = _draining_discovery(gateway_runtime)
+    monkeypatch.setattr(gateway_runtime, "ensure_gateway_runtime", lambda *a, **k: discovery)
+
+    def attach(*args, **kwargs):
+        raise gateway_client.GatewayClientError("ATTACHED")
+
+    monkeypatch.setattr(gateway_client, "_session_ticket", attach)
+
+    async def run():
+        async with gateway_client.connect_gateway():
+            raise AssertionError("the stub always refuses")
+
+    with pytest.raises(gateway_client.GatewayClientError) as caught:
+        asyncio.run(run())
+    assert "ATTACHED" in str(caught.value)
+
+
+def test_a_finite_run_is_the_client_that_has_new_work(monkeypatch):
+    """The one-shot marker (``-q``/``-z``) is what selects the wait; an interactive viewer does not."""
+    from hermes_cli.gateway_connection import GatewayConnection
+
+    for key in ("HERMES_SESSION_SOURCE", "HERMES_SESSION_SOURCE_EXPLICIT"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    assert GatewayConnection().new_work is True
+    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION")
+    assert GatewayConnection().new_work is False
+
+
 def test_boot_evidence_names_create_time_and_start_time(tmp_path):
     """A boot verdict can say how long this host's boot took, from the lifecycle ledger (AC2)."""
     from hermes_cli import gateway_runtime as runtime
