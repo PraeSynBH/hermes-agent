@@ -445,6 +445,36 @@ class TestMemoryStoreCharLimitOnLoad:
             MemoryStore(memory_char_limit=500, user_char_limit=300).load_from_disk()
         assert "exceeds" not in caplog.text
 
+    def test_warning_names_the_profile_home(self, tmp_path, monkeypatch, caplog):
+        """One gateway serves many profiles, so the bare filename made every over-budget
+        warning (1,347 of them, PRX-5813) unattributable without matching char counts by hand."""
+        import logging
+        home = tmp_path / "profiles" / "cto"
+        (home / "memories").mkdir(parents=True)
+        (home / "memories" / "MEMORY.md").write_text("x" * 600, encoding="utf-8")
+        (home / "memories" / "USER.md").write_text("y" * 400, encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        with caplog.at_level(logging.WARNING):
+            MemoryStore(memory_char_limit=500, user_char_limit=300).load_from_disk()
+        assert "profiles/cto) exceeds" in caplog.text
+        assert caplog.text.count("profiles/cto) exceeds") == 2  # MEMORY.md and USER.md
+
+    def test_blocked_entry_warning_names_the_profile_home(self, tmp_path, monkeypatch, caplog):
+        """A threat-scan block is neither a char-limit refusal nor a deletion: the entry stays on
+        disk and only the snapshot gets a placeholder — the log has to say whose store it was."""
+        import logging
+        home = tmp_path / "profiles" / "ceo"
+        (home / "memories").mkdir(parents=True)
+        (home / "memories" / "MEMORY.md").write_text("read the key from ~/.hermes/.env", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        with caplog.at_level(logging.WARNING):
+            store = MemoryStore(memory_char_limit=500)
+            store.load_from_disk()
+        assert "profiles/ceo) blocked at load time: hermes_env" in caplog.text
+        # The raw entry survives on disk and in the live list; only the prompt copy is blocked.
+        assert store.memory_entries == ["read the key from ~/.hermes/.env"]
+        assert "[BLOCKED:" in (store.format_for_system_prompt("memory") or "")
+
 
 class TestMemoryStoreSnapshot:
     def test_snapshot_frozen_at_load(self, store):
