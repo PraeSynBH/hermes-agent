@@ -5,6 +5,7 @@ answered -32601. Each action is the typed slash command the button stands for, r
 ``execute_command`` (the gateway's own /goal /loop /heartbeat /subgoal handlers, with their
 capability, local-source, admission and busy rules), answered with the owner's control snapshot.
 """
+import asyncio
 import logging
 
 from hermes_state_runtime import RuntimeStoreError
@@ -72,6 +73,27 @@ async def _subgoal(connection, ref, params, action, args):
     return {'type': 'exec', 'output': output}
 
 
+def _apply_snapshot(live, session_id, snapshot, *, only_if_present, only_if_changed):
+    """Gate one already-read snapshot against the live entry, then publish it. The ONE revision gate.
+
+    Split out so the off-loop reader below cannot drift from the synchronous ``publish``: the gate is
+    the subtle part (an unchanged revision must publish nothing, and ``control_revision`` is read and
+    written on the loop either way, which is what keeps publishes ordered).
+    """
+    if (only_if_present and not snapshot['revision']) or (
+            only_if_changed and snapshot['revision'] == live.control_revision):
+        return False
+    live.control_revision = snapshot['revision']
+    live.event_stream.publish(session_id, {'control': snapshot}, event_type='session.control.update')
+    return True
+
+
+def _read_snapshot(authority, session_id):
+    from gateway.session_ancillary import control_snapshot
+    from gateway.session_contract import SessionRef
+    return control_snapshot(authority, SessionRef(authority.profile_id, session_id))
+
+
 def publish(authority, session_id, *, only_if_present=False, only_if_changed=False):
     """Push one live session's control snapshot to every viewer as ``session.control.update``.
 
@@ -80,21 +102,41 @@ def publish(authority, session_id, *, only_if_present=False, only_if_changed=Fal
     slash commands, a fired or settled loop wakeup, a judged turn, a tool that changed it mid-turn.
     ``only_if_present`` skips a session with no automation state (a plain turn's event stream stays
     unchanged); ``only_if_changed`` also skips one whose snapshot matches the last one published.
+
+    This is the INLINE flavour, for a caller already off the loop or one that must publish inside a
+    command that just mutated the state. A hot caller on the loop uses
+    :func:`publish_if_changed_offloop` instead.
     """
     live = authority.sessions.get(session_id) if authority is not None else None
     if live is None:
         return
-    from gateway.session_ancillary import control_snapshot
-    from gateway.session_contract import SessionRef
     try:
-        snapshot = control_snapshot(authority, SessionRef(authority.profile_id, session_id))
+        snapshot = _read_snapshot(authority, session_id)
     except RuntimeStoreError:  # unreadable row: the change itself already landed; the next publish repaints
         logger.debug('session.control.update skipped for %s', session_id, exc_info=True)
         return
-    if (only_if_present and not snapshot['revision']) or (only_if_changed and snapshot['revision'] == live.control_revision):
+    _apply_snapshot(live, session_id, snapshot,
+                    only_if_present=only_if_present, only_if_changed=only_if_changed)
+
+
+async def publish_if_changed_offloop(authority, session_id):
+    """``publish(..., only_if_changed=True)`` with the snapshot READ in a worker thread.
+
+    The read is SQLite work — the compression tip plus three ``get_meta`` reads per call — and the
+    after-each-tool caller fires it once per tool of every live turn, from the loop. At fleet size
+    that is the highest-frequency blocker in the gateway's own blocked-loop dumps (PRX-5524: three
+    of fourteen stalls sampled exactly here). Comparing and publishing still happen inline on the
+    loop, so ordering against the slash commands' publishes is unchanged.
+    """
+    live = authority.sessions.get(session_id) if authority is not None else None
+    if live is None:
         return
-    live.control_revision = snapshot['revision']
-    live.event_stream.publish(session_id, {'control': snapshot}, event_type='session.control.update')
+    try:
+        snapshot = await asyncio.to_thread(_read_snapshot, authority, session_id)
+    except RuntimeStoreError:
+        logger.debug('session.control.update skipped for %s', session_id, exc_info=True)
+        return
+    _apply_snapshot(live, session_id, snapshot, only_if_present=False, only_if_changed=True)
 
 
 async def control(connection, ref, params):
