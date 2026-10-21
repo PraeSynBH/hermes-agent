@@ -251,6 +251,99 @@ class TestDemandRanking:
         assert set(deferred) == {"a"}
 
 
+class TestWorkNotCapability:
+    """PRX-5750 acceptance: the rank follows WORK, and a credential only breaks a work-free tie.
+
+    Built on the real ``DemandSnapshot``/``DemandFacts`` (no fake view), because the defect was in
+    how those two ranked, not in ``apply_ceiling``'s arithmetic.
+    """
+
+    @staticmethod
+    def _snapshot(facts_by_name: dict):
+        from hermes_cli.gateway_multiplex_demand import DemandFacts, DemandSnapshot
+        return DemandSnapshot(facts={name: DemandFacts(**facts) for name, facts in facts_by_name.items()},
+                              captured_at=0.0)
+
+    def test_a_credential_never_outranks_a_working_profile(self):
+        """The regression itself, in pre-PRX-5750 vocabulary: both used to be "demand", so the name
+        decided it and the working profile could lose the edge to a bot token alone."""
+        demand = self._snapshot({"alpha": {"credentials": ("discord",)}, "zulu": {"cron_jobs": 1}})
+
+        kept, deferred = capacity.apply_ceiling(_serve("alpha", "zulu"), 2, demand=demand)
+
+        assert [n for n, _ in kept] == ["default", "zulu"]
+        assert set(deferred) == {"alpha"}
+
+    def test_a_used_profile_is_served_ahead_of_a_credential_only_one(self):
+        """The ticket's own case: 4 profiles, cap 3, one is credential-only, one was used 10 min ago."""
+        demand = self._snapshot({
+            "channelled": {"credentials": ("discord",)},
+            "rambur-aira": {"state_age_seconds": 600.0},
+            "cfo": {"cron_jobs": 1},
+        })
+
+        kept, deferred = capacity.apply_ceiling(
+            _serve("channelled", "rambur-aira", "cfo"), 3, demand=demand)
+
+        assert [n for n, _ in kept] == ["default", "cfo", "rambur-aira"]
+        assert set(deferred) == {"channelled"}
+
+    def test_a_cron_profile_still_outranks_a_recency_only_profile(self):
+        """A scheduled job is work that exists whether or not anybody touched the profile."""
+        demand = self._snapshot({"cronny": {"cron_jobs": 2}, "recently-opened": {"state_age_seconds": 60.0}})
+
+        kept, deferred = capacity.apply_ceiling(_serve("cronny", "recently-opened"), 2, demand=demand)
+
+        assert [n for n, _ in kept] == ["default", "cronny"]
+        assert set(deferred) == {"recently-opened"}
+
+    def test_credentials_break_a_tie_only_among_work_free_profiles(self):
+        """A capability is still better than nothing: it orders two idle profiles, and no more."""
+        demand = self._snapshot({"zulu": {"credentials": ("telegram",)}, "alpha": {}})
+
+        kept, _deferred = capacity.apply_ceiling(_serve("alpha", "zulu"), 2, priority=("alpha", "zulu"),
+                                                 demand=demand)
+
+        # Priority would have put ``alpha`` first; the credential puts ``zulu`` first instead.
+        assert [n for n, _ in kept] == ["default", "zulu"]
+
+    def test_explicit_priority_cannot_evict_a_profile_with_work(self):
+        demand = self._snapshot({"idle": {"credentials": ("discord",)}, "working": {"state_age_seconds": 30.0}})
+
+        kept, deferred = capacity.apply_ceiling(_serve("idle", "working"), 2, priority=("idle",),
+                                               demand=demand)
+
+        assert [n for n, _ in kept] == ["default", "working"]
+        assert set(deferred) == {"idle"}
+
+    def test_a_view_without_work_signals_keeps_the_legacy_rank(self):
+        """``_Demand`` (and any pre-PRX-5750 snapshot) declares only ``has``: fall back, don't guess."""
+        demand = _Demand({"zulu"})
+        kept, _deferred = capacity.apply_ceiling(_serve("alpha", "zulu"), 2, demand=demand)
+        assert [n for n, _ in kept] == ["default", "zulu"]
+
+    def test_the_deferral_reason_publishes_the_work_vocabulary(self):
+        demand = self._snapshot({"used": {"state_age_seconds": 900.0}, "idle": {"credentials": ("discord",)}})
+
+        _kept, deferred = capacity.apply_ceiling(_serve("used", "idle"), 2, demand=demand)
+
+        assert "work: credentials" in deferred["idle"]
+        # ... and each class speaks for itself when everything is past the edge.
+        _kept, deferred = capacity.apply_ceiling(_serve("used", "idle"), 1, demand=demand)
+        assert "work: recency" in deferred["used"]
+        assert "work: credentials" in deferred["idle"]
+        _kept, deferred = capacity.apply_ceiling(_serve("nothing"), 1, demand=demand)
+        assert "work: none" in deferred["nothing"]
+
+    def test_the_published_record_carries_the_work_signals(self):
+        demand = self._snapshot({"used": {"state_age_seconds": 900.0, "credentials": ("discord",)}})
+
+        record = demand.for_profile("used").as_record()
+
+        assert record["work"] == ["recency", "credentials"]
+        assert record["state_age_seconds"] == 900
+
+
 class TestCostClause:
     def test_the_deferral_reason_states_the_trade(self):
         demand = _Demand({"general"}, facts={"general": _facts(agents=12, cron_jobs=0)})

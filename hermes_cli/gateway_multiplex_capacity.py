@@ -12,10 +12,13 @@ They are reported under ``parked_profiles`` with a ``capacity:`` reason, so a cl
 gets a terminal verdict instead of waiting out its deadline for a profile nothing is serving.
 
 Which profiles? ``default`` is always served (it is the process's own profile and owns the control
-socket). Named profiles are RANKED BY LIVE DEMAND since SOU-3075: a profile that owns Paperclip
-agents, an enabled cron job, or adapter credentials is served before one that holds nothing
-(:mod:`hermes_cli.gateway_multiplex_demand`). ``gateway.multiplex_serve_priority`` survives as the
-tiebreak *inside* a class — it can no longer outrank demand — and the name breaks remaining ties.
+socket). Named profiles are RANKED BY LIVE WORK since SOU-3075, and by work rather than by capability
+since PRX-5750: a profile that owns Paperclip agents, a blocked admission, an enabled cron job, or a
+session store written in the last six hours is served before one that holds none of them
+(:mod:`hermes_cli.gateway_multiplex_demand`). Adapter credentials rank *below* all of that — every
+live profile has a bot token, so ranking by it made the demand class universal and collapsed this
+order back into the priority list it replaced. ``gateway.multiplex_serve_priority`` survives as the
+tiebreak *inside* a class — it can no longer outrank work — and the name breaks remaining ties.
 No weights and no counts-based ordering: a profile with 19 agents does not outrank one with 1 (that
 score would flip the served set on every job edit). When two demand-bearing profiles compete for one
 slot the loser is deferred by name, deterministically, and the over-subscription is what the host
@@ -157,8 +160,12 @@ def apply_ceiling(serve: Sequence[tuple[str, Path]], cap: Optional[int],
         order = [name for name in priority if name in by_name and name != "default"]
         order += [name for name, _home in pairs if name != "default" and name not in order]
     else:
+        # One class ladder, then priority, then the name (PRX-5750): 0 queued work · 1 recent use ·
+        # 2 credentials · 3 nothing. Credentials used to be *demand*, which made the class universal
+        # on a host where every live profile has a bot token — the rank then degenerated to the very
+        # priority list it replaced, and a profile in use sat deferred behind a dead one.
         order = sorted((name for name in by_name if name != "default"),
-                       key=lambda name: (0 if demand.has(name) else 1,
+                       key=lambda name: (_demand_class(demand, name),
                                          priority_index.get(name, len(priority_index)), name))
     has_default = "default" in by_name
     ranked = (["default"] if has_default else []) + order
@@ -211,10 +218,24 @@ def demand_signal(demand: Any, name: str) -> str:
     agents = getattr(facts, "agents", None)
     if agents:
         return f"{int(agents)} Paperclip agents"
+    age = getattr(facts, "state_age_seconds", None)
+    window = demand_module.RECENT_USE_WINDOW_SECONDS
+    if age is not None and age <= window:
+        return f"used {_short_duration(age)} ago (session store)"
     credentials = tuple(getattr(facts, "credentials", ()) or ())
     if credentials:
+        # Last, and labelled as a capability: it wins no slot over any work signal (PRX-5750).
         return f"connects as a bot ({len(credentials)} adapter credentials)"
     return "demand unreadable" if getattr(facts, "unreadable", ()) else "demand"
+
+
+def _short_duration(seconds: float) -> str:
+    """``4m`` / ``3h`` — compact enough for a WARNING line that already carries several profiles."""
+    if seconds < 120:
+        return f"{int(seconds)}s"
+    if seconds < 7200:
+        return f"{int(seconds // 60)}m"
+    return f"{int(seconds // 3600)}h"
 
 
 def _demand_facts(demand: Any, name: str):
@@ -225,6 +246,20 @@ def _demand_facts(demand: Any, name: str):
         return getter(name)
     except Exception:  # health: allow BLE001 -- a demand view that cannot answer costs a label
         return None
+
+
+def _demand_class(demand: Any, name: str) -> int:
+    """The rank's only key (PRX-5750). A view without ``rank_class`` — a test double, an older
+    snapshot — falls back to its single ``has`` bit, which is exactly the pre-PRX-5750 ranking."""
+    getter = getattr(demand, "rank_class", None)
+    if callable(getter):
+        try:
+            value = getter(name)
+        except Exception:  # health: allow BLE001 -- a ranking key never stops the decision
+            value = None
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return 0 if _demand_flag(demand, "has", name) else 3
 
 
 def _demand_flag(demand: Any, flag: str, name: str) -> bool:
@@ -263,6 +298,10 @@ def cost_clause(demand: Any, name: str) -> str:
     cron_jobs = int(getattr(facts, "cron_jobs", 0) or 0)
     credentials = tuple(getattr(facts, "credentials", ()) or ())
     clause = f"cost: {agents_text}, {cron_jobs} enabled cron jobs, {len(credentials)} adapter credentials"
+    work = tuple(getattr(facts, "work_signals", lambda: ())() or ())
+    # Why this profile ranked where it did, in the published vocabulary (PRX-5750): a reader can now
+    # tell "deferred because it is dead" from "deferred because two stronger profiles took the edge".
+    clause += f", work: {','.join(work) if work else 'none'}"
     unreadable = tuple(getattr(facts, "unreadable", ()) or ())
     if unreadable:
         clause += f", demand unreadable: {', '.join(str(source) for source in unreadable)}"

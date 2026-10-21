@@ -766,11 +766,15 @@ gateway:
 
 - The **default profile is always served**; `multiplex_max_profiles: 1` means
   "the default only", never "no gateway".
-- Slots go to profiles **ranked by live demand**, not by a hand list: a profile that owns
-  Paperclip agents, an enabled cron job, or an adapter credential in its `.env` is served
-  before one that holds nothing. `multiplex_serve_priority` is only the tiebreak *inside*
-  those two classes (and the name breaks the remaining ties), so a priority entry can never
-  keep a demand-free profile ahead of one with live work.
+- Slots go to profiles **ranked by live work**, not by a hand list. The rank is a ladder of four
+  classes, in this order: (1) **queued work** — Paperclip agents, a blocked admission, an enabled
+  cron job; (2) a **session store written in the last six hours** (`profiles/<name>/state.db`
+  `mtime`, i.e. somebody is using it); (3) **an adapter credential** in `.env`; (4) holds nothing.
+  `multiplex_serve_priority` is only the tiebreak *inside* a class (and the name breaks the
+  remaining ties), so a priority entry can never keep a work-free profile ahead of one with live
+  work. Credentials rank below the others on purpose: every live profile has a bot token, so
+  ranking them as work made the class universal and collapsed the order back into the priority
+  list.
 - There are **no weights**: a profile with one enabled cron job ranks level with one that
   owns nineteen agents. A score would flip the served set on every job edit, and its weights
   would be indefensible; the over-subscribed case is reported instead (below).
@@ -795,7 +799,8 @@ gateway:
 | source | what it reads | owned by |
 |---|---|---|
 | cron store | enabled jobs in `profiles/<name>/cron/jobs.json` | core |
-| credentials | adapter credentials in `profiles/<name>/.env` (the same key table `hermes profile clone` uses) | core |
+| recency | `profiles/<name>/state.db` `mtime` inside `RECENT_USE_WINDOW_SECONDS` (6 h) — the only cheap evidence a profile is *being used* | core |
+| credentials | adapter credentials in `profiles/<name>/.env` (the same key table `hermes profile clone` uses) — a capability, ranked *below* every work signal | core |
 | manifest | `gateway.multiplex_demand_manifest` — agents that wake a profile from outside Hermes | a host-side collector |
 | pending admission | a client that asked for a profile this gateway refused, live in the gateway process | core |
 
