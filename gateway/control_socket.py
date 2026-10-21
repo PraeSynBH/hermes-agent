@@ -212,6 +212,9 @@ class GatewayControlServer:
         # The real directory, as clients canonicalize it: the peer check below refuses any
         # symlinked component, so an unresolved symlinked ~/.hermes would never mint tickets.
         self._home = Path(home).resolve()
+        # Whether this home may label a same-uid peer: a constant of the server, resolved once off
+        # the loop (``start``) and never per connection (PRX-5821).
+        self._home_peer_trusted: Optional[bool] = None
         self.ticket_store = None
         self.private_handlers = {}
         self._server: Optional[asyncio.AbstractServer] = None
@@ -232,6 +235,10 @@ class GatewayControlServer:
     async def start(self) -> bool:
         """Bind and start serving. Returns True on success, False otherwise."""
         try:
+            if os.name != "nt":
+                # Resolve the home's peer-trust verdict HERE, once and off the loop, so no connection
+                # can ever ask for it from the loop's own thread (PRX-5821).
+                await asyncio.to_thread(self._home_trusts_same_uid_peers)
             return await (self._start_windows() if _IS_WINDOWS else self._start_posix())
         except Exception as exc:
             await self.stop()
@@ -424,16 +431,60 @@ class GatewayControlServer:
                 "instance_id": self.ticket_store.instance_id,
                 "profile_id": params["profile_id"], "runtime_protocol": 1}
 
+    def _home_trusts_same_uid_peers(self) -> bool:
+        """May this server's home label a same-uid peer (``uid:<uid>``)? A constant — computed once.
+
+        The socket's home is fixed for the life of the listener, so deriving this per request bought
+        no safety and cost a full ``realpath()`` (one stat per path component) on the event loop for
+        every connect. On a writeback-saturated disk that walk parked the loop through an entire
+        shutdown drain and the watchdog force-exited the process (PRX-5821: 58.1 s, 28 runs lost).
+        The verdict is therefore resolved once in ``start()``, off the loop; a home swapped under a
+        live listener is not a state this socket can serve, and the socket's own identity is tracked
+        separately (``_file_identities``).
+        """
+        verdict = self._home_peer_trusted
+        if verdict is None:
+            verdict = self._compute_home_trust()
+            if verdict is not None:
+                self._home_peer_trusted = verdict
+        return verdict is True
+
+    def _compute_home_trust(self) -> Optional[bool]:
+        """One-shot trust check for ``self._home``: real directory, ours, not group/other writable.
+
+        ``self._home`` is already canonical (``__init__``); the ``resolve()`` comparison still catches
+        a symlink planted on a component after construction — paid once per server, not per connect.
+
+        ``None`` means the home could not be inspected at all (absent, EMFILE at boot): that verdict
+        is NOT cached, so the gate is not closed for the life of a process that merely started early.
+        The failed call is a cheap failing ``lstat``; only the walk that follows a successful one is
+        the expensive thing.
+        """
+        try:
+            from hermes_cli.gateway_runtime_discovery import home_mode_unsafe
+            home = self._home
+            info = home.lstat()
+            return not (
+                home.absolute() != home.resolve()
+                or not stat.S_ISDIR(info.st_mode)  # windows-footgun: ok — POSIX-only helper
+                or info.st_uid != os.getuid()  # windows-footgun: ok — POSIX-only helper
+                or home_mode_unsafe(info, home)
+            )
+        except (OSError, RuntimeError):  # a broken path (ELOOP, too long) is "not inspected", not fatal
+            return None
+
     def _posix_peer_subject(self, writer) -> Optional[str]:
+        """``uid:<uid>`` for a same-user peer, else None (no ticket may be minted).
+
+        Cheap by construction — a cached verdict plus one ``getpeereid`` — so it is safe to evaluate
+        on the loop ahead of the hand-off instead of as an argument to an ``await`` (PRX-5821).
+        """
         # The legacy diagnostic channel may operate without bootstrap-safe metadata.
         if os.name == "nt":
             return None
         try:
-            from hermes_cli.gateway_runtime_discovery import home_mode_unsafe, socket_peer_uid
-            home = self._home
-            info = home.lstat()
-            if (home.absolute() != home.resolve() or not stat.S_ISDIR(info.st_mode)
-                    or info.st_uid != os.getuid() or home_mode_unsafe(info, home)):  # windows-footgun: ok — POSIX-only helper
+            from hermes_cli.gateway_runtime_discovery import socket_peer_uid
+            if not self._home_trusts_same_uid_peers():
                 return None
             uid = socket_peer_uid(writer.get_extra_info("socket"))
             return f"uid:{uid}" if uid == os.getuid() else None  # windows-footgun: ok — POSIX-only helper
@@ -445,7 +496,10 @@ class GatewayControlServer:
             raw = await asyncio.wait_for(reader.readline(), timeout=_DEFAULT_CLIENT_TIMEOUT)
             if not raw or len(raw) > _MAX_REQUEST_BYTES:
                 return
-            response = await self._answer_off_loop(raw.rstrip(b"\n"), self._posix_peer_subject(writer))
+            # Evaluated on its own line, not as an argument to the await: anything that lands here
+            # runs on the loop before the hand-off, so it must stay a cache read (PRX-5821).
+            peer_subject = self._posix_peer_subject(writer)
+            response = await self._answer_off_loop(raw.rstrip(b"\n"), peer_subject)
             writer.write(response)
             await asyncio.wait_for(writer.drain(), timeout=_DEFAULT_CLIENT_TIMEOUT)
         except (TimeoutError, ConnectionError, OSError):
