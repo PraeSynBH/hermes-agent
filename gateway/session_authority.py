@@ -1021,8 +1021,7 @@ class SessionAuthority:
                 await apply_pending_reasoning(self, ref, live)
                 await apply_deferred_pick(self, ref, live)
             if first is not None and live.source.platform == Platform.LOCAL:
-                from gateway.session_local_recovery import restore_local_session
-                restore_local_session(self, ref.session_id)
+                await self._restore_local_turn(ref)
                 if first['request_id'].startswith('hosted:'):
                     from gateway.session_hosted_transport import check_remote_hosted_admission
                     if not await asyncio.to_thread(check_remote_hosted_admission, self, ref, first):
@@ -1082,6 +1081,20 @@ class SessionAuthority:
             # Input scheduled while this claim's transaction ran may postdate its read: re-read
             # instead of letting the drain exit idle over a committed admission.
             return (False if row is None and live.rescan else row), first
+
+    async def _restore_local_turn(self, ref):
+        """Re-read a local session's receipt at its turn boundary, on a worker thread.
+
+        Every boundary re-reads the receipt, its session row, the lineage tip, its admissions and the
+        policy the session was frozen with: synchronous SQLite, per local session, per turn — the
+        ``_drain`` → ``restore_local_session`` frame in PRX-5524's blocked-loop dumps (and, being
+        per-turn rather than per-30 s tick, one of the continuously-starved shapes). Off the loop it
+        is also the shape the receipt check wants: a compression catch-up that still has to commit is
+        written by this worker (``_with_untracked_compression``) instead of being handed back to the
+        loop as ``_CatchUpPending``.
+        """
+        from gateway.session_local_recovery import restore_local_session
+        await asyncio.to_thread(restore_local_session, self, ref.session_id)
 
     def _stamp_claim(self, ref, live, row):
         """The claim's execution stamp, in the same tracked task as its commit: no observer (or

@@ -863,8 +863,10 @@ class GatewayStartupMixin:
 
     async def _hosted_room_worker_watcher(self, interval: float = 1.0) -> None:
         """Keep the room worker alive for the messaging gateway lifetime."""
+        from gateway.loop_tick_timing import timed
         while self._running:
-            await self._ensure_hosted_room_worker()
+            with timed('hosted_room_worker'):
+                await self._ensure_hosted_room_worker()
             await asyncio.sleep(interval)
 
     async def _stop_hosted_room_worker(self, timeout: float = 5.0) -> bool:
