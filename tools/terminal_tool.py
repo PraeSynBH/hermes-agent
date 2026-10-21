@@ -1534,7 +1534,8 @@ def terminal_tool(
             _note_pre_exec_guard_wedge(guard_timeout)
             raise _Rejected(_error_json(
                 f"Terminal pre-execution guard did not finish within {guard_timeout}s "
-                "(process-identity probe wedged); the command was not run. Retry the call.",
+                "(no verdict: the guard chain is starving, not the command); the command was "
+                "not run. Retry the call.",
                 status="error",
             ))
         # Pre-exec security checks (floors + dangerous command detection);
