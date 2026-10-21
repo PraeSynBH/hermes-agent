@@ -309,13 +309,33 @@ _PIPE_TO_INTERPRETER = re.compile(
 # on stdin; an INLINE value is the same data (PRX-5770): `curl -d '{"text":"hermes gateway restart"}'`
 # sends that prose, it does not run it, and the ordinary way to write up a restart incident is a
 # request body that quotes one.
-_DATA_PAYLOAD_EXECUTABLES = frozenset({"curl", "wget"})
-_DATA_PAYLOAD_VALUE_OPTIONS = {
-    "curl": frozenset({
+# option -> how many FOLLOWING tokens carry its data (every payload option takes exactly one).
+_DATA_PAYLOAD_VALUE_OPTIONS: dict[str, dict[str, int]] = {
+    "curl": dict.fromkeys((
         "-d", "--data", "--data-ascii", "--data-binary", "--data-raw", "--data-urlencode",
         "--json", "-F", "--form", "--form-string",
-    }),
-    "wget": frozenset({"--post-data", "--post-file", "--body-data", "--body-file"}),
+    ), 1),
+    "wget": dict.fromkeys(("--post-data", "--post-file", "--body-data", "--body-file"), 1),
+}
+
+# The same shape one rung up (PRX-5773): argument-carrying options of programs that cannot execute
+# their arguments but routinely carry prose ABOUT a command — a commit subject, a log search
+# pattern, a JSON field, an issue body. The rule is the rule the inline body established: the
+# lifecycle decision belongs to the argv the shell would EXECUTE, and none of these values is ever
+# executed. This is what lets an agent write up a restart ("git commit -m '…a human runs …'")
+# without the write-up reading as an order to the guard.
+# Width is the number of FOLLOWING tokens that are data (`jq --arg NAME VALUE` takes two — the
+# name is data too). Single-letter options also arrive attached (`git commit -m"…"`,
+# `git log -S"…"`), which `_mask_option_values` masks as well.
+_DATA_TEXT_VALUE_OPTIONS: dict[str, dict[str, int]] = {
+    # -m/--message is the commit message, -F/--file the message file, -S/-G/--grep the log search.
+    # `git branch -m` reuses -m for a RENAME: still a name, still never a command.
+    # `git grep -e PATTERN` spells the same search one flag over; `-e` only ever carries a pattern.
+    "git": dict.fromkeys(("-m", "--message", "-F", "--file", "-S", "-G", "--grep", "-e"), 1),
+    # `gh` is an HTTP client: --body/--title/--comment are payload text, --body-file a path.
+    "gh": dict.fromkeys(("--body", "--body-file", "--title", "--comment"), 1),
+    # jq's option values are JSON scalars handed to a filter, never run by a shell.
+    "jq": {"--arg": 2, "--argjson": 2},
 }
 
 # Bytes sniffed before reading a referenced file in full (see _BINARY_MAGICS).
@@ -990,13 +1010,15 @@ def _mask_data_sink_arguments(text: str) -> str:
     return "\n".join(lines_out) if changed else text
 
 
-def _mask_request_body_arguments(text: str) -> str:
-    """Replace an HTTP client's inline request-body option VALUES with a neutral placeholder.
+def _mask_option_values(text: str, table: dict[str, dict[str, int]]) -> str:
+    """Replace the VALUES of data-carrying options of non-executing programs with ``arg``.
 
-    ``curl -d '{"text": "…hermes gateway restart…"}'`` hands that prose to the server; it is not a
-    command this shell runs. Every value given to a ``_DATA_PAYLOAD_VALUE_OPTIONS`` option in a
-    curl/wget segment becomes ``arg``, leaving the rest of the line — the URL, another command after
-    a ``;`` — fully visible. Strictly fail-closed, exactly like ``_mask_data_sink_arguments``: a
+    One rule for every table: the program cannot run its argument text, so the value is data even
+    when it spells a command. ``curl -d '{"text": "…hermes gateway restart…"}'`` sends that prose
+    and ``git commit -m '…hermes gateway restart…'`` stamps it into a subject; neither runs it.
+    Each value of a listed option (``table[program][option]`` tokens, ``jq --arg NAME VALUE`` = 2)
+    becomes ``arg``, leaving the rest of the line — the URL, the path, another command after a
+    ``;`` — fully visible. Strictly fail-closed, exactly like ``_mask_data_sink_arguments``: a
     value carrying an execution marker (``$(``, backtick, process substitution) disables masking
     for the whole text, and a line that pipes into a shell is never masked.
     """
@@ -1014,29 +1036,69 @@ def _mask_request_body_arguments(text: str) -> str:
 
         rebuilt: list[str] = []
         for segment in _split_segments(tokens, keep_controls=True):
-            index = _command_token_index(segment)
-            name = Path(segment[index]).name if index is not None else ""
-            options = _DATA_PAYLOAD_VALUE_OPTIONS.get(name)
-            if index is None or options is None:
+            # `_executed_command_index`, not the first token: `sudo git commit -m …` and
+            # `env A=1 gh pr comment --body …` carry the data under a wrapper.
+            index = _executed_command_index(segment)
+            name = _executable_name(segment[index]) if index is not None else ""
+            options = table.get(name)
+            if options is None:
                 rebuilt.extend(segment)
                 continue
             masked = list(segment)
             hit = False
             for position in range(index + 1, len(masked)):
+                if masked[position] == "arg":
+                    continue
                 option, separator, inline = masked[position].partition("=")
-                if option not in options:
+                width = options.get(option)
+                if width is None:
+                    # Attached short form: `-m"msg"` / `-S"pattern"` tokenizes to one token.
+                    attached = masked[position][:2]
+                    if (
+                        len(masked[position]) > 2
+                        and not masked[position].startswith("--")
+                        and attached in options
+                    ):
+                        if _carries_execution_marker(masked[position][2:]):
+                            return text
+                        masked[position] = f"{attached}arg"
+                        hit = True
                     continue
-                value_position = position if separator and inline else position + 1
-                if value_position >= len(masked):
+                if separator and inline:
+                    # `--message=…`: the value rides the option token.
+                    if _carries_execution_marker(inline):
+                        return text
+                    masked[position] = f"{option}=arg"
+                    hit = True
                     continue
-                if any(marker in masked[value_position] for marker in _UNSAFE_DATA_ARG_MARKERS):
-                    return text
-                masked[value_position] = "arg"
-                hit = True
+                for offset in range(1, width + 1):
+                    value_position = position + offset
+                    if value_position >= len(masked):
+                        break
+                    if _carries_execution_marker(masked[value_position]):
+                        return text
+                    masked[value_position] = "arg"
+                    hit = True
             rebuilt.extend(masked)
             changed = changed or hit
         lines_out.append(" ".join(rebuilt))
     return "\n".join(lines_out) if changed else text
+
+
+def _carries_execution_marker(value: str) -> bool:
+    """True when a data value the shell would EXPAND is spelled as code (fail closed)."""
+    return any(marker in value for marker in _UNSAFE_DATA_ARG_MARKERS)
+
+
+def _mask_request_body_arguments(text: str) -> str:
+    """An HTTP client's inline request body is data: mask its option values (PRX-5770)."""
+    return _mask_option_values(text, _DATA_PAYLOAD_VALUE_OPTIONS)
+
+
+def _mask_text_argument_values(text: str) -> str:
+    """Prose an argument-carrying option swallows is data too — commit messages, search patterns
+    (PRX-5773)."""
+    return _mask_option_values(text, _DATA_TEXT_VALUE_OPTIONS)
 
 
 def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
@@ -1046,7 +1108,9 @@ def _lifecycle_command_scan_with_data_exemption(text: str) -> bool:
     if not contains_gateway_lifecycle_command(text):
         return False
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
-    masked = _mask_request_body_arguments(_mask_data_sink_arguments(normalized))
+    masked = _mask_text_argument_values(
+        _mask_request_body_arguments(_mask_data_sink_arguments(normalized))
+    )
     return contains_gateway_lifecycle_command(masked)
 
 
