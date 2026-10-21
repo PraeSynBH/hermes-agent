@@ -457,7 +457,12 @@ Servers that support multi-root workspaces (currently pyright) run as a
 **single process** per Hermes process: the first Python project spawns
 it, and every further project root — for example sibling git worktrees
 edited by parallel subagents — is attached to that same server as an
-additional workspace folder instead of starting another copy.
+additional workspace folder instead of starting another copy. There is
+one such server for trusted projects and one for untrusted ones, because
+a workspace you have not opened gets a restricted spawn (no project
+interpreter); a project that becomes trusted after it was first touched
+moves to the trusted server, and the untrusted one is closed once it has
+no folders left.
 
 ## Disabling
 
