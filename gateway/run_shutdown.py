@@ -30,6 +30,7 @@ from gateway.restart import (
 from gateway.run_common import _UNSET
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
+from gateway.delivery import _delivery_target_key, _notice_target_key
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
@@ -144,29 +145,11 @@ def _send_error(result: Any) -> str:
     return getattr(result, "error", "send returned success=False")
 
 
-def _notice_target_key(platform_value: str, chat_id, thread_id) -> tuple:
-    """Dedup key for one notice destination: thread/topic platforms share a chat but route apart."""
-    return (platform_value, str(chat_id), str(thread_id) if thread_id else None)
-
-
-def _delivery_target_key(platform_value: str, chat_id, thread_id, *, profile: Optional[str] = None) -> tuple:
-    """Dedupe key for one DELIVERED chat: profile-independent, except Telegram private chats.
-
-    Two served profiles can share one home chat (one Telegram group for the whole host) and owe it
-    ONE notice per host restart. A positive Telegram chat id names the USER, though: the same id
-    under two bot tokens is two conversations, so those stay keyed per served profile (#118233).
-    """
-    from gateway.delivery import looks_like_telegram_private_chat_id
-    if (profile and profile != "default" and platform_value == "telegram"
-            and looks_like_telegram_private_chat_id(chat_id)):
-        platform_value = f"{profile}:{platform_value}"
-    return _notice_target_key(platform_value, chat_id, thread_id)
-
-
 def _effective_watchdog_leash(runner: object) -> float:
     """Thread-watchdog leash for the stop in progress: effective drain + grace, clamped under
     launchd's live ``ExitTimeOut`` minus the dump margin. Lives here (not in gateway.restart)
-    because restart.py cannot import shutdown_watchdog without a cycle."""
+    because restart.py cannot import shutdown_watchdog without a cycle, and it reads this
+    module's ``resolve_shutdown_watchdog_delay`` binding so the stop's leash stays one seam."""
     return effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner)))
 
 

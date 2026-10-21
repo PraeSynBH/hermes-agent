@@ -2153,24 +2153,6 @@ def _gateway_detached_env() -> bool:
     return _truthy_env(os.getenv("HERMES_GATEWAY_DETACHED"))
 
 
-def _stdin_is_tty() -> bool | None:
-    """``sys.stdin.isatty()``; None when stdin is closed/invalid."""
-    try:
-        return bool(sys.stdin and sys.stdin.isatty())
-    except (ValueError, OSError):
-        return None
-
-
-def _windows_gateway_should_absorb_console_controls() -> bool:
-    """True for detached Windows gateway runs that should ignore Ctrl+C (``HERMES_GATEWAY_DETACHED=1``
-    or no interactive stdin); foreground runs stay interruptible."""
-    if not is_windows():
-        return False
-    if _gateway_detached_env():
-        return True
-    return not _stdin_is_tty()
-
-
 def _windows_console_window_attached() -> bool | None:
     """Return whether Windows assigned this process a console window."""
     if not is_windows():
@@ -2188,6 +2170,16 @@ def _windows_gateway_breakaway_state() -> bool | None:
         return None
     from hermes_cli._subprocess_compat import _WINDOWS_GATEWAY_BREAKAWAY_ENV
     return {"1": True, "0": False}.get(os.environ.pop(_WINDOWS_GATEWAY_BREAKAWAY_ENV, None))
+
+
+def _windows_gateway_should_absorb_console_controls() -> bool:
+    """True for detached Windows gateway runs that should ignore Ctrl+C (``HERMES_GATEWAY_DETACHED=1``
+    or no interactive stdin); foreground runs stay interruptible."""
+    if not is_windows():
+        return False
+    if _gateway_detached_env():
+        return True
+    return not _gw_windows()._stdin_is_tty()
 
 
 # =============================================================================
@@ -4469,23 +4461,6 @@ def _apply_startup_watchdog_config() -> None:
         pass
 
 
-def _absorb_windows_console_controls() -> None:
-    """Make a detached Windows gateway ignore console-control broadcasts from sibling CLIs."""
-    try:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        if hasattr(signal, "SIGBREAK"):
-            signal.signal(signal.SIGBREAK, signal.SIG_IGN)
-    except (OSError, ValueError):
-        pass  # SetConsoleCtrlHandler unavailable (rare) — best-effort
-    # signal only hooks SIGINT/SIGBREAK; SetConsoleCtrlHandler(NULL, TRUE) ignores ALL console
-    # control events (CTRL_CLOSE/CTRL_LOGOFF included), as background services should.
-    try:
-        import ctypes
-        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, 1)  # type: ignore[attr-defined]
-    except (OSError, AttributeError):
-        pass
-
-
 def _make_exit_diag():
     """``_exit_diag(tag, **extra)`` recorder writing ``logs/gateway-exit-diag.log`` — captures every way
     ``asyncio.run()`` can return, for chasing silent Windows gateway deaths. HERMES_GATEWAY_EXIT_DIAG=0 opts out."""
@@ -4572,12 +4547,12 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     # Detached Windows runs (HERMES_GATEWAY_DETACHED=1, or non-TTY for older wrappers) ignore
     # console-control broadcasts from sibling CLIs; foreground runs keep Ctrl+C-to-stop.
-    stdin_is_tty = bool(_stdin_is_tty())
+    stdin_is_tty = bool(_gw_windows()._stdin_is_tty())
     _console_window_attached = _windows_console_window_attached()
     _breakaway = _windows_gateway_breakaway_state()
     _absorb = _windows_gateway_should_absorb_console_controls()
     if _absorb:
-        _absorb_windows_console_controls()
+        _gw_windows()._absorb_windows_console_controls()
 
     # A system-level unit execs us without XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS; adopt our own
     # user bus before any worker env snapshot so `systemd-run --user --scope` works (#104893).
