@@ -114,7 +114,38 @@ def test_connect_gateway_raises_a_retryable_restarting_verdict_fast(tmp_path, mo
     assert error.retry_after_s and 0 < error.retry_after_s <= 120
     assert "retryAfterS=" in str(error) and "retryable=true" in str(error)
     # A run must not spend its 120 s budget here (acceptance 4).
-    assert elapsed < 30
+    assert elapsed < 10
+
+
+def test_the_window_outranks_a_parkable_owner_for_new_work(tmp_path, monkeypatch):
+    """A restart's after-turn wait is attachable, but it admits no NEW work (PRX-5787/PRX-5791).
+
+    Inside a declared window there is no replacement owner to wait for until the owning job starts
+    one — longer than the whole admission budget — so a run with a turn to place must be answered
+    ``restarting`` instead of parked. An interactive client (no new work) keeps the owner: answering
+    a prompt parked on approval/clarify is its job (#139041).
+    """
+    from hermes_cli import gateway_runtime as runtime
+    from gateway.drain_control import RESTART_WAIT_REASON
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    _write_lease(home, time.time() + 120)
+    parked = runtime.GatewayDiscovery(
+        "draining", reason_code=RESTART_WAIT_REASON,
+        endpoint=runtime.GatewayEndpoint(
+            profile_id=str(home), instance_id="i-1", authority_epoch=1, runtime_protocol=1,
+            api_origin="", supervisor="none", capabilities=frozenset()))
+    monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *a, **k: parked)
+
+    started = time.monotonic()
+    verdict = runtime.ensure_gateway_runtime(home, timeout=30.0, new_work=True)
+    assert time.monotonic() - started < 10
+    assert verdict.reason_code == RESTART_WINDOW_REASON
+    assert verdict.retry_after_s and verdict.retry_after_s > 0
+
+    # The interactive client still reaches the owner to answer its parked prompt.
+    assert runtime.ensure_gateway_runtime(home, timeout=30.0) is parked
 
 
 def test_a_boot_that_dies_unanswered_is_started_by_the_waiting_client(tmp_path, monkeypatch):

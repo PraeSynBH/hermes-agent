@@ -602,7 +602,8 @@ async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
                                 f"(phase={phase}, elapsed={time.monotonic() - started:.1f}s, "
                                 "admission budget spent before an owner could be ensured)")
                 break
-            result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True, timeout=cap)
+            result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True, timeout=cap,
+                                             new_work=new_work)
             if result.reason_code == "update_paused":
                 fence = getattr(result, "detail", None) or "update fence live"
                 if left(1.0) <= 0:
@@ -620,7 +621,7 @@ async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
                 raise GatewayRestartingError(
                     "Gateway restarting: a declared restart window owns the gateway, so this run was "
                     f"never admitted (elapsed={time.monotonic() - started:.1f}s, "
-                    f"retryAfterS={int(round(left_s))}, retryable=true): "
+                    f"retryAfterS={round(left_s)}, retryable=true): "
                     f"{result.detail or 'restart window open'}", float(left_s))
             if new_work and result.state == "draining" and attachable(result):
                 drain = f"{result.state}: {result.reason_code or 'draining'}"

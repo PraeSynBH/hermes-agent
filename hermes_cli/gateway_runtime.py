@@ -515,8 +515,8 @@ def _fenced_verdict(home: Path, timeout: float, fence: str) -> GatewayDiscovery:
     return GatewayDiscovery("draining", reason_code="update_paused", detail=fence)
 
 
-def _restart_window_verdict(home: Path, window: "DeclaredRestartWindow",
-                            timeout: float) -> GatewayDiscovery:
+def _restart_window_verdict(home: Path, window: DeclaredRestartWindow,
+                            timeout: float, *, new_work: bool = False) -> GatewayDiscovery:
     """What ensure answers while a declared restart window is open, and never a spawned owner.
 
     A window is not a boot: the owning job stopped the gateway on purpose and will start it itself,
@@ -524,11 +524,23 @@ def _restart_window_verdict(home: Path, window: "DeclaredRestartWindow",
     RETRYABLE and carries the lease it is waiting on (``retry_after_s``), which is the one thing a
     dispatcher needs to re-queue instead of charging this host with a runtime failure (PRA-6692).
 
-    A window is also not infallible: if the owner is already answering — the job started it and the
-    lease has not been cleared yet — the answer is the owner, not the fence.
+    Two owners are not the fence:
+
+    * a ``ready`` owner — the job started it and the lease has not been cleared yet, so the answer
+      is the owner;
+    * a restart's after-turn wait (``draining``/``restart_wait``) for an INTERACTIVE client, whose
+      job is to answer a turn parked on approval/clarify (#139041).
+
+    That wait is not one for a client with NEW WORK. It closed admission at T=0 of the drain, so a
+    new-work client attaching to it dies at its first submit with ``runtime_draining`` (101 runs
+    across the 21:38 and 23:05-23:25 drains, PRX-5791/PRX-5787) — and inside a declared window there
+    is no replacement to wait for until the owning job starts one, which is longer than the whole
+    admission budget. Answering ``restarting`` for that client costs it no budget and loses no work.
     """
     observed = discover_gateway_endpoint(home, timeout=timeout)
-    if attachable(observed):
+    if observed.state == "ready":
+        return observed
+    if attachable(observed) and not new_work:
         return observed
     return GatewayDiscovery("draining", reason_code=RESTART_WINDOW_REASON,
                             detail=window.describe(), retry_after_s=float(window.remaining_s))
@@ -562,7 +574,7 @@ def _observe_replacing_stale(home: Path, probe_timeout: float, deadline: float,
 
 
 def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT_ENSURE_TIMEOUT,
-                           idle_exit: bool = False) -> GatewayDiscovery:
+                           idle_exit: bool = False, new_work: bool = False) -> GatewayDiscovery:
     """Ensure once; pending remains pending at deadline.
 
     Never installs anything. The one owner it replaces is a gateway an older Hermes left running on
@@ -576,6 +588,8 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
     ``idle_exit``: an unmanaged daemon this call starts ends itself once idle (client entrypoints:
     chat, TUI, cron/kanban/ACP clients). A gateway that is ending that way reports ``draining``
     (``idle_exit``); this call waits for it to go and starts the replacement transparently.
+    ``new_work``: this caller has a turn to place, so inside a declared restart window a parkable
+    owner (a restart's after-turn wait) is not an answer for it — see ``_restart_window_verdict``.
     """
     import time
     from hermes_cli.gateway_runtime_service import (
@@ -616,7 +630,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
             # declared the window is still rewriting stores (PRA-6692: an external spawn at
             # 14:08:36 landed inside the maintenance pass and made it refuse every held store).
             if window := declared_restart_window(fence_homes):
-                return _restart_window_verdict(home, window, probe_timeout())
+                return _restart_window_verdict(home, window, probe_timeout(), new_work=new_work)
             # Poll BEFORE discovering: an exit observed first, then "absent", cannot be a child that
             # published its owner a moment later. A winning racer shows up as starting/ready instead.
             status = child.poll() if child is not None else None
