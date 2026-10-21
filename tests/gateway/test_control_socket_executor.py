@@ -3,8 +3,9 @@
 ``identify`` IS liveness: a consumer treats a connectable socket that answers it as a live gateway,
 and falls back to the state-file/scan layer when it does not. So the answer must never queue behind
 the loop's DEFAULT executor, which carries every ``asyncio.to_thread`` in the process — turn tools,
-and the periodic profile reconcile sweep (PRA-6507). A drained control pool refuses immediately
-(``control_busy``) instead of queueing past the client's deadline, and every answer carries
+and the periodic profile reconcile sweep (PRA-6507). Admission is bounded twice: the pool is eight
+workers wide (PRA-6633) and a request waits at most ``_CONTROL_QUEUE_WAIT_S`` for one before it is
+refused with ``control_busy``, instead of queueing past the client's deadline. Every answer carries
 ``queue_wait_ms``/``handler_ms`` so "the loop is starved" is a measurement, not a guess.
 """
 
@@ -21,6 +22,8 @@ import pytest
 
 from gateway.control_socket import (
     CONTROL_PROTOCOL_VERSION,
+    _CONTROL_EXECUTOR_WORKERS,
+    _CONTROL_QUEUE_WAIT_S,
     GatewayControlServer,
     identify_gateway,
     query_gateway_control,
@@ -98,28 +101,78 @@ def test_identify_answers_while_the_default_executor_is_saturated(home: Path):
     assert answer["queue_wait_ms"] + answer["handler_ms"] <= elapsed_ms + 250
 
 
-def test_drained_control_pool_refuses_with_control_busy(home: Path):
-    """Both control workers busy -> a fast structured refusal, never a silent queue past the deadline.
+def test_burst_wider_than_two_answers_without_control_busy(home: Path):
+    """Ten simultaneous ``status`` readers are all answered — none refused with ``control_busy``.
 
-    Red on main: there is no control pool and no admission, so the third request is simply served
-    (``ok: true``) — nothing tells a caller the control path is saturated.
+    This is the PRA-6502 burst leg. Red on main: the pool was two slots behind a non-blocking
+    acquire, so every request that arrived while the first two handlers were still running was
+    refused on the spot — measured live at 5 refusals in 47 sockets, including at the gate's own
+    n=8 floor, varying with scheduling alone.
     """
-    entered: list[bool] = []
+    gate = threading.Event()
+    lock = threading.Lock()
+    entered: list[int] = []
+    burst = 10
+
+    def hold() -> dict:
+        with lock:
+            ticket = len(entered) + 1
+            entered.append(ticket)
+        gate.wait(timeout=60)
+        return {"n": ticket}
+
+    async def scenario() -> list[dict]:
+        server = GatewayControlServer(home, verb_handlers={"hold": hold})
+        assert await server.start()
+        tasks = [asyncio.ensure_future(_ask(home, {"verb": "hold", "id": n, "protocol": 1}))
+                 for n in range(burst)]
+        try:
+            # Hold the burst until the pool is as full as it can get, then release: a realistic
+            # handler returns in ~10 ms, so the requests still waiting for a worker are served as
+            # soon as one frees. On main the pool tops out at two, so the other eight are answered
+            # with ``control_busy`` and the burst fails here.
+            await async_wait_until(
+                lambda: len(entered) >= min(_CONTROL_EXECUTOR_WORKERS, burst),
+                what="the control pool to be as full as the burst can make it")
+            gate.set()
+            return await asyncio.gather(*tasks)
+        finally:
+            gate.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await server.stop()
+
+    answers = asyncio.run(scenario())
+    refused = [answer for answer in answers if answer.get("error") == "control_busy"]
+    assert refused == [], refused
+    assert [answer["ok"] for answer in answers] == [True] * burst
+    # Ten distinct handler executions, so "answered" means ten requests, not ten reads of two.
+    assert sorted(answer["result"]["n"] for answer in answers) == list(range(1, burst + 1))
+
+
+def test_drained_control_pool_refuses_after_the_bounded_wait(home: Path):
+    """Every worker busy -> refuse once the grace runs out, never a silent queue past the deadline.
+
+    Red on main: with no bounded wait the refusal is instant, so ``queue_wait_ms`` reads ~0 and a
+    burst that a slower arrival would have fit into is refused anyway. The refusal must also land
+    well inside the client's 2 s deadline, or a consumer times out instead of getting an answer.
+    """
+    entered: list[int] = []
     held = threading.Event()
 
     def hold() -> dict:
-        entered.append(True)
+        entered.append(1)
         held.wait(timeout=60)
         return {"held": True}
 
     async def scenario() -> dict:
         server = GatewayControlServer(home, verb_handlers={"identify": lambda: {"pid": 4242},
-                                                           "hold": hold})
+                                                          "hold": hold})
         assert await server.start()
         holders = [asyncio.ensure_future(_ask(home, {"verb": "hold", "id": n, "protocol": 1}))
-                   for n in (1, 2)]
+                   for n in range(_CONTROL_EXECUTOR_WORKERS)]
         try:
-            await async_wait_until(lambda: len(entered) >= 2, what="both control workers to be busy")
+            await async_wait_until(lambda: len(entered) >= _CONTROL_EXECUTOR_WORKERS,
+                                   what="every control worker to be busy")
             return await _ask(home, {"verb": "identify", "id": 9, "protocol": 1})
         finally:
             held.set()
@@ -131,6 +184,9 @@ def test_drained_control_pool_refuses_with_control_busy(home: Path):
     assert answer["error"] == "control_busy"
     assert answer["id"] == 9
     assert answer["protocol"] == CONTROL_PROTOCOL_VERSION
+    # It waited the grace for a worker, then refused — inside the client's 2 s deadline.
+    grace_ms = _CONTROL_QUEUE_WAIT_S * 1000
+    assert grace_ms * 0.9 <= answer["queue_wait_ms"] <= 2000, answer
 
 
 def test_existing_consumers_still_get_the_bare_result(home: Path):
