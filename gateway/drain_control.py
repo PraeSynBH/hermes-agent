@@ -283,12 +283,9 @@ def _marker_is_expired(body: dict[str, Any]) -> bool:
     """
     global _expiry_logged_for
     raw = body.get("requested_at")
-    requested_at = _parse_iso(raw)
-    if requested_at is None:
-        return False
     lease = _clamp_lease(body.get(DRAIN_LEASE_FIELD))
-    age = (datetime.now(UTC) - requested_at).total_seconds()
-    if age <= lease:
+    age = drain_age_seconds(body)
+    if age is None or age <= lease:
         return False
     if _expiry_logged_for != raw:
         _expiry_logged_for = raw
@@ -298,6 +295,20 @@ def _marker_is_expired(body: dict[str, Any]) -> bool:
             raw, age, lease, body.get("principal"),
         )
     return True
+
+
+def drain_age_seconds(body: dict[str, Any]) -> Optional[float]:
+    """Seconds since the marker's ``requested_at``, or ``None`` when it carries no parseable clock.
+
+    The one clock reader for the marker, so a consumer that reports "draining since … for N min"
+    (the cron drain gate, SOU-3252) cannot drift from the :func:`_marker_is_expired` verdict, which
+    compares this same age against the marker's own lease. A tz-naive or future-dated stamp still
+    reads: ``_parse_iso`` treats a missing zone as UTC.
+    """
+    requested_at = _parse_iso(body.get("requested_at"))
+    if requested_at is None:
+        return None
+    return (datetime.now(UTC) - requested_at).total_seconds()
 
 
 def _marker_epoch_is_stale(body: dict[str, Any]) -> bool:
@@ -422,6 +433,18 @@ def drain_requested(*, home: Optional[Path] = None) -> bool:
     drain-active, and so does one from a host whose epoch or process table cannot be read.
     """
     return _active_drain_body(home) is not None
+
+
+def active_drain(home: Optional[Path] = None) -> Optional[dict[str, Any]]:
+    """``drain_requested()``'s verdict with its evidence: the ACTIVE marker body, or ``None``.
+
+    ``drain_requested()`` answers "may I dispatch?"; a consumer that has to explain a pause (the
+    cron drain gate stamps ``last_fire_error`` and the liveness pager names the cause, SOU-3252)
+    needs the ``principal``/``requested_at``/``writer_pid`` too. Same activeness rule by
+    construction — one predicate, one answer — so a stale or refused marker is ``None`` here
+    exactly as it is ``False`` there.
+    """
+    return _active_drain_body(home)
 
 
 def drain_notification_suppressed(*, home: Optional[Path] = None) -> bool:
