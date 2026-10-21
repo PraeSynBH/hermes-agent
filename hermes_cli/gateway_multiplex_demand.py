@@ -37,13 +37,21 @@ open toward *serving* demand, loudly. A source that could not be READ at all is 
 profile counts as demand-bearing (fail toward serving it) and is reported ``unreadable`` — treating
 an unreadable ``.env`` as "no demand" is the bug class this module exists to remove.
 
-Cost: :func:`snapshot` only reads the last snapshot — it performs **no I/O at all** once one exists,
-because the serving path calls it per inbound route (``/p/<profile>/``) on the event loop. A full
-sweep costs ~240 ms on a 42-profile host (~80 % of it python-dotenv interpolation of every ``.env``),
-so letting the read path re-read on any clock would stall the loop for a quarter second per request
-between ticks. :func:`refresh` is the authoritative read and runs off the event loop — from the
-reconcile tick (``asyncio.to_thread``) and at boot — and that 30 s tick, not a clock in this module,
-is what bounds demand staleness.
+Cost: :func:`snapshot` performs **no I/O at all** — not even the first time. Because the serving path
+calls it per inbound route (``/p/<profile>/``) on the event loop, and because the first
+:func:`refresh` of a process pays one-time plugin discovery (``credential_env_keys``: 15–22 s on a
+loaded host, measured 00:00Z), a cold read must never be paid by a caller that does not own
+freshness. With no snapshot, :func:`snapshot` therefore returns a **cold view** —
+``facts={}``, ``manifest_state="cold"``, ``captured_at=None`` — in which no profile holds demand, so
+the ceiling falls back to the ``demand=None`` order (priority list, then alphabetical).
+
+Cold is not "no demand": :meth:`DemandSnapshot.demand_source` reports ``state="cold"`` with
+``age_seconds=None``, and the host check renders that as ``demand=cold (first reconcile pending)``
+instead of implying real facts. Only :func:`refresh` reads, and only its two owners call it: the
+reconcile tick (``asyncio.to_thread``, every 30 s) and the boot path's own pre-warm (off-loop,
+started beside boot so the discovery overlaps the rest of startup). **By design the rank is
+priority-only for up to 30 s after boot**, until the first tick replaces the cold view — a 20 s
+stall inside cold boot is the worse trade (SOU-3125).
 """
 
 from __future__ import annotations
@@ -79,6 +87,9 @@ MANIFEST_OK = "ok"
 MANIFEST_STALE = "stale"
 MANIFEST_ABSENT = "absent"
 MANIFEST_MALFORMED = "malformed"
+#: No snapshot has been taken in this process yet. Published as ``demand_source.state`` so a reader
+#: never mistakes the priority-only fallback rank for a considered, demand-ranked decision.
+MANIFEST_COLD = "cold"
 
 
 @dataclass(frozen=True)
@@ -121,7 +132,8 @@ class DemandSnapshot:
     manifest_age_seconds: Optional[float] = None
     manifest_error: Optional[str] = None
     unknown_profiles: tuple[str, ...] = ()
-    captured_at: float = 0.0
+    #: ``None`` on the cold view — nothing has been captured, and ``0.0`` would read as 1970.
+    captured_at: Optional[float] = None
 
     def for_profile(self, name: str) -> DemandFacts:
         return self.facts.get(name) or DemandFacts()
@@ -150,6 +162,11 @@ class DemandSnapshot:
 
 _LOCK = threading.Lock()
 _snapshot: Optional[DemandSnapshot] = None
+
+#: What :func:`snapshot` answers until something refreshes. ``facts={}`` is load-bearing: with no
+#: entries every profile reads as demand-free, which reproduces ``apply_ceiling(demand=None)``
+#: exactly. A facts map of zeroes would be a different claim ("we looked, nobody has work").
+_COLD = DemandSnapshot(manifest_state=MANIFEST_COLD)
 
 
 def _default_home() -> Path:
@@ -331,18 +348,17 @@ def refresh() -> DemandSnapshot:
 
 
 def snapshot() -> DemandSnapshot:
-    """The current demand view. No I/O once a snapshot exists — see the module docstring.
+    """The current demand view: a dict read, and a COLD view when nothing has refreshed yet.
 
-    The reconcile tick owns freshness (:func:`refresh`, off the event loop, every 30 s), so the
-    serving path — which calls this per inbound route on the loop — only ever pays a dict read. A
-    process that has never refreshed reads once here, which is what gives a one-shot caller
-    (``hermes gateway status``, a migration preflight) real demand instead of none.
+    No I/O, ever — including the first call (SOU-3125). The read this used to do on demand cost
+    15–22 s of one-time plugin discovery, and the two callers that hit it cold pay for it in the
+    worst places: the boot path (inside the restart SOU-3075 lands) and the event loop (a per-route
+    ``profiles_to_serve`` → ``capacity`` → here). Freshness is owned by :func:`refresh` from the
+    reconcile tick and the boot pre-warm; this function only reports what they last published.
     """
     with _LOCK:
         current = _snapshot
-    if current is not None:
-        return current
-    return refresh()
+    return current if current is not None else _COLD
 
 
 def reset() -> None:
@@ -395,6 +411,7 @@ __all__ = [
     "DEFAULT_MANIFEST_NAME",
     "DEFAULT_TTL_SECONDS",
     "MANIFEST_ABSENT",
+    "MANIFEST_COLD",
     "MANIFEST_KEY",
     "MANIFEST_MALFORMED",
     "MANIFEST_OK",

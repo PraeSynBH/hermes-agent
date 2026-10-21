@@ -207,15 +207,64 @@ class TestManifest:
         assert snapshot.for_profile("devops").agents == 5
 
 
+class TestColdSnapshot:
+    """SOU-3125: no snapshot means a COLD view, never a read on the caller's thread.
+
+    The first read of a process pays one-time plugin discovery (``credential_env_keys``: 15–22 s on
+    a loaded host), and the two callers that reached it that way were cold boot and the event loop
+    (``profiles_to_serve`` per inbound route). So ``snapshot()`` performs no I/O at all; the cold
+    view is a claim about what this process has *not* looked at, and it says so.
+    """
+
+    def test_a_cold_snapshot_performs_no_io_and_says_so(self, profile_env, monkeypatch):
+        busy = _profile("busy")
+        _write_jobs(busy, enabled=2)
+        _write_manifest(profile_env, {"busy": {"agents": 3}})
+
+        def reading_refused(*_args, **_kwargs):
+            raise AssertionError("snapshot() must not read")
+
+        monkeypatch.setattr(demand, "refresh", reading_refused)
+        monkeypatch.setattr(demand, "manifest_path", reading_refused)
+        monkeypatch.setattr(demand, "_cron_jobs", reading_refused)
+
+        view = demand.snapshot()
+
+        assert view.manifest_state == demand.MANIFEST_COLD
+        assert view.facts == {}
+        assert view.captured_at is None
+        assert view.has("busy") is False
+        assert view.for_profile("busy").agents is None
+        assert view.demand_source() == {"path": None, "state": "cold", "age_seconds": None}
+
+    def test_refresh_populates_the_view_the_serving_path_then_reads(self, profile_env):
+        busy = _profile("busy")
+        _write_jobs(busy, enabled=1)
+        cold = demand.snapshot()
+        assert cold.manifest_state == demand.MANIFEST_COLD
+
+        refreshed = demand.refresh()
+
+        assert refreshed.has("busy") is True
+        assert refreshed.manifest_state != demand.MANIFEST_COLD
+        assert refreshed.captured_at is not None
+        assert demand.snapshot() is refreshed
+        assert demand.snapshot() is not cold
+
+    def test_cold_ranking_is_exactly_the_no_demand_ordering(self, profile_env):
+        """The boot-time regression: a cold view must reproduce ``demand=None``, not invent."""
+        serve = [("default", Path("/h/default"))] + [(n, Path(f"/h/{n}")) for n in ("zulu", "alpha", "mike")]
+
+        cold_kept, cold_deferred = capacity.apply_ceiling(serve, 2, ("zulu",), demand=demand.snapshot())
+        none_kept, none_deferred = capacity.apply_ceiling(serve, 2, ("zulu",), demand=None)
+
+        assert [n for n, _ in cold_kept] == [n for n, _ in none_kept] == ["default", "zulu"]
+        assert set(cold_deferred) == set(none_deferred) == {"alpha", "mike"}
+
+
 class TestSnapshotCost:
     def test_snapshot_never_reads_again_however_long_it_has_been_captured(self, profile_env, monkeypatch):
-        """The serving path calls snapshot() per inbound route on the event loop: never a re-read.
-
-        A 5 s TTL only made bursts cheap — 25 s out of every 30 s tick the next inbound request paid
-        the whole sweep (~240 ms on a 42-profile host, python-dotenv interpolation included). The
-        tick owns freshness, so the read path is unconditional: a dict read or, if nothing has ever
-        been captured, one refresh.
-        """
+        """The serving path calls snapshot() per inbound route on the event loop: never a read."""
         busy = _profile("busy")
         _write_jobs(busy, enabled=1)
         reads: list[str] = []
@@ -229,7 +278,7 @@ class TestSnapshotCost:
 
             monkeypatch.setattr(demand, name, counting)
 
-        first = demand.snapshot()
+        first = demand.refresh()
         performed = len(reads)
         assert performed > 0
         with monkeypatch.context() as clock:
@@ -246,7 +295,9 @@ class TestSnapshotCost:
     def test_refresh_is_the_authoritative_read(self, profile_env):
         busy = _profile("busy")
         _write_jobs(busy, enabled=1)
-        assert demand.snapshot().has("busy") is True
+        assert demand.snapshot().has("busy") is False  # cold: nothing has read yet
+
+        assert demand.refresh().has("busy") is True
 
         _write_jobs(busy, enabled=0)
         demand.reset()

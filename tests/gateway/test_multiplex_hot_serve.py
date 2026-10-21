@@ -80,9 +80,19 @@ def _runner(tmp_path, monkeypatch):
 
 def _boot(runner, home):
     """What ``start_gateway`` does before the runner exists: reserve every profile that exists now and
-    freeze that set as the reservation the process owns."""
+    freeze that set as the reservation the process owns.
+
+    The demand read boot pre-warms beside startup (SOU-3125) is waited for here, exactly as the
+    adapter startup waits for it: these tests start from a WARM reservation to exercise the
+    reconcile. A reservation still cold is priority-ordered for up to one tick, by design —
+    ``tests/gateway/test_demand_boot_prewarm.py`` pins that window instead.
+    """
     from gateway.run import _multiplex_profile_homes
     from gateway.runtime_ownership import process_ownership
+    from hermes_cli import gateway_multiplex_capacity as capacity
+    from hermes_cli import gateway_multiplex_demand as demand
+    if capacity.profile_ceiling() is not None:
+        demand.refresh()
     boot_set = _multiplex_profile_homes(runner.config)
     process_ownership.reserve([h for _n, h in boot_set])
     runner.config._runtime_profile_homes = tuple(boot_set)
@@ -679,6 +689,38 @@ async def test_a_demand_flip_hot_serves_and_parks_without_a_restart(tmp_path, mo
         assert "; cost: " in parked["zulu"]
         assert "alpha" not in parked
         assert _state(home)["serving_decision"]["deferred"][0]["profile"] == "zulu"
+
+
+@pytest.mark.asyncio
+async def test_a_cold_boot_reservation_is_corrected_by_the_first_tick(tmp_path, monkeypatch):
+    """SOU-3125: boot may reserve on a cold (priority-only) view; one tick makes it demand-ranked.
+
+    ``snapshot()`` no longer reads, so the reservation ``start_gateway`` freezes is the priority order
+    until the boot pre-warm lands (<= 30 s by design). The first reconcile tick refreshes first, then
+    enumerates — this is the correction, and it must be a real add+remove, not just a repaint.
+    """
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        runner, home = _capped_runner(tmp_path, monkeypatch)
+        _mkprofile(home, "alpha")
+        zulu = _mkprofile(home, "zulu")
+        _cron_job(zulu)  # zulu holds demand; alpha holds nothing
+
+        # A cold boot: nothing has refreshed, so the ceiling falls back to priority-then-alphabetical.
+        from gateway.run import _multiplex_profile_homes
+        from gateway.runtime_ownership import process_ownership
+        boot_set = _multiplex_profile_homes(runner.config)
+        process_ownership.reserve([h for _n, h in boot_set])
+        runner.config._runtime_profile_homes = tuple(boot_set)
+        assert [name for name, _home in boot_set] == ["default", "alpha"]
+        await runner._start_secondary_profile_adapters()
+        assert _served_record(home) == ["default", "alpha"]
+
+        result = await runner.reconcile_served_profiles()
+
+        assert result["added"] == ["zulu"], result
+        assert result["removed"] == ["alpha"], result
+        assert _served_record(home) == ["default", "zulu"]
+        assert _state(home)["parked_profiles"]["alpha"].startswith("capacity: ")
 
 
 @pytest.mark.asyncio
