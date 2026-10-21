@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 # Extra leash beyond ``agent.restart_drain_timeout`` so a slow-but-progressing drain survives.
 # Matches the issue #66892 suggested hardening.
 DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S = 60.0
+# Historic claim, kept only as the fallback for an armed watchdog that carries no snapshot verdict.
+# It is a *diagnosis*, and a false one whenever the fire landed in a phase after the drain
+# (PRX-5828: teardown 8 s in, loop parked in select()) — the shutdown path supplies the real phase.
+DEFAULT_SHUTDOWN_WATCHDOG_VERDICT = "asyncio drain path appears wedged"
 DEFAULT_HEARTBEAT_INTERVAL_S = 30.0
 DEFAULT_LOOP_FLOOR_TIMER_INTERVAL_S = 5.0
 DEFAULT_LOOP_WATCHDOG_INTERVAL_S = 30.0
@@ -283,10 +287,15 @@ def resolve_shutdown_watchdog_delay(
 
 
 def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[dict[str, Any]],
-                         event: str = "shutdown_watchdog_fired") -> None:
+                         event: str = "shutdown_watchdog_fired",
+                         verdict: Optional[str] = None) -> None:
     """Best-effort thread dump + metadata before hard-exit (file, then stderr)."""
     header = {"event": event, "pid": os.getpid(), "delay_s": delay_s,
               "fired_at": datetime.now(UTC).isoformat(), "snapshot": snapshot or {}}
+    if verdict:
+        # In the file too, not just the log line: the dump is what the next reader greps, and a
+        # dump that says "wedged" when the drain had simply used its cap sends them the wrong way.
+        header["verdict"] = verdict
     with contextlib.suppress(OSError):  # unwritable dir: skip only the file copy, stderr still runs
         dump_path.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(Exception), open(dump_path, "a", encoding="utf-8") as fh:
@@ -299,7 +308,8 @@ def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[
         fh.flush()
     with contextlib.suppress(Exception):  # stderr too: journald/launchd get it if disk is wedged
         sys.stderr.write(f"Gateway {event.replace('_', ' ')} after {delay_s:.0f}s "
-                         f"(pid={os.getpid()}); dumping bounded thread stacks.\n")
+                         f"(pid={os.getpid()}; {verdict or DEFAULT_SHUTDOWN_WATCHDOG_VERDICT}); "
+                         "dumping bounded thread stacks.\n")
         sys.stderr.flush()
         # Rate-limited: when the file arm already dumped, this is a counted no-op, not a second walk.
         dump_thread_stacks(f"{event} (shutdown watchdog)")
@@ -308,10 +318,17 @@ def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[
 def arm_shutdown_watchdog(
     delay_s: float, *, done_event: Optional[threading.Event] = None,
     snapshot_fn: Optional[Callable[[], dict[str, Any]]] = None, exit_code: int = 1,
-    dump_path: Optional[Path] = None, name: str = "gateway-shutdown-watchdog") -> threading.Event:
+    dump_path: Optional[Path] = None, name: str = "gateway-shutdown-watchdog",
+    verdict_fn: Optional[Callable[[dict[str, Any]], str]] = None) -> threading.Event:
     """Arm a daemon-thread hard-exit backstop for a wedged shutdown path: exits quietly if
     ``done_event`` is set within ``delay_s``, else dumps diagnostics and ``os._exit(exit_code)``.
-    Never raises; returns ``done_event`` for disarming."""
+    Never raises; returns ``done_event`` for disarming.
+
+    ``verdict_fn`` names the phase the exit interrupted from the snapshot — the shutdown path
+    knows whether the drain had used its whole cap or whether teardown was simply still running
+    (PRX-5828). Without it the verdict stays the historic "wedged" claim, which is only true for
+    the drain-phase stall it was written for.
+    """
     done = done_event if done_event is not None else threading.Event()
     delay = _coerce_float(delay_s, DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S)
     if delay <= 0:
@@ -328,11 +345,18 @@ def arm_shutdown_watchdog(
             snapshot = snapshot_fn() if snapshot_fn is not None else None
         except Exception as exc:
             snapshot = {"snapshot_error": repr(exc)}
+        verdict = DEFAULT_SHUTDOWN_WATCHDOG_VERDICT
+        if verdict_fn is not None:
+            try:
+                verdict = verdict_fn(snapshot or {}) or DEFAULT_SHUTDOWN_WATCHDOG_VERDICT
+            except Exception as exc:  # the verdict must never cost us the dump
+                logger.debug("Shutdown watchdog verdict failed", exc_info=True)
+                verdict = f"{DEFAULT_SHUTDOWN_WATCHDOG_VERDICT}; verdict unavailable ({exc!r})"
         target = dump_path if dump_path is not None else get_shutdown_watchdog_dump_path()
-        _write_watchdog_dump(target, delay_s=delay, snapshot=snapshot)
+        _write_watchdog_dump(target, delay_s=delay, snapshot=snapshot, verdict=verdict)
         with contextlib.suppress(Exception):
-            logger.critical("Shutdown watchdog fired after %.0fs — forcing process exit "
-                            "(asyncio drain path appears wedged; see %s)", delay, target)
+            logger.critical("Shutdown watchdog fired after %.0fs — forcing process exit (%s; see %s)",
+                            delay, verdict, target)
         for stream in (sys.stdout, sys.stderr):
             with contextlib.suppress(Exception):
                 stream.flush()

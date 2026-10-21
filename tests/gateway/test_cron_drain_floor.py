@@ -187,8 +187,9 @@ class TestResolveSystemdTimeoutStopSec:
         assert resolve_systemd_timeout_stop_sec(180.0, 30.0) == 210
 
     def test_larger_cron_floor_raises_timeout_stop_sec(self):
-        # 60s cron + 10s reserve + 30s headroom = 100s
-        assert resolve_systemd_timeout_stop_sec(0.0, 60.0) == 100
+        # 60s cron + the post-drain reserve (interrupt, settle, adapters, SQLite close) + headroom.
+        # The reserve is the measured teardown budget, not a bare constant (PRX-5828).
+        assert resolve_systemd_timeout_stop_sec(0.0, 60.0) == 60 + CRON_DRAIN_CLEANUP_RESERVE_S + 30
 
     def test_zero_cron_floor_is_an_opt_out_not_a_hidden_default(self):
         assert resolve_systemd_timeout_stop_sec(0.0, 0.0) == 60
