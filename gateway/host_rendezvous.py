@@ -285,7 +285,10 @@ def _host_lock_is_free(role: str) -> Optional[bool]:
 
 
 def _current_boot_epoch() -> str:
-    """Identity of this boot. Empty when /proc is unreadable — a recorded epoch is then unprovable."""
+    """Identity of this boot (Linux ``boot_id``+PID-1, macOS ``kern.boottime``).
+
+    Empty when it cannot be read — a recorded epoch is then unprovable.
+    """
     try:
         from gateway.drain_control import current_instantiation_epoch
 

@@ -441,7 +441,7 @@ async def test_drain_suppress_skips_home_channel_keeps_session_ping(tmp_path, mo
     runner._running_agents["agent:main:telegram:dm:999"] = MagicMock()
 
     # NAS auto-update drain: marker present with suppress_notification=True.
-    dc.write_drain_request(principal="nas", suppress_notification=True)
+    dc.write_drain_request(principal="drain-control", suppress_notification=True)
 
     await runner._notify_active_sessions_of_shutdown()
 
