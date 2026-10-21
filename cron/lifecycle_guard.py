@@ -1077,8 +1077,15 @@ def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator
             yield token[len(prefix):]
 
 
-def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
-    """Yield the scripts the token at *index* executes, if any."""
+def _references_at(
+    segment: list[str], index: int, cwd: Optional[str]
+) -> Iterator[tuple[Path, tuple[str, ...]]]:
+    """Yield ``(script, argv)`` for the scripts the token at *index* executes, if any.
+
+    *argv* is what the script itself receives (never the interpreter's own flags), so a script can
+    be judged by the invocation it is actually given rather than by its whole body — see
+    ``_declared_read_only_argv``.
+    """
     if index >= len(segment):
         return
     executable = segment[index]
@@ -1086,7 +1093,8 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
 
     if executable_name in {".", "source"}:
         if len(segment) > index + 1:
-            yield from _resolved_or_nothing(segment[index + 1], cwd)
+            for path in _resolved_or_nothing(segment[index + 1], cwd):
+                yield path, tuple(segment[index + 2 :])
         return
 
     if executable_name in _SHELL_EXECUTABLES:
@@ -1107,19 +1115,23 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
                 continue
             break
         if arg_index < len(arguments) and arguments[arg_index] not in _SHELL_COMMAND_FLAGS:
-            yield from _resolved_or_nothing(arguments[arg_index], cwd)
+            for path in _resolved_or_nothing(arguments[arg_index], cwd):
+                yield path, tuple(arguments[arg_index + 1 :])
         return
 
     # A bare "/" is pathlib's division operator in Python sources, not an executable; resolving it
     # hits the filesystem root and fails the regular-file check, hard-blocking innocent .py scripts.
     if executable.strip("/") and ("/" in executable or executable.endswith((".sh", ".bash", ".zsh"))):
-        yield from _resolved_or_nothing(executable, cwd)
+        for path in _resolved_or_nothing(executable, cwd):
+            yield path, tuple(segment[index + 1 :])
 
 
-def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
-    """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
-    original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
-    a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
+def _iter_referenced_shell_scripts(
+    command: str, *, cwd: Optional[str] = None
+) -> Iterator[tuple[Path, tuple[str, ...]]]:
+    """Yield ``(script, argv)`` for scripts executed directly or through a POSIX shell. Each segment
+    is read at the original token AND at the peeled wrapper target — additive on purpose: peeling
+    must never REMOVE a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
@@ -1286,6 +1298,37 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
     return script_text or "", None
 
 
+# A script may declare which argv shapes are pure queries — reads only, no lifecycle action. The
+# guard then judges the INVOCATION, not the whole body: `restart-gateway.sh --schedulers` prints the
+# host's schedulers and restarts nothing, but the file it lives in necessarily contains the restart
+# commands of its other modes, so a body-only scan refuses the script's own documented read-only
+# probe and `--list-stores` with it. Opt-in and per-invocation: an undeclared script, an argv outside
+# the declared set, or any scan failure keeps the body scan exactly as it was.
+_READ_ONLY_ARGV_DECLARATION = re.compile(
+    r"^[ \t]*#[ \t]*lifecycle-guard:[ \t]*read-only-argv[ \t]+([^\r\n]*)$", re.MULTILINE
+)
+
+
+def _declared_read_only_argv(script_text: str) -> frozenset[str]:
+    """The argv a script declares as pure queries (empty when it declares none)."""
+    declared: set[str] = set()
+    for match in _READ_ONLY_ARGV_DECLARATION.finditer(script_text):
+        declared.update(match.group(1).split())
+    return frozenset(declared)
+
+
+def _invocation_is_declared_read_only(script_text: str, argv: tuple[str, ...]) -> bool:
+    """Whether *argv* is entirely made of the flags *script_text* declares as pure queries.
+
+    Requires at least one argument and every argument a literal ``-`` flag: a positional value such
+    as ``--schedule 1`` (which DOES restart) or a bare word answers ``False``, and the body scan runs
+    unchanged.
+    """
+    if not argv or any(not argument.startswith("-") for argument in argv):
+        return False
+    return set(argv) <= _declared_read_only_argv(script_text)
+
+
 # --- clean-verdict memo -----------------------------------------------------------------------
 #
 # The walk is pure work over file BYTES, so its answer for a script is a property of that script and
@@ -1437,6 +1480,7 @@ def _scan_one_referenced_script(
     visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn],
     dependencies: Optional[list[_Witness]],
+    argv: tuple[str, ...] = (),
 ) -> str:
     """Scan one referenced script and the scripts it references: ``"block"`` when the walk must
     refuse, ``"next"`` when this candidate contributes nothing, ``"stop"`` when the walk cannot go
@@ -1488,6 +1532,13 @@ def _scan_one_referenced_script(
     if dependencies is not None:
         dependencies.extend(own)
     if not script_text:
+        return "next"
+    # A pure-query invocation declared by the script itself: its body is not what will run, so the
+    # restart commands of its OTHER modes are not this invocation's verdict (PRX-5769). Decided on
+    # the bytes already read here, so it costs no extra read, and *own* is already in
+    # *dependencies* — an edit to this file still invalidates the caller's latched verdict, which
+    # keeps the memo sound for every argv this same file is later invoked with.
+    if candidate_executed and _invocation_is_declared_read_only(script_text, argv):
         return "next"
     child_dependencies: list[_Witness] = []
     # Relative references inside a script resolve against that script's directory, not the cwd.
@@ -1551,14 +1602,22 @@ def _contains_unsafe_gateway_action(
     # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
     # trip them. Executed candidates come first so a mention never starves a real script's budget.
-    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)]
+    candidates = [
+        (path, argv, executed)
+        for path, argv in _iter_referenced_shell_scripts(walk_command, cwd=cwd)
+        for executed in (True,)
+    ]
     if walk_command != command:
-        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)]
+        candidates += [
+            (path, argv, False)
+            for path, argv in _iter_referenced_shell_scripts(command, cwd=cwd)
+        ]
 
-    for script_path, candidate_executed in candidates:
+    for script_path, argv, candidate_executed in candidates:
         outcome = _scan_one_referenced_script(
             script_path, candidate_executed, cwd=cwd, depth=depth, visited=visited,
             budget=budget, read_remote_script=read_remote_script, dependencies=dependencies,
+            argv=argv,
         )
         if outcome == "block":
             return True

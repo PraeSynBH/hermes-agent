@@ -2,8 +2,8 @@
 cron lifecycle_guard) that false-positive on heredoc *bodies*. Stripping every body is unsafe the
 other way (a fake ``<<`` in quotes can swallow an operator; unquoted bodies expand; ``bash <<'EOF'``
 executes), so a body is masked ONLY when every delimiter is quoted, every heredoc has an exact
-terminator line, the owning simple command is an allowlisted non-shell interpreter, and no list
-operator follows the heredoc. Otherwise the command is returned untouched: a false positive is
+terminator line, the owning simple command is an allowlisted non-shell interpreter (or an HTTP
+client reading the body from stdin), and no list operator follows the heredoc. Otherwise the command is returned untouched: a false positive is
 acceptable, hiding shell syntax from a guard is not.
 Masked bodies keep their newline count (re.MULTILINE)."""
 
@@ -17,6 +17,26 @@ _INERT_HEREDOC_CONSUMER_RE = re.compile(
     r"^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:env\s+)?(?:[A-Za-z0-9_./-]+/)?"
     r"(?:python(?:3(?:\.\d+)*)?|osascript|cat)(?=\s|$)",
     re.IGNORECASE)
+
+# An HTTP client whose body is read from stdin (``--data-binary @-``, ``-d @-``, ``-T -``) puts the
+# heredoc body on the wire: request PAYLOAD, never shell text. Matched only together with the stdin
+# argument below, so ``curl -o x.sh <<'EOF'`` — a body curl could later hand to something else — and
+# plain ``curl $url <<'EOF'`` stay visible.
+_HTTP_CLIENT_RE = re.compile(
+    r"^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:env\s+)?(?:[A-Za-z0-9_./-]+/)?(?:curl|wget)(?=\s|$)",
+    re.IGNORECASE)
+_HTTP_STDIN_BODY_RE = re.compile(
+    r"(?:^|\s)(?:--data-binary|--data-raw|--data|--post-file|-d|-T)(?:=|\s+)?@?-?(?=\s|$)")
+
+
+def _is_inert_heredoc_owner(masked_owner: str) -> bool:
+    """Whether the simple command owning a heredoc consumes its body as data only."""
+    if _INERT_HEREDOC_CONSUMER_RE.search(masked_owner):
+        return True
+    return bool(
+        _HTTP_CLIENT_RE.search(masked_owner)
+        and _HTTP_STDIN_BODY_RE.search(masked_owner)
+    )
 
 
 def _span_end(command: str, cursor: int, closer: str) -> int:
@@ -219,7 +239,7 @@ def strip_inert_heredoc_bodies(command: str) -> str:
             if not any(
                 marker in masked_opener
                 for marker in ("$(", "`", "<(", ">(", "(", ")", "{", "}")
-            ) and _INERT_HEREDOC_CONSUMER_RE.search(masked_owner):
+            ) and _is_inert_heredoc_owner(masked_owner):
                 ranges.extend(body_ranges)
         command_start = body_cursor
     # Single-pass rebuild (ranges are sorted and non-overlapping), bodies -> their newlines only.
