@@ -5,15 +5,21 @@ profile acquired its first agent or cron job: a profile with real work sat defer
 held nothing (SOU-3073). Ranking now follows demand, read from three sources on every reconcile tick:
 
 S1 ``profiles/<n>/cron/jobs.json`` — enabled jobs. Owned by core, costs one small JSON read.
-S2 ``profiles/<n>/.env`` — the adapter credentials that make the profile connect as a bot, via
+S2 ``profiles/<n>/state.db`` ``st_mtime`` — used within :data:`RECENT_USE_WINDOW_SECONDS`. One
+   ``stat``, and the only cheap evidence that a profile is *being used*: a human talking to it, with
+   no cron, no route and no agent, was previously indistinguishable from a dead profile (PRX-5750).
+S3 ``profiles/<n>/.env`` — the adapter credentials that make the profile connect as a bot, via
    :func:`hermes_cli.profile_channels.credential_env_keys` (the same table ``profile clone`` and the
    migration preflight trust; never a second list here). Owned by core, one ``.env`` parse.
-S3 the demand manifest — ``gateway.multiplex_demand_manifest`` (default
+   **A credential is a capability, not work** (PRX-5750): every live profile has one, so ranking by
+   it made the demand class universal and degenerated to the old priority list. It is kept as a
+   *tiebreak below* every work signal — it only separates two profiles that both hold no work.
+S4 the demand manifest — ``gateway.multiplex_demand_manifest`` (default
    ``<default home>/gateway_demand.json``), schema 1. Written by whoever knows about agents that
    wake profiles: today a host-side collector, never read from another product's database.
 
-S1–S3 are read from disk. The fourth source is LIVE and lives in this process only: a client that
-asked for a profile and is waiting on its admission (``note_wanted``, PRX-5738). S1–S3 say a profile
+S1–S4 are read from disk. The fifth source is LIVE and lives in this process only: a client that
+asked for a profile and is waiting on its admission (``note_wanted``, PRX-5738). S1–S4 say a profile
 *could* hold work; a pending admission says somebody is blocked on it right now, which is the
 sighting the 2026-10-20 outage never produced — the busiest profile sat deferred while its runs
 failed admission. A sighting carries its own TTL and expires, so it cannot pin a slot forever.
@@ -77,6 +83,12 @@ DEFAULT_TTL_SECONDS = 900.0
 #: sighting expires by itself (PRX-5738) while a profile that keeps being asked keeps refreshing it.
 WANTED_TTL_SECONDS = 300.0
 
+#: How recently ``state.db`` must have been written for a profile to count as *used* (PRX-5750).
+#: One ``stat`` per profile per tick, so the window is generous: a profile a human opened this
+#: morning still holds a claim, one last touched yesterday does not. Six hours is longer than the
+#: daily restart gate, so a profile in use across a restart keeps its claim either side of it.
+RECENT_USE_WINDOW_SECONDS = 6 * 3600.0
+
 #: ``name -> monotonic expiry`` for "a client asked for this profile and is waiting on it". Kept
 #: beside the snapshot, never inside it: the snapshot is a disk-derived view aged by a cache window,
 #: this is LIVE state of THIS process — a route resolved a moment ago — and caching it away would be
@@ -100,14 +112,76 @@ class DemandFacts:
     cron_jobs: int = 0
     credentials: tuple[str, ...] = ()
     blocked_admission_15m: int = 0
+    #: Seconds since ``profiles/<n>/state.db`` was last written, or ``None`` when the profile has no
+    #: store. ``None`` is "no evidence of use", never "used long ago" — a profile created an hour
+    #: ago and never opened must not outrank one whose store is a day old and also idle.
+    state_age_seconds: Optional[float] = None
     #: Source ids (``cron``, ``env``) that could not be read for this profile.
     unreadable: tuple[str, ...] = ()
 
-    def has_demand(self) -> bool:
-        """An unreadable source fails toward SERVING the profile (F7 in the plan)."""
+    @property
+    def used_recently(self) -> bool:
+        """Was this profile's session store written inside :data:`RECENT_USE_WINDOW_SECONDS`?"""
+        return (self.state_age_seconds is not None
+                and self.state_age_seconds <= RECENT_USE_WINDOW_SECONDS)
+
+    def work_signals(self) -> tuple[str, ...]:
+        """Which signals say *this profile holds work right now*, in strength order (PRX-5750).
+
+        The published vocabulary — ``work: cron,recency`` in a deferral reason, ``"work": [...]`` in
+        a ``serving_decision`` row — comes from here, so the record and the rank can never disagree.
+        ``credentials`` is last on purpose: it is a capability that every live profile has, so it
+        only ever separates two profiles that hold no work.
+        """
+        signals: list[str] = []
+        if self.blocked_admission_15m:
+            signals.append("admission")
+        if self.agents:
+            signals.append("agents")
+        if self.cron_jobs:
+            signals.append("cron")
+        if self.used_recently:
+            signals.append("recency")
+        if self.credentials:
+            signals.append("credentials")
+        signals.extend(self.unreadable)
+        return tuple(signals)
+
+    def has_queued_work(self) -> bool:
+        """Work that exists whether or not anybody touched the profile: cron, agents, an admission.
+
+        This is the class a ``multiplex_serve_priority`` entry can never override (PRX-5750) — a
+        scheduled job or a blocked client outranks the operator's hand-list, as it always has.
+        """
         if self.unreadable:
             return True
-        return self.cron_jobs > 0 or bool(self.credentials) or bool(self.agents)
+        return bool(self.blocked_admission_15m or self.agents or self.cron_jobs)
+
+    def has_work(self) -> bool:
+        """Any work at all — queued work, or a session store written inside the use window."""
+        return self.has_queued_work() or self.used_recently
+
+    def rank_class(self) -> int:
+        """The rank's only key, ascending: 0 queued work, 1 recent use, 2 credentials, 3 nothing.
+
+        Classes, not weights: a profile with 19 agents ties with one that has 1, so editing a job
+        cannot flip the served set (SOU-3075's rule). The ladder exists because a cron job is work
+        that outlives a human's last click — it must beat a profile that was merely opened an hour
+        ago, and both must beat the 40 profiles whose only claim is a bot token (PRX-5750).
+        """
+        if self.has_queued_work():
+            return 0
+        if self.used_recently:
+            return 1
+        if self.credentials:
+            return 2
+        return 3
+
+    def has_demand(self) -> bool:
+        """Any claim to a slot at all — work first, and an unreadable source fails toward SERVING."""
+        if self.unreadable:
+            return True
+        return self.has_work() or bool(self.credentials)
 
     def as_record(self) -> dict:
         """The published shape — counts only; agent names stay in the manifest."""
@@ -116,6 +190,9 @@ class DemandFacts:
             "cron_jobs": self.cron_jobs,
             "credentials": list(self.credentials),
             "blocked_admission_15m": self.blocked_admission_15m,
+            "state_age_seconds": (None if self.state_age_seconds is None
+                                  else int(self.state_age_seconds)),
+            "work": list(self.work_signals()),
         }
         if self.unreadable:
             record["unreadable"] = list(self.unreadable)
@@ -149,6 +226,24 @@ class DemandSnapshot:
         the profile holds nothing: that client is the work (PRX-5738).
         """
         return self.wanted(name) or self.for_profile(name).has_demand()
+
+    def has_work(self, name: str) -> bool:
+        """Does *name* hold WORK — queued work, or a session store inside the use window?"""
+        return self.wanted(name) or self.for_profile(name).has_work()
+
+    def holds_credentials(self, name: str) -> bool:
+        """Can *name* connect as a bot? True only when it has no stronger claim to a slot."""
+        return bool(self.for_profile(name).credentials)
+
+    def rank_class(self, name: str) -> int:
+        """How strongly *name* claims a slot: 0 queued work · 1 recent use · 2 credentials · 3 none.
+
+        A client waiting on the profile right now is the strongest claim there is (PRX-5738), so a
+        sighting pins the class at 0 regardless of what the disk says.
+        """
+        if self.wanted(name):
+            return 0
+        return self.for_profile(name).rank_class()
 
 
     def demand_source(self) -> dict:
@@ -278,6 +373,24 @@ def _credentials(home: Path, keys: Mapping[str, str]) -> tuple[tuple[str, ...], 
     return tuple(sorted({platform for key, platform in keys.items() if values.get(key)})), ()
 
 
+def _state_age(home: Path) -> Optional[float]:
+    """S2: seconds since ``<home>/state.db`` was last written, or ``None`` when there is no store.
+
+    One ``stat`` — the only cheap evidence a profile is being *used* rather than merely configured.
+    A store we cannot stat, or one with a timestamp in the future (a clock skew on a shared volume),
+    is no evidence: reporting a negative age would rank a profile as used forever.
+    """
+    try:
+        mtime = (Path(home) / "state.db").stat().st_mtime
+    except OSError:
+        return None
+    age = time.time() - mtime
+    if age < 0:
+        logger.debug("demand: %s has an mtime in the future; ignoring the use signal", home)
+        return None
+    return age
+
+
 def _roster() -> list[tuple[str, Path]]:
     """Named profiles with an identity marker — the same roster serving uses, ``default`` aside."""
     from hermes_cli.profiles import _iter_named_profile_dirs
@@ -330,6 +443,7 @@ def refresh() -> DemandSnapshot:
             cron_jobs=cron_jobs,
             credentials=credentials,
             blocked_admission_15m=blocked,
+            state_age_seconds=_state_age(home),
             unreadable=cron_bad + env_bad,
         )
     known_names = set(facts)
@@ -416,6 +530,7 @@ __all__ = [
     "MANIFEST_MALFORMED",
     "MANIFEST_OK",
     "MANIFEST_STALE",
+    "RECENT_USE_WINDOW_SECONDS",
     "SCHEMA_VERSION",
     "WANTED_TTL_SECONDS",
     "DemandFacts",

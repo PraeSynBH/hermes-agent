@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 
@@ -127,6 +128,87 @@ class TestCredentialSource:
         facts = snapshot.for_profile("locked")
         assert facts.unreadable == ("env",)
         assert snapshot.has("locked") is True
+
+
+class TestRecencySource:
+    """PRX-5750: a profile a human is USING has work, however it is configured.
+
+    Before this, a profile with no cron, no route and no agent was invisible to every source —
+    identical to a dead one — so the ceiling could defer the profile somebody was typing into.
+    """
+
+    def test_a_store_written_inside_the_window_is_work(self, profile_env):
+        used = _profile("rambur-aira")
+        store = used / "state.db"
+        store.write_bytes(b"")
+        os.utime(store, (time.time() - 600, time.time() - 600))  # touched 10 min ago
+
+        snapshot = demand.refresh()
+
+        facts = snapshot.for_profile("rambur-aira")
+        assert facts.used_recently is True
+        assert "recency" in facts.work_signals()
+        assert snapshot.has_work("rambur-aira") is True
+        assert facts.as_record()["work"] == ["recency"]
+
+    def test_a_store_older_than_the_window_is_not_work(self, profile_env):
+        stale = _profile("dormant")
+        store = stale / "state.db"
+        store.write_bytes(b"")
+        old = time.time() - demand.RECENT_USE_WINDOW_SECONDS - 3600
+        os.utime(store, (old, old))
+
+        snapshot = demand.refresh()
+
+        assert snapshot.for_profile("dormant").used_recently is False
+        assert snapshot.has_work("dormant") is False
+        assert snapshot.for_profile("dormant").as_record()["work"] == []
+
+    def test_a_profile_with_no_store_makes_no_claim(self, profile_env):
+        """``None`` is "no evidence", never "used long ago" — a fresh profile outranks nothing."""
+        _profile("newborn")
+        facts = demand.refresh().for_profile("newborn")
+        assert facts.state_age_seconds is None
+        assert facts.used_recently is False
+        assert facts.has_work() is False
+
+    def test_a_future_mtime_is_not_a_claim(self, profile_env):
+        """A clock skew (a shared volume) must not rank a profile as used forever."""
+        skewed = _profile("skewed")
+        store = skewed / "state.db"
+        store.write_bytes(b"")
+        future = time.time() + 86400
+        os.utime(store, (future, future))
+
+        assert demand.refresh().for_profile("skewed").state_age_seconds is None
+
+    def test_evidence_is_named_in_strength_order(self, profile_env):
+        busy = _profile("busy")
+        _write_jobs(busy, enabled=2)
+        (busy / ".env").write_text("DISCORD_BOT_TOKEN=discord-token\n", encoding="utf-8")
+        store = busy / "state.db"
+        store.write_bytes(b"")
+        os.utime(store, (time.time() - 60, time.time() - 60))
+        _write_manifest(profile_env, {"busy": {"agents": 3, "blocked_admission_15m": 1}})
+
+        facts = demand.refresh().for_profile("busy")
+
+        assert facts.work_signals() == ("admission", "agents", "cron", "recency", "credentials")
+
+
+class TestCredentialIsCapabilityNotWork:
+    """PRX-5750: every live profile has a bot token, so a credential cannot be a work signal."""
+
+    def test_credentials_alone_are_demand_but_not_work(self, profile_env):
+        channelled = _profile("channelled")
+        (channelled / ".env").write_text("DISCORD_BOT_TOKEN=discord-token\n", encoding="utf-8")
+
+        snapshot = demand.refresh()
+
+        assert snapshot.has("channelled") is True        # it still claims a slot
+        assert snapshot.has_work("channelled") is False  # ... but it ranks below any work
+        assert snapshot.holds_credentials("channelled") is True
+        assert snapshot.for_profile("channelled").work_signals() == ("credentials",)
 
 
 class TestManifest:

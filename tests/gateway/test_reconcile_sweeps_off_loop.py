@@ -105,8 +105,19 @@ async def test_reconcile_reads_demand_off_the_event_loop(tmp_path, monkeypatch):
         calls.append(threading.get_ident())
         return real_refresh()
 
+    # The recency signal added one ``stat`` per profile per tick (PRX-5750). It runs INSIDE the
+    # refresh that this tick hands to a thread, so the sweep rides along — pin that, because a
+    # stat on the loop is the stall class this file exists to prevent.
+    stat_calls = []
+    real_state_age = demand_mod._state_age
+
+    def spy_state_age(home_):
+        stat_calls.append(threading.get_ident())
+        return real_state_age(home_)
+
     # The reconcile tick imports the module by name at call time, so patching it here is the seam.
     monkeypatch.setattr(demand_mod, "refresh", spy_refresh)
+    monkeypatch.setattr(demand_mod, "_state_age", spy_state_age)
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(multiplex_profiles=True)
@@ -129,3 +140,5 @@ async def test_reconcile_reads_demand_off_the_event_loop(tmp_path, monkeypatch):
 
     assert calls, "the tick never read demand with a ceiling configured"
     assert loop_thread not in calls, "the demand read ran on the event loop thread"
+    assert stat_calls, "the recency sweep never ran with a ceiling configured"
+    assert loop_thread not in stat_calls, "the recency stat ran on the event loop thread"
