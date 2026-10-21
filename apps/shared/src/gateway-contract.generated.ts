@@ -5135,6 +5135,7 @@ export interface CanonicalSubmitParams {
   attachments?: CanonicalAttachment[] | null
   finite?: boolean
   unattended?: boolean
+  one_shot?: boolean
   surface?: string | null
   voice_context?: string | null
   interrupted?: boolean
