@@ -96,6 +96,12 @@ class GatewayStartupMixin:
     _startup_parked_platforms: bool = False
 
     def _serving_state(self) -> str:
+        # A pending external drain wins over ``running``/``degraded``: this is what boot publishes
+        # AFTER the marker was adopted (``_adopt_pending_drain``), and a ``running`` there hands a
+        # dispatcher that respects ``gateway_state.json`` a green light this gateway refuses
+        # (PRX-5819: 21 refused spawns in the 35 s between boot and the watcher's first tick).
+        if getattr(self, "_external_drain_active", False):
+            return "draining"
         return "degraded" if self._startup_parked_platforms else "running"
 
     async def _run_startup_resume_event(
@@ -1667,6 +1673,12 @@ class GatewayStartupMixin:
     async def start(self) -> bool:
         """Start the gateway and all configured platform adapters."""
         try:
+            # The drain marker is durable and this process is not, so a boot that lands inside a
+            # drain must honour it as its FIRST act — before any adapter connects, before admission
+            # opens, and before ``running`` is ever published. Waiting for the drain watcher's first
+            # tick left a 35 s window in which a reader was right to spawn runs this gateway then
+            # refused (PRX-5819).
+            await self._adopt_pending_drain()
             return await self._start_impl()
         finally:
             # Every startup path (early aborts included) ends here: bound startup on the latest

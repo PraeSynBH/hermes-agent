@@ -6,8 +6,9 @@ an ACTIVE marker means ``gateway_state -> "draining"``.
 
 Four lenient staleness signals (any one suffices): epoch mismatch (HERMES_HOME is a durable
 volume on Hermes Cloud, so a marker survives the restart a drain-gated action ends in and would
-park the fresh gateway in ``draining`` forever), expiry (any orphan past
-:data:`DRAIN_REQUEST_MAX_AGE_SECONDS`; re-writing refreshes it), a dead writer (the marker is a
+park the fresh gateway in ``draining`` forever), expiry (any orphan past its own lease — the
+``max_age_seconds`` field, clamped to :data:`DRAIN_REQUEST_MAX_AGE_SECONDS` and defaulting to it
+when absent; re-writing refreshes it — PRX-5819), a dead writer (the marker is a
 file, so the process that wrote it can be SIGKILLed before any cleanup runs — SOU-3249), and an
 untrusted principal (a drain silences a whole fleet, so only the authenticated control seams may
 ask for one).
@@ -21,6 +22,7 @@ import contextlib
 import functools
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -111,13 +113,20 @@ _DRAIN_REQUEST_FILENAME = ".drain_request.json"
 # the old leniency, because a half-written file must never un-quiesce a fleet mid-update.
 TRUSTED_DRAIN_PRINCIPALS = frozenset({"drain-control", "dashboard"})
 
-# Blast radius of a leaked marker, in seconds. A drain-gated lifecycle action completes in
-# minutes, and the off-host canary pages CanaryDeadmanDown after 45 min of fleet silence, so this
-# bound must stay strictly under that threshold — 3600 s made a single leaked test marker a
-# guaranteed page (SOU-3249). A deliberate drain longer than this keeps the marker alive by
-# re-writing it — write_drain_request() is idempotent and bumps ``requested_at``; a marker nobody
-# re-writes expires here.
+# Blast radius of a leaked marker, in seconds — the DEFAULT lease and the CEILING for a marker
+# that names its own. A drain-gated lifecycle action completes in minutes, and the off-host canary
+# pages CanaryDeadmanDown after 45 min of fleet silence, so this bound must stay strictly under
+# that threshold — 3600 s made a single leaked test marker a guaranteed page (SOU-3249). A
+# deliberate drain longer than this keeps the marker alive by re-writing it —
+# write_drain_request() is idempotent and bumps ``requested_at``; a marker nobody re-writes expires
+# here. A writer that knows its own lifetime should name a SHORTER lease in the body
+# (``max_age_seconds``, PRX-5819): measured 2026-10-21, an acceptance harness died with the marker
+# engaged and held the host for the whole constant — 17 refused spawns and every ``agent``-profile
+# cron silent for 64 min.
 DRAIN_REQUEST_MAX_AGE_SECONDS = 900.0
+# Marker field naming that per-marker lease. Absent, or not a finite positive number, means the
+# constant above — byte-for-byte today's behaviour for every existing writer.
+DRAIN_LEASE_FIELD = "max_age_seconds"
 # Dedup for the expired-marker warning (the watcher re-reads every second); keyed by
 # ``requested_at`` so a keep-alive re-write that later expires logs again.
 _expiry_logged_for: Optional[str] = None
@@ -184,14 +193,37 @@ def _process_birth() -> Optional[float]:
         return None
 
 
+def _clamp_lease(raw: Any) -> float:
+    """The lease a marker names, clamped to :data:`DRAIN_REQUEST_MAX_AGE_SECONDS`.
+
+    Unusable input (absent, bool, NaN/inf, non-numeric, <= 0) yields the constant, never "expire
+    now" and never "no bound": the lease is a blast-radius bound, so a corrupt one must fall back
+    to today's behaviour rather than un-quiesce a fleet mid-update. Above the constant clamps DOWN,
+    so a marker can ask to be forgotten sooner but never to outlive a legitimate drain's bound.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return DRAIN_REQUEST_MAX_AGE_SECONDS
+    lease = float(raw)
+    if not math.isfinite(lease) or lease <= 0:
+        return DRAIN_REQUEST_MAX_AGE_SECONDS
+    return min(lease, DRAIN_REQUEST_MAX_AGE_SECONDS)
+
+
 def write_drain_request(
     *, principal: str = "drain-control", suppress_notification: bool = False,
     test_only: bool = False, home: Optional[Path] = None,
+    max_age_seconds: Optional[float] = None,
 ) -> dict[str, Any]:
     """Write the begin-drain marker atomically; returns the payload.
 
     Re-writing refreshes ``requested_at`` (keep-alive past the max-age) AND the writer identity, so
     a long drain stays active by re-writing.
+
+    ``max_age_seconds`` is this marker's own lease (PRX-5819): a writer that knows it will be gone
+    in a minute says so instead of leaving the fleet quiesced for the default 900 s, and a writer
+    that dies is then harmless — no cancel, no watchdog. Written clamped to
+    :data:`DRAIN_REQUEST_MAX_AGE_SECONDS`, so a marker can never outlive the constant; omitted
+    (the default) writes no field at all, which reads exactly as it always has.
 
     ``suppress_notification`` skips ONLY the home-channel "gateway shutting down" broadcast (the
     per-session interrupt ping is never suppressed).  It is refused (written as False) for a
@@ -214,6 +246,8 @@ def write_drain_request(
         "epoch": current_instantiation_epoch(), "suppress_notification": bool(suppress_notification) and trusted,
         "writer_pid": os.getpid(), "writer_birth": _process_birth(),
     }
+    if max_age_seconds is not None:
+        payload[DRAIN_LEASE_FIELD] = _clamp_lease(max_age_seconds)
     if not trusted:
         payload["test_only"] = True
         _log.warning(
@@ -238,9 +272,11 @@ def clear_drain_request(*, home: Optional[Path] = None) -> bool:
 
 
 def _marker_is_expired(body: dict[str, Any]) -> bool:
-    """True iff ``requested_at`` parses AND is older than the max-age.
+    """True iff ``requested_at`` parses AND is older than this marker's lease.
 
-    Missing/unparseable and future-dated (clock skew) timestamps are honoured.
+    The lease is the marker's own ``max_age_seconds`` clamped to
+    :data:`DRAIN_REQUEST_MAX_AGE_SECONDS`, or that constant when the field is absent/unusable
+    (PRX-5819). Missing/unparseable and future-dated (clock skew) timestamps are honoured.
     Logged once per marker, not per poll — the operator's breadcrumb for a leak.
 
     See #85433.
@@ -250,15 +286,16 @@ def _marker_is_expired(body: dict[str, Any]) -> bool:
     requested_at = _parse_iso(raw)
     if requested_at is None:
         return False
+    lease = _clamp_lease(body.get(DRAIN_LEASE_FIELD))
     age = (datetime.now(UTC) - requested_at).total_seconds()
-    if age <= DRAIN_REQUEST_MAX_AGE_SECONDS:
+    if age <= lease:
         return False
     if _expiry_logged_for != raw:
         _expiry_logged_for = raw
         _log.warning(
             "drain-control: ignoring expired drain marker (requested_at=%s, age=%.0fs > max %.0fs, principal=%s) "
             "— the drain that wrote it was never cancelled; treating as stale so the gateway keeps accepting turns.",
-            raw, age, DRAIN_REQUEST_MAX_AGE_SECONDS, body.get("principal"),
+            raw, age, lease, body.get("principal"),
         )
     return True
 
