@@ -17,7 +17,6 @@ import functools
 import json
 import logging
 import re
-import time
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Optional
@@ -34,46 +33,26 @@ _log = logging.getLogger(__name__)
 RESTART_WAIT_REASON = "restart_wait"
 
 
-# A restart's after-turn wait can hold for up to ``restart_after_turn_timeout`` (1800 s by default)
-# while the process is healthy and still running in-flight turns. Refusing every new admission for
-# that whole window is a total blackout for a fleet whose clients do not queue-and-wait: measured
-# 2026-10-18 05:30-06:00Z, one restart request with 43 active units produced 267 refused admissions
-# in 30 min (95 % of all run failures), while the owner was serving and the loop was fast. So the
-# after-turn wait keeps admitting until this many seconds before its force-drain deadline; inside
-# the window admission closes again, so no turn is admitted that the imminent ``stop()`` amputates.
-RESTART_WAIT_ADMISSION_CLOSE_S = 60.0
-# Monotonic (time.monotonic()) instant at which THAT wait stops admitting; absent/None = refuse from
-# the start (every other drain, and the moment the wait ends). Process monotonic, not loop.time(), so
-# the admission gate can read it off the event loop.
-_RESTART_WAIT_ADMIT_UNTIL = "_restart_wait_admit_until"
+# Admission closes at T=0 of every drain, and a restart's after-turn wait is not an exception. The
+# wait can hold the process for ``restart_after_turn_timeout`` (1800 s by default) and it ends with
+# ``stop()``, which does NOT wait for anything admitted during it: measured 2026-10-21, two restarts
+# (21:37, 23:05 PDT) started 101 runs inside their waits and killed every one of them
+# (``error='runtime_draining'``, mean lifetime 7.2 s and 4.6 s). A run started into a drain is lost
+# work, and it is lost *after* the client paid a spawn and a boot — strictly worse than the same
+# refusal at T=0, which every client already handles as the retryable "restarting" verdict. So the
+# wait admits nothing it did not already own: it only KEEPS what was in flight at T=0 (queue_only
+# commits still land, #139041), and it says so once at the top instead of every 30 s (PRX-5787).
 
 
-def open_restart_wait(runner, *, admit_for: Optional[float] = None) -> None:
+def open_restart_wait(runner) -> None:
     """Publish the restart's after-turn wait (``drain_reason``) unless a drain already named its own.
 
-    ``admit_for`` is how many seconds the wait still admits new work — ``restart_after_turn_timeout``
-    minus :data:`RESTART_WAIT_ADMISSION_CLOSE_S`; omit it to keep the wait admission-closed.
+    The reason is what lets an interactive client attach to the owner to answer a turn parked on
+    approval/clarify (#139041); it never reopens admission, which the drain closed at T=0.
     """
     descriptor = getattr(runner, "session_runtime_descriptor", None)
     if descriptor is not None and not descriptor.get("drain_reason"):
         descriptor["drain_reason"] = RESTART_WAIT_REASON
-    deadline = None if admit_for is None or admit_for <= 0 else time.monotonic() + float(admit_for)
-    setattr(runner, _RESTART_WAIT_ADMIT_UNTIL, deadline)
-
-
-def close_restart_wait_admission(runner) -> None:
-    """Stop admitting new work in the current restart wait (the wait ended, or ``stop()`` began)."""
-    setattr(runner, _RESTART_WAIT_ADMIT_UNTIL, None)
-
-
-def restart_wait_admits(runner, *, now: Optional[float] = None) -> bool:
-    """True while *runner*'s after-turn wait is still admitting new work: it is a restart wait, its
-    force-drain deadline is more than :data:`RESTART_WAIT_ADMISSION_CLOSE_S` away, and the window has
-    not been closed. Everything else (a plain drain, retirement, the final window) refuses as before."""
-    deadline = getattr(runner, _RESTART_WAIT_ADMIT_UNTIL, None)
-    if deadline is None or not restart_wait_open(runner):
-        return False
-    return (time.monotonic() if now is None else float(now)) < float(deadline)
 
 
 def restart_wait_open(runner) -> bool:
