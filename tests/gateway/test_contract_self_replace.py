@@ -16,7 +16,10 @@ is driven tick by tick here against an injected clock — no sleeping, no real g
 5. no contract document / a non-git tree -> silent (unprovable is not a skew);
 6. a good boot whose file becomes unreadable -> silent;
 7. turns in flight -> the restart proceeds and the interrupted counts are recorded per profile;
-8. the loop guard survives a process restart (a real second process reads the record and stands down).
+8. the loop guard survives a process restart (a real second process reads the record and stands down);
+9. the COMMITTED document, not the working copy, decides (PRX-5958): a WIP edit that reverts never
+   restarts and is published as a finding, a commit landing after the worktree write is taken, and
+   an install that cannot answer reads as unprovable.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional, cast
 
 import pytest
 
@@ -37,6 +41,9 @@ from gateway.contract_watch import ContractWatcher, replaced_recently, state_pat
 OLD = "old0ld0ld0ld0"
 NEW = "new9new9new9"
 
+#: "committed" not passed at all: HEAD commits what the tree holds, the shape of a real deploy.
+_COMMITTED_UNSET = object()
+
 # The default cadence and guard window, as configured: 10 s ticks, a 20 s settle window.
 WATCH, GUARD = 10.0, 600.0
 
@@ -44,10 +51,13 @@ WATCH, GUARD = 10.0, 600.0
 class Rig:
     """A watcher with a pinned clock and observable side effects."""
 
-    def __init__(self, home, boot=OLD, tree=NEW, *, drained=False, restart_ok=True,
-                 interrupted=None, publishes=None):
+    def __init__(self, home, boot=OLD, tree=NEW, *, committed=_COMMITTED_UNSET, drained=False,
+                 restart_ok=True, interrupted=None, publishes=None):
         self.home = home
         self.boot, self.tree = boot, tree
+        # HEAD commits the tree's digest unless a case says otherwise: a normal, committed deploy.
+        self.committed: Optional[str] = (
+            tree if committed is _COMMITTED_UNSET else cast(Optional[str], committed))
         self.now = 0.0
         self.restarts = 0
         self.restart_ok = restart_ok
@@ -56,7 +66,8 @@ class Rig:
         self.published = [] if publishes is None else publishes
         self.watcher = ContractWatcher(
             home=home, seconds=WATCH, min_seconds_between_restarts=GUARD,
-            boot=lambda: self.boot, tree=lambda: self.tree, restart=self._restart,
+            boot=lambda: self.boot, tree=lambda: self.tree, committed=lambda: self.committed,
+            restart=self._restart,
             publish=self.published.append, interrupted=lambda: self.interrupted,
             drain_active=lambda: self.drained, clock=lambda: self.now)
 
@@ -243,6 +254,7 @@ calls = []
 clock = iter([0.0, 10.0, 20.0, 30.0])
 w = ContractWatcher(home=home, seconds=10.0, min_seconds_between_restarts=600.0,
                     boot=lambda: 'old0ld0ld0ld0', tree=lambda: 'new9new9new9',
+                    committed=lambda: 'new9new9new9',
                     restart=lambda: calls.append('restart') or True,
                     publish=calls.append, interrupted=dict, drain_active=lambda: False,
                     clock=lambda: next(clock))
@@ -266,6 +278,71 @@ print(json.dumps({'restarts': calls.count('restart'),
     assert json.loads(second.stdout)["restarts"] == 0, "the guard must be durable across the restart"
 
 
+# -- 9. the COMMITTED document decides, not the working copy (PRX-5958) ---------------------------
+
+
+def test_an_uncommitted_edit_of_the_contract_never_replaces_the_gateway(tmp_path, caplog):
+    """PRX-5958: the tree's ``63166f1c88be`` matched no commit, yet replaced the live gateway.
+
+    The edit was WIP for ~3 minutes (a shared stash pop or a direct edit), so the settle window could
+    not absorb it: 9 runs across 3 profiles were interrupted for a change no commit ever declared.
+    """
+    rig = Rig(tmp_path, boot=OLD, tree=NEW, committed=OLD)
+    caplog.set_level(logging.WARNING, logger="gateway.contract_watch")
+    assert rig.tick(0).outcome == "skew_unsettled"
+    assert rig.tick(WATCH).outcome == "skew_unsettled"
+    assert rig.tick(2 * WATCH).outcome == "uncommitted_edit"
+
+    assert rig.restarts == 0, "an edit nobody committed is not a deploy"
+    finding = rig.published[-1]
+    assert finding["status"] == "uncommitted"
+    assert (finding["boot"], finding["tree"], finding["committed"]) == (OLD, NEW, OLD)
+    assert "uncommitted" in finding["not_restarting"]
+    assert any("left alone" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert not state_path(tmp_path).exists(), "no guard record: nothing was attempted"
+
+    # The edit reverts: the process never disagreed with what HEAD declares, and the claim is withdrawn.
+    rig.tree = OLD
+    assert rig.tick(3 * WATCH).outcome == "no_skew"
+    assert rig.published[-1] is None
+    assert rig.restarts == 0
+
+
+def test_an_open_finding_is_published_once_not_every_tick(tmp_path):
+    """The watch re-enters the hold on every tick: gateway_state.json must not be rewritten at 10 s."""
+    rig = Rig(tmp_path, boot=OLD, tree=NEW, committed=OLD)
+    rig.settle()
+    assert len(rig.published) == 1
+    rig.tick(3 * WATCH)
+    rig.tick(4 * WATCH)
+    assert len(rig.published) == 1, "one finding for one open edit"
+    assert rig.restarts == 0
+
+
+def test_a_commit_landing_after_the_worktree_write_is_taken_on_the_next_tick(tmp_path):
+    """A merge writes the working tree before the commit object (SOU-3328: 45 s apart): wait for HEAD."""
+    rig = Rig(tmp_path, boot=OLD, tree=NEW, committed=OLD)
+    rig.settle()
+    assert rig.restarts == 0, "the tree moved but no commit declared it yet"
+
+    rig.committed = NEW  # the merge commit lands; the tree digest is now the committed one
+    assert rig.tick(3 * WATCH).outcome == "restarting"
+    assert rig.restarts == 1
+    assert rig.published[-1]["status"] == "requested"
+
+
+def test_without_a_committed_document_nothing_is_replaced(tmp_path):
+    """A non-git install (or a git fault) cannot prove the wire contract moved, so it must not die."""
+    rig = Rig(tmp_path, boot=OLD, tree=NEW, committed=None)
+    assert rig.settle().outcome == "commit_unprovable"
+
+    assert rig.restarts == 0
+    finding = rig.published[-1]
+    assert (finding["status"], finding["committed"]) == ("uncommitted", None)
+    assert finding["finding"] == "commit_unprovable"
+    assert not state_path(tmp_path).exists()
+
+
 # -- the publish seam really lands in gateway_state.json --------------------------------------------
 
 
@@ -276,7 +353,8 @@ def test_contract_stale_is_published_into_gateway_state(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     clock = iter([0.0, WATCH, 2 * WATCH])
     watcher = ContractWatcher(home=tmp_path, seconds=WATCH, boot=lambda: OLD, tree=lambda: NEW,
-                              restart=lambda: True, interrupted=dict, clock=lambda: next(clock))
+                              committed=lambda: NEW, restart=lambda: True, interrupted=dict,
+                              clock=lambda: next(clock))
     assert watcher.tick().outcome == "skew_unsettled"
     assert watcher.tick().outcome == "skew_unsettled"
     assert watcher.tick().outcome == "restarting"
@@ -286,6 +364,7 @@ def test_contract_stale_is_published_into_gateway_state(tmp_path, monkeypatch):
 
     # An in-sync process withdraws the previous life's claim exactly once (never per tick).
     steady = ContractWatcher(home=tmp_path, seconds=WATCH, boot=lambda: NEW, tree=lambda: NEW,
+                             committed=lambda: NEW,
                              publish=lambda payload: write_runtime_status(contract_stale=payload))
     assert steady.tick().outcome == "no_skew"
     assert read_runtime_status().get("contract_stale") is None
@@ -350,6 +429,8 @@ def test_the_live_watcher_asks_the_runner_for_a_restart_through_the_loop(tmp_pat
     monkeypatch.setattr(contract_revision, "_boot_revision", OLD, raising=False)
     monkeypatch.setattr(contract_revision, "_boot_recorded", True, raising=False)
     monkeypatch.setattr(contract_revision, "revision", lambda root=None: NEW)
+    # ...and the NEW digest is committed, so the skew is a deploy and not somebody's open edit.
+    monkeypatch.setattr(contract_revision, "committed_revision", lambda *a, **k: NEW)
 
     loop = asyncio.new_event_loop()
     thread = threading.Thread(target=loop.run_forever, daemon=True, name="test-gateway-loop")
