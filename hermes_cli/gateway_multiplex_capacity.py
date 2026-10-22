@@ -13,9 +13,10 @@ gets a terminal verdict instead of waiting out its deadline for a profile nothin
 
 Which profiles? ``default`` is always served (it is the process's own profile and owns the control
 socket). Named profiles are RANKED BY LIVE WORK since SOU-3075, and by work rather than by capability
-since PRX-5750: a profile that owns Paperclip agents, a blocked admission, an enabled cron job, or a
-session store written in the last six hours is served before one that holds none of them
-(:mod:`hermes_cli.gateway_multiplex_demand`). Adapter credentials rank *below* all of that — every
+since PRX-5750. The ladder, strongest first (:mod:`hermes_cli.gateway_multiplex_demand`): a PENDING
+WAKE (a blocked admission, or a queued run for one of its agents — PRA-6796) · assigned work
+(Paperclip agents, an enabled cron job) · a session store written in the last six hours · a bare bot
+token. Adapter credentials rank *below* all of that — every
 live profile has a bot token, so ranking by it made the demand class universal and collapsed this
 order back into the priority list it replaced. ``gateway.multiplex_serve_priority`` survives as the
 tiebreak *inside* a class — it can no longer outrank work — and the name breaks remaining ties.
@@ -212,6 +213,10 @@ def demand_signal(demand: Any, name: str) -> str:
     if _demand_flag(demand, "wanted", name):
         return demand_module.wanted_signal(name)
     facts = _demand_facts(demand, name)
+    wake = demand_module.wake_signal(facts) if facts is not None else ""
+    if wake:
+        # The strongest disk evidence there is (PRA-6796): say the wake, not the assigned count.
+        return wake
     cron_jobs = int(getattr(facts, "cron_jobs", 0) or 0)
     if cron_jobs:
         return f"{cron_jobs} enabled cron job{'s' if cron_jobs != 1 else ''}"
@@ -259,7 +264,9 @@ def _demand_class(demand: Any, name: str) -> int:
             value = None
         if isinstance(value, int) and not isinstance(value, bool):
             return value
-    return 0 if _demand_flag(demand, "has", name) else 3
+    # A view that cannot rank only says yes/no about demand: it lands in the queued-work class (1),
+    # never class 0 — "has some demand" is not the claim "a wake is waiting" (PRA-6796).
+    return 1 if _demand_flag(demand, "has", name) else 4
 
 
 def _demand_flag(demand: Any, flag: str, name: str) -> bool:
@@ -309,6 +316,13 @@ def cost_clause(demand: Any, name: str) -> str:
         # The one cost an operator must never have to infer: somebody is blocked on this profile.
         from hermes_cli import gateway_multiplex_demand as demand_module
         clause += f", {demand_module.wanted_signal(name)}"
+    elif facts is not None:
+        # PRA-6796: the profile was not parked for being idle — a wake for it is WAITING. This is
+        # the sentence the refusal carries onto the owning card, so say it here, not only in a log.
+        from hermes_cli import gateway_multiplex_demand as demand_module
+        wake = demand_module.wake_signal(facts)
+        if wake:
+            clause += f", {wake}"
     return clause
 
 
