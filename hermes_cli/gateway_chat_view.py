@@ -330,17 +330,29 @@ class GatewayChatView:
         # (2026-10-18T09:39:53Z, elapsed 84.2 s, session_id present, no output). Same startup
         # deadline as the create: a late admission is recoverable, a dropped one is a lost run.
         sid, gaps = self.session_id, self.gaps
-        from hermes_cli.gateway_client import contract_submit_params
-        receipt = await self.client.rpc("prompt.submit", _timeout=GATEWAY_STARTUP_RPC_DEADLINE_S,
-                                        session_id=self.session_id,
-                                        input_id=uuid.uuid4().hex, text=text,
-                                        **(contract_submit_params()),
-                                        **({"finite": True} if self.finite else {}),
-                                        # A one-shot's process exits with the turn, so a turn lost
-                                        # across an owner restart has no waiter to pause for
-                                        # (PRX-5850: the row blocked every later wake instead).
-                                        **({"one_shot": True} if self.finite else {}),
-                                        **({"unattended": True} if self.finite and self.unattended else {}))
+        from hermes_cli.gateway_client import (
+            GatewayRPCError, contract_submit_params, declaration_retry_params,
+        )
+        params = {"session_id": self.session_id, "input_id": uuid.uuid4().hex, "text": text,
+                  **(contract_submit_params()),
+                  **({"finite": True} if self.finite else {}),
+                  # A one-shot's process exits with the turn, so a turn lost across an owner
+                  # restart has no waiter to pause for (PRX-5850: the row blocked every later
+                  # wake instead).
+                  **({"one_shot": True} if self.finite else {}),
+                  **({"unattended": True} if self.finite and self.unattended else {})}
+        try:
+            receipt = await self.client.rpc("prompt.submit", _timeout=GATEWAY_STARTUP_RPC_DEADLINE_S, **params)
+        except GatewayRPCError as exc:
+            # The declaration is metadata; an owner that predates it must not fail the run. The
+            # resend reuses ``input_id`` (nothing was admitted: the param gate refuses first) and
+            # cannot be refused for the same reason — the key is gone (SOU-3330).
+            retry = declaration_retry_params(exc, params)
+            if retry is None:
+                raise
+            from gateway.contract_revision import REVISION_PARAM
+            logger.debug("prompt.submit: owner does not know %s; resending without it", REVISION_PARAM)
+            receipt = await self.client.rpc("prompt.submit", _timeout=GATEWAY_STARTUP_RPC_DEADLINE_S, **retry)
         if (receipt or {}).get("voice_stopped") is True:
             # TUI-26: a bare stop phrase typed into this LOCAL session's voice chat (another viewer
             # turned it on) ended the chat on the owner; nothing was admitted and no turn follows.

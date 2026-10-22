@@ -18,7 +18,9 @@ import time
 import uuid
 from contextlib import suppress
 
-from hermes_cli.gateway_client import GatewayClientError, GatewayContractSkewError, GatewayRPCError
+from hermes_cli.gateway_client import (
+    GatewayClientError, GatewayContractSkewError, GatewayRPCError, declaration_retry_params,
+)
 from hermes_cli.gateway_connection import DISCONNECTED, CallStopped, lost_before
 
 logger = logging.getLogger(__name__)
@@ -702,6 +704,29 @@ class GatewayAgent:
         params.update(contract_submit_params())
         return params
 
+    def _submit_turn(self, params, session_id):
+        """One ``prompt.submit`` for this turn, with the single safe resend.
+
+        An owner that booted before this tree's wire contract does not define the optional
+        ``contract_revision`` declaration, and PRA-6722 names it in the refusal. That declaration is
+        metadata, so the run must not die on it: resend ONCE without the key, under the same
+        admission identity (``submission_id``), because the param gate refuses before anything is
+        admitted. Every other refusal — a skew, another unknown key, a bare one that names nothing —
+        propagates untouched (SOU-3330; the rollout of SOU-3318 refused 40 runs this way).
+        """
+        def send(payload):
+            return self.connection.call("prompt.submit", **{**payload, "session_id": session_id})
+
+        try:
+            return send(params)
+        except GatewayRPCError as exc:
+            retry = declaration_retry_params(exc, params)
+            if retry is None:
+                raise
+            from gateway.contract_revision import REVISION_PARAM
+            logger.debug("prompt.submit: owner does not know %s; resending without it", REVISION_PARAM)
+            return send(retry)
+
     def _take_turn_route(self):
         """The ``/model --once`` pick for the admission being built, consumed here: one admission carries
         it, even when a later ``run_conversation`` submits while this one's ``prompt.submit`` still blocks.
@@ -771,7 +796,7 @@ class GatewayAgent:
                 params = self._submit_params(user_message, persist_user_message, turn_author)
                 if self._stop(turn)():
                     raise CallStopped("prompt.submit")
-                receipt = self.connection.call("prompt.submit", **{**params, "session_id": turn.session_id})
+                receipt = self._submit_turn(params, turn.session_id)
             except CallStopped:  # main moved on (a later turn, /new, Ctrl-C's bound) before the submit
                 self._give_back_turn_route()  # nothing was sent: the pick is still owed
                 return self._failed(history, user_message, "Stopped before the prompt was sent; nothing was sent.")
