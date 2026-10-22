@@ -61,7 +61,7 @@ def _actor(authority, actor):
     return Principal(CRON_PRINCIPAL_ID, authority.profile_id, actor.capabilities, actor.transport_id)
 
 
-def _create(authority, actor, params):
+async def _create(authority, actor, params):
     from cron.jobs import get_job
     from gateway.session_local_recovery import local_identity, restore_local_session
     from gateway.session_policy import build_policy, bind_launch_key
@@ -79,7 +79,11 @@ def _create(authority, actor, params):
         raise RuntimeStoreError('invalid_params')
     execution_id, request_id = request_id, cron_request_id(jid, request_id)
     sid = local_identity(authority.profile_id, actor.subject, request_id)
-    if authority.db.get_session(sid) is not None:
+    # The retry-exists read runs off the owner loop, for the same reason the creation commit below
+    # does: a read that misses the read pool degrades to the writer connection under ``SessionDB._lock``
+    # (hermes_state._read_ctx's documented fallback), so a held writer would freeze every session,
+    # timer and socket this profile serves while a cron fire is admitted.
+    if await asyncio.to_thread(authority.db.get_session, sid) is not None:
         return restore_local_session(authority, sid), request_id
     if ':' in execution_id:
         # Fresh admissions only: ``cron:<job>:<execution>`` then splits at its one ``:`` after the
@@ -156,7 +160,7 @@ async def operation(authority, name, params, actor=None):
         from gateway.session_authorities import owner_scope
         # The job id, jobs file and gateway config belong to the OWNING profile.
         with owner_scope(authority):
-            ref, request_id = _create(authority, actor, params)
+            ref, request_id = await _create(authority, actor, params)
         from functools import partial
         from gateway.session_runtime_workers import tracked_write
         if isinstance(ref, dict):
