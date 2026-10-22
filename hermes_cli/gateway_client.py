@@ -438,9 +438,17 @@ class GatewayProfileDeferredError(GatewayUnavailableError):
     perfectly servable and simply did not get a slot among the profiles already served — so it
     carries its own reason code and a retry schedule, and the ceiling's own numbers (served of
     installed) instead of "not served". Re-dispatch is safe because nothing was submitted.
+
+    ``exit_code`` is EX_TEMPFAIL, the same contract ``GatewayTurnNotAdmitted`` carries: the reason
+    code alone only reached a reader that parsed the message, while the LOSER here — the process
+    exit status — still said 1, i.e. "this run failed", which is what a dispatcher and the adapter
+    book (PRX-5964 gave the never-admitted class that exit contract; a deferral needs it for the
+    same reason, and the issue's own repro is "a failed run with exit 1"). ``GatewayRestartingError``
+    deliberately keeps 1: a declared window is an operator action, not this dispatcher's to retry.
     """
 
     reason_code = PROFILE_DEFERRED_REASON
+    exit_code = TURN_NOT_ADMITTED_EXIT_CODE
 
     def __init__(self, message: str, retry_after_s: float, *, profile_name: str | None = None):
         super().__init__(message, "deferred")

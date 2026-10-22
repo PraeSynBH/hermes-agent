@@ -525,3 +525,40 @@ def test_boot_evidence_names_create_time_and_start_time(tmp_path):
     ledger.write_text("not json", encoding="utf-8")
     assert runtime.boot_evidence(home) is None
     assert runtime.boot_evidence(tmp_path / "never-booted") is None
+
+
+def test_a_settled_deferral_leaves_the_process_a_retry_verdict(monkeypatch, capsys):
+    """The deferral's exit status is EX_TEMPFAIL, not the 1 that books a failed run (PRX-5972).
+
+    A reason code on the exception is only visible to a reader inside this process. What a dispatcher
+    and the Paperclip adapter act on is the process EXIT STATUS (PRX-5964 gave the never-admitted
+    class that same contract); run ``979b4fe2`` spent 75 s on a ceiling wait and exited 1, so the
+    agent's card carried a failure for a capacity decision. EX_TEMPFAIL says the one true thing:
+    nothing was submitted, and re-dispatch is safe.
+    """
+    from hermes_cli import gateway_chat, gateway_chat_startup
+    from hermes_cli.gateway_client import GatewayProfileDeferredError
+    from hermes_cli.turn_exit import TURN_NOT_ADMITTED_EXIT_CODE
+
+    deferral = GatewayProfileDeferredError(
+        "Gateway deferred: profile_deferred_capacity (retryAfterS=300, retryable=true, profile=cmo): "
+        "no slot among 17 served of 43 installed (ceiling 17)",
+        300.0, profile_name="cmo")
+
+    async def run(args, emitter=None):
+        raise deferral
+
+    monkeypatch.setattr(gateway_chat_startup, "ensure_launch_provider", lambda args: True)
+    monkeypatch.setattr(gateway_chat, "run_gateway_chat", run)
+    assert gateway_chat.launch_from_kwargs({"q": "literal"}) == TURN_NOT_ADMITTED_EXIT_CODE
+    err = capsys.readouterr().err
+    assert "profile_deferred_capacity" in err and "profile_not_served" not in err, err
+
+    # The record a machine reader parses (``--format stream-json``) closes with the same verdict.
+    assert gateway_chat.launch_from_kwargs(
+        {"q": "literal", "output_format": "stream-json"}) == TURN_NOT_ADMITTED_EXIT_CODE
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    result = records[-1]
+    assert result["type"] == "result" and result["exit_code"] == TURN_NOT_ADMITTED_EXIT_CODE, result
+    assert "profile_deferred_capacity" in result["error"], result
+    assert "profile_not_served" not in result["error"], result
