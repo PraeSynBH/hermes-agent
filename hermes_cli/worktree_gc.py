@@ -30,6 +30,15 @@ _KANBAN_RE = re.compile(r"^t_[0-9a-f]+$")
 # lane, not merged scratch; checking it is expensive and it stays preserved.
 _MAX_CHERRY_AHEAD = 50
 
+# Footprint size probe (PRA-6783). One `du -sm` over the whole `.worktrees` parent is O(every
+# inode under it) against a single fixed deadline, so on a large tree it always expires and the
+# size half of the escalation gate reads None — 722 of 746 boot notices said "(unknown size)".
+# One bounded probe per tree does about the same total work, but a stalled tree only costs its
+# own timeout instead of starving every other tree's measurement.
+_SIZE_PROBE_TIMEOUT = 20   # seconds per tree
+_SIZE_PROBE_WORKERS = 4    # the probe runs on the boot path: keep concurrent disk pressure low
+_SIZE_PROBE_BUDGET = 60    # seconds overall; trees still unstarted past this are unmeasured
+
 
 @dataclass
 class TreeRecord:
@@ -422,13 +431,66 @@ def reclaim_branches(
     return actions
 
 
-def worktrees_summary(repo_root: str) -> tuple[int, Optional[int]]:
-    """(tree_count, total_size_mb) for the escalation notice; size is best-effort with a timeout."""
+@dataclass
+class Footprint:
+    """Count + size of ``<repo>/.worktrees`` for the boot escalation notice (PRA-6637/PRA-6783).
+
+    ``size_mb`` sums the trees that could be measured and ``unmeasured`` says how many could not;
+    it is None only when NO tree could be measured, and then :meth:`size_text` says so out loud —
+    a silent ``None`` is exactly what kept the size half of the gate dead on big hosts.
+    """
+    count: int
+    size_mb: Optional[int]
+    unmeasured: int = 0
+
+    def size_text(self) -> str:
+        if self.size_mb is None:
+            return "size probe timed out"
+        text = f"{self.size_mb / 1024:.1f}GB"
+        if self.unmeasured:
+            text += f"+, {self.unmeasured} tree(s) unmeasured"
+        return text
+
+
+def _tree_sizes(children: list, *, timeout: int = _SIZE_PROBE_TIMEOUT,
+                workers: int = _SIZE_PROBE_WORKERS,
+                budget: int = _SIZE_PROBE_BUDGET) -> tuple[int, int]:
+    """(summed_mb, unmeasured_count) — one bounded ``du -sm`` per tree, never one walk of the parent."""
+    if not children:
+        return 0, 0
+    deadline = time.monotonic() + budget
+
+    def probe(tree: Path) -> Optional[int]:
+        if time.monotonic() >= deadline:
+            return None
+        return _tree_size_mb(tree, timeout=timeout)
+
+    pool_size = max(1, min(workers, len(children)))
+    if pool_size == 1:
+        sizes = [probe(tree) for tree in children]
+    else:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=pool_size, thread_name_prefix="hermes-tree-size") as pool:
+            sizes = list(pool.map(probe, children))
+    measured = [size for size in sizes if size is not None]
+    return sum(measured), len(sizes) - len(measured)
+
+
+def worktrees_footprint(repo_root: str) -> Footprint:
+    """Measure ``<repo>/.worktrees``: tree count plus a real size on a tree of any size."""
     worktrees_dir = Path(repo_root) / ".worktrees"
-    if not worktrees_dir.exists():
-        return 0, None
     try:
-        count = sum(1 for e in worktrees_dir.iterdir() if e.is_dir())
-    except Exception:
-        return 0, None
-    return count, _tree_size_mb(worktrees_dir, timeout=20)
+        children = sorted(entry for entry in worktrees_dir.iterdir() if entry.is_dir())
+    except OSError:
+        return Footprint(0, None)
+    total_mb, unmeasured = _tree_sizes(children)
+    if children and unmeasured == len(children):
+        return Footprint(len(children), None, unmeasured)
+    return Footprint(len(children), total_mb, unmeasured)
+
+
+def worktrees_summary(repo_root: str) -> tuple[int, Optional[int]]:
+    """(tree_count, total_size_mb) for the escalation notice; see :func:`worktrees_footprint`."""
+    footprint = worktrees_footprint(repo_root)
+    return footprint.count, footprint.size_mb
