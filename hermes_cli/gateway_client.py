@@ -91,6 +91,12 @@ PROFILE_SERVE_POLL_INTERVAL_S = 5.0
 # deferral as terminal at T=0 is what killed three devops runs in the 2-3 min boot reconcile that was
 # already re-ranking them in (PRX-5963).
 PROFILE_SERVE_WAIT_S = 75.0
+# A settled ceiling deferral is a CAPACITY verdict, not a failed run (PRX-5972). The run is told when
+# to ask again — the next heartbeat — and nothing was submitted, so re-dispatch is safe. Without this
+# the client exited 1 and the Paperclip adapter booked `adapter_failed` onto the agent's card, so a
+# card read as a broken agent for a ceiling decision (PRX-5970 was filed over exactly that).
+PROFILE_DEFERRED_REASON = "profile_deferred_capacity"
+PROFILE_DEFERRAL_RETRY_S = 300.0
 # The bound on sampling the owner's loop at the moment this run dies at admission: the owner is
 # already stalling, so the probe is allowed less than the slack a healthy loop answers in
 # milliseconds, and a no-answer is reported as a floor (``owner_loop>2s``), never as healthy.
@@ -423,6 +429,93 @@ class GatewayRestartingError(GatewayUnavailableError):
         self.retry_after_s = retry_after_s
 
 
+class GatewayProfileDeferredError(GatewayUnavailableError):
+    """A ceiling deferral that outlived its window: a CAPACITY booking, not an unusable profile.
+
+    ``profile_not_served`` was the wrong word for it in two ways (PRX-5972): it is the verdict for a
+    home that can NEVER be served (no identity marker, no owner of its own), and a retry chain /
+    adapter reading it books a failed run. The ceiling deferral means the opposite — the profile is
+    perfectly servable and simply did not get a slot among the profiles already served — so it
+    carries its own reason code and a retry schedule, and the ceiling's own numbers (served of
+    installed) instead of "not served". Re-dispatch is safe because nothing was submitted.
+    """
+
+    reason_code = PROFILE_DEFERRED_REASON
+
+    def __init__(self, message: str, retry_after_s: float, *, profile_name: str | None = None):
+        super().__init__(message, "deferred")
+        self.retry_after_s = retry_after_s
+        self.profile_name = profile_name
+
+
+
+def _deferral_already_outlived_a_sighting(detail: str | None, profile_name: str | None) -> bool:
+    """Is this park the SAME deferral a waiting client already filed itself into?
+
+    ``gateway_multiplex_capacity.cost_clause`` appends the live wanted-sighting to a deferral's reason,
+    so a reason that already carries it was published by a reconcile tick that read a waiting client's
+    sighting — the strongest demand signal the rank has — and still left the profile outside the
+    ceiling. A second dispatch cannot do better by waiting again; it just pays the window over
+    (PRX-5972). Detection is the canonical signal text, never a substring of our own words.
+    """
+    from hermes_cli.gateway_multiplex_demand import wanted_signal
+    return wanted_signal(profile_name) in (detail or "")
+
+
+def _deferral_numbers(detail: str | None) -> tuple[int | None, int | None, int | None]:
+    """``(ceiling, served, installed)`` for a deferral verdict, each None when it cannot be read.
+
+    The park reason already spells the ceiling (``capacity: 17 profiles per gateway …``); the served
+    set and the roster are two cheap reads. Every read is best-effort: a message builder must never be
+    the reason a run dies, so a failure degrades to the words the multiplexer already gave us.
+    """
+    ceiling = None
+    marker = "capacity: "
+    text = detail or ""
+    if marker in text:
+        head = text.split(marker, 1)[1]
+        digits = head.split(" ", 1)[0]
+        if digits.isdigit():
+            ceiling = int(digits)
+    served = installed = None
+    with suppress(Exception):  # a number in a message must never be the reason a run dies
+        from hermes_cli.gateway_multiplex_served import recorded_served_profiles
+        recorded = recorded_served_profiles()
+        served = len(recorded) if recorded is not None else None
+    with suppress(Exception):
+        from hermes_cli.profiles_serve import profiles_to_serve
+        installed = len(profiles_to_serve(multiplex=True))
+    return ceiling, served, installed
+
+
+def _deferral_slot_phrase(ceiling, served, installed) -> str:
+    """``no slot among 17 served of 43 installed (ceiling 17)`` — the ceiling's own arithmetic."""
+    if served is None and installed is None:
+        return "no free slot at gateway.multiplex_max_profiles"
+    slot = f"no slot among {served if served is not None else '?'} served"
+    if installed is not None:
+        slot += f" of {installed} installed"
+    if ceiling is not None:
+        slot += f" (ceiling {ceiling})"
+    return slot
+
+
+def _deferral_message(profile_name: str | None, detail: str | None, *, waited_s: float | None,
+                      reconciled: bool) -> str:
+    """The deferral verdict: a machine token, a retry schedule, the ceiling's numbers, the park's cost."""
+    reason = (detail or "the multiplexer's ceiling defers this profile").strip()
+    if len(reason) > 400:
+        reason = reason[:397] + "..."
+    why = ("a waiting client was already deferred by the reconcile after its own sighting, so no "
+           "window of this dispatch could have opened a slot" if reconciled else
+           f"waited {waited_s:g}s through ceiling re-ranks after filing this run as demand")
+    server = _deferral_slot_phrase(*_deferral_numbers(detail))
+    return (f"Gateway deferred: {PROFILE_DEFERRED_REASON} "
+            f"(retryAfterS={round(PROFILE_DEFERRAL_RETRY_S)}, retryable=true, profile={profile_name}): "
+            f"{server}; nothing was submitted, so re-dispatch can be admitted when the rank moves — "
+            f"{why}. Park reason: {reason}")
+
+
 class EventQueue(asyncio.Queue):
     """The client's bounded event queue plus an ordered overflow behind it: each ``get`` refills the
     queue from the overflow, so items arrive in read order and ``qsize``/``full`` see only the queue."""
@@ -753,6 +846,15 @@ async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
                     # The park is keyed by profile id, and a home's basename is only that for a named
                     # profile (the root home is `.hermes`, i.e. `default`, an install detail).
                     serving_name = profile_name_for_home(home) or home.name
+                    if _deferral_already_outlived_a_sighting(serving, serving_name):
+                        # The publish already carries a waiting client's own sighting and STILL
+                        # defers this profile: a reconcile tick ran with the strongest demand signal
+                        # there is and the rank did not move, so another window cannot open one.
+                        # Spend seconds, not the whole window, on a slot nobody is going to free
+                        # (PRX-5972: 26 profiles parked, 16 agents behind them).
+                        raise GatewayProfileDeferredError(
+                            _deferral_message(serving_name, serving, waited_s=None, reconciled=True),
+                            PROFILE_DEFERRAL_RETRY_S, profile_name=serving_name)
                     serving_until = time.monotonic() + PROFILE_SERVE_WAIT_S
                     boot = drain = None  # the owner is up; this wait is about a slot, not a boot
                     from hermes_cli.gateway_multiplex_served import note_profile_wanted
@@ -782,11 +884,14 @@ async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
         # owner never accepted this run), and the text says which wait ate the budget.
         if serving is not None:
             # The ceiling never made room inside the wait window: for THIS run the deferral is
-            # settled, and its own reason (cost, remedy) is the answer — not a boot, not starvation.
-            raise GatewayUnavailableError(
-                f"Gateway inaccessible: profile_not_served ({serving}; waited {PROFILE_SERVE_WAIT_S:g}s "
-                f"through ceiling re-ranks after filing this run as demand on '{serving_name}')",
-                "inaccessible")
+            # settled. Its own reason (cost, remedy) is the answer — not a boot, not starvation — and
+            # it is a CAPACITY booking, not an unusable profile: nothing was submitted, so the
+            # dispatcher may re-admit on the next heartbeat instead of reading a broken agent
+            # (PRX-5972: `profile_not_served` here booked `adapter_failed` onto a card for a ceiling
+            # decision).
+            raise GatewayProfileDeferredError(
+                _deferral_message(serving_name, serving, waited_s=PROFILE_SERVE_WAIT_S, reconciled=False),
+                PROFILE_DEFERRAL_RETRY_S, profile_name=serving_name)
         if boot is not None:
             # Only a real boot reaches here now: a silent owner is its own verdict (control_timeout)
             # and no longer borrows this name. Say how long this host's boot actually took.

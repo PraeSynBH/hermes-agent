@@ -235,7 +235,14 @@ def test_admission_waits_a_ceiling_deferral_out_and_files_itself_as_demand(monke
 
 @pytest.mark.platforms("posix")
 def test_a_deferral_that_outlives_the_window_names_the_ceiling(monkeypatch):
-    """No slot inside the window: the run fails with the ceiling's reason, not as a boot or a stall."""
+    """No slot inside the window: the run is booked as a DEFERRAL, not as an unusable profile.
+
+    PRX-5972: the window expiring used to raise ``GatewayUnavailableError("Gateway inaccessible:
+    profile_not_served …")`` — the verdict for a home that can never be served — so the Paperclip
+    adapter booked ``adapter_failed`` onto the agent's card for a plain ceiling decision (run
+    ``979b4fe2``: 75 s, exit 1). The settled deferral now carries its own reason code, a retry
+    schedule, and the ceiling's own numbers.
+    """
     from hermes_cli import gateway_client, gateway_multiplex_served, gateway_runtime
 
     monkeypatch.setattr(gateway_client, "PROFILE_SERVE_WAIT_S", 0.25)
@@ -251,13 +258,56 @@ def test_a_deferral_that_outlives_the_window_names_the_ceiling(monkeypatch):
             raise AssertionError("a settled deferral must not admit the run")
 
     before = time.monotonic()
-    with pytest.raises(gateway_client.GatewayUnavailableError) as caught:
+    with pytest.raises(gateway_client.GatewayProfileDeferredError) as caught:
+        asyncio.run(run())
+    elapsed = time.monotonic() - before
+    error, line = caught.value, str(caught.value)
+    assert error.reason_code == "profile_deferred_capacity", line
+    assert error.retryable is True and error.retry_after_s is not None, line
+    assert "retryAfterS=" in line and "retryable=true" in line and "profile=devops" in line, line
+    assert "profile_not_served" not in line, "a capacity booking must not borrow the unserved verdict"
+    assert "no slot among" in line and "ceiling 16" in line, line
+    assert "capacity: 16 profiles" in line, "the park's own cost/remedy clause has to survive"
+    assert "boot" not in line and "starving" not in line, line
+    assert elapsed < 5, f"the deferral window bounds the wait, took {elapsed:.1f}s"
+
+
+@pytest.mark.platforms("posix")
+def test_a_deferral_a_reconcile_already_re_ranked_fails_fast(monkeypatch):
+    """A park that already carries a waiting client's sighting cannot be won by waiting again.
+
+    ``cost_clause`` appends the live wanted-sighting to the park reason, so a reason that carries it
+    was published by a tick that read the strongest demand signal there is and still kept the profile
+    outside the ceiling. 16 agents sit behind parked profiles (PRX-5972), and each of their runs used
+    to pay the whole window for a rank that had already been asked to move.
+    """
+    from hermes_cli import gateway_client, gateway_multiplex_demand, gateway_multiplex_served
+    from hermes_cli import gateway_runtime
+
+    seen = gateway_multiplex_demand.wanted_signal("devops")
+    park = _CAPACITY_PARK.replace(" — raise the ceiling", f", {seen} — raise the ceiling")
+    monkeypatch.setattr(gateway_client, "PROFILE_SERVE_WAIT_S", 30.0)
+    monkeypatch.setattr(gateway_runtime, "ensure_gateway_runtime",
+                        lambda *a, **k: gateway_runtime.GatewayDiscovery(
+                            "inaccessible", reason_code="profile_serving", detail=park,
+                            retry_after_s=5.0))
+    monkeypatch.setattr(gateway_runtime, "gateway_profile_home", lambda home: Path("/homes/devops"))
+    sightings: list[str] = []
+    monkeypatch.setattr(gateway_multiplex_served, "note_profile_wanted",
+                        lambda name, **k: sightings.append(name) or True)
+
+    async def run():
+        async with gateway_client.connect_gateway():
+            raise AssertionError("a settled deferral must not admit the run")
+
+    before = time.monotonic()
+    with pytest.raises(gateway_client.GatewayProfileDeferredError) as caught:
         asyncio.run(run())
     elapsed = time.monotonic() - before
     line = str(caught.value)
-    assert "profile_not_served" in line and "capacity: 16 profiles" in line, line
-    assert "boot" not in line and "starving" not in line, line
-    assert elapsed < 5, f"the deferral window bounds the wait, took {elapsed:.1f}s"
+    assert "profile_deferred_capacity" in line and "already deferred" in line, line
+    assert sightings == [], "a run must not join a queue the reconcile has already answered"
+    assert elapsed < 5, f"the window is not re-spent on a rank that already saw the sighting ({elapsed:.1f}s)"
 
 
 @pytest.mark.platforms("posix")
