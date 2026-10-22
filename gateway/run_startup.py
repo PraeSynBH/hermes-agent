@@ -1627,6 +1627,26 @@ class GatewayStartupMixin:
         "_handoff_watcher", "_async_delegation_watcher", "_loop_wakeup_watcher", "_profile_reconcile_watcher",
     )
 
+    async def _start_prime_watcher_first_pass(self) -> None:
+        """Pay the watchers' first-pass fan-out during startup, where it is not a tick (PRX-5989).
+
+        Both passes walk every served home and do cold work there: the reconcile watcher re-syncs
+        each home's shell hooks and runs the first profile diff, and the loop-wakeup watcher opens
+        each home's goals store for the first time (200-650 ms per home on this host). Inside their
+        first ticks that measured p95 49-113 s for ``profile_reconcile`` and 1.3-17.1 s for
+        ``loop_wakeup_scan``, against 40-2,800 ms and 82-140 ms on the passes right after — so it
+        is the cold fan-out, not the tick body, that has to move. Startup owns it now and records
+        it under its own counters (``profile_reconcile_boot``), so a regression stays visible as
+        boot cost instead of vanishing into a tick's ``boot_max``.
+
+        Each half is independently guarded: a failed warm never aborts a boot whose adapters have
+        already connected (the watcher's own tick then does the work the old way).
+        """
+        for label, prime in (("profile reconcile", self.prime_profile_reconcile),
+                             ("loop wakeup stores", self._prime_loop_wakeup_stores)):
+            with _log_suppressed(logging.WARNING, "boot %s first pass failed", label, exc_info=True):
+                await prime()
+
     def _start_spawn_background_watchers(self) -> None:
         """Spawn the long-lived supervised background watchers."""
         for method in self._PRE_RECONNECT_WATCHERS:
@@ -1740,6 +1760,11 @@ class GatewayStartupMixin:
         # line next to "Gateway running with N platform(s)".
         self._update_runtime_status(self._serving_state())
         await self._start_finish_wiring(connected_count)
+        # Before the watchers exist: their FIRST pass is a cold fan-out over every served home
+        # (hook-consent re-sync, profile diff, per-home goals SessionDB open). Spent inside the
+        # first tick it was p95 49-113 s (PRX-5989); here it costs startup only, and every tick
+        # the watchers then run is the warm one.
+        await self._start_prime_watcher_first_pass()
         self._start_spawn_background_watchers()
         from hermes_cli.observability.shared_metrics_startup import record_process_ready
         record_process_ready("gateway_boot", background=True)

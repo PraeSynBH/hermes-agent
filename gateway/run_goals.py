@@ -24,6 +24,26 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Homes whose goals SessionDB the boot pass warms at once. The warm is SQLite init, so it is
+# GIL-bound work spread over a few threads; more concurrency buys little beside the connects the
+# boot is still settling.
+_WAKEUP_WARM_CONCURRENCY = 4
+
+
+def _wakeup_scan_scope(profile_home):
+    """Runtime scope for one profile's loop-wakeup store read (and the boot warm of it).
+
+    ``profile_home`` None = the launch profile's own store; once the process multiplexes it binds
+    its own scope instead of running on ambient env (see ``_scope_or_null``). One definition for
+    the scan and the warm: a warm that entered a different scope would populate another home's
+    cache and leave the first scan exactly as cold as before.
+    """
+    if profile_home is not None:
+        from gateway.run import _async_profile_runtime_scope
+        return _async_profile_runtime_scope(profile_home)
+    from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
+    return async_launch_profile_scope_if_multiplexed()
+
 
 class GatewayGoalsMixin:
     """Goal/heartbeat continuation, post-turn hooks and loop-wakeup watcher methods for GatewayRunner."""
@@ -528,18 +548,11 @@ class GatewayGoalsMixin:
         store — a ``/loop`` set from a secondary profile's chat would never fire. Every served
         profile's store is scanned under its own runtime scope (same shape as ``_handoff_watcher``),
         and each hit is fired against that profile's adapters."""
-        from gateway.run import _async_profile_runtime_scope
         from gateway.run_idle_gates import active_loop_in_store, offload_for_poll, poll_plan
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
 
-        def _scope(profile_home):
-            # profile_home None = the launch profile's own store; once the process multiplexes it
-            # binds its own scope instead of running on ambient env (see _scope_or_null).
-            if profile_home is not None:
-                return _async_profile_runtime_scope(profile_home)
-            from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
-            return async_launch_profile_scope_if_multiplexed()
+        _scope = _wakeup_scan_scope
 
         async def _scan_one_store(profile_name: Optional[str]) -> None:
             from hermes_cli.loops import list_active_loops
@@ -574,3 +587,33 @@ class GatewayGoalsMixin:
             except Exception as exc:
                 logger.debug("loop wakeup watcher error: %s", exc)
             await asyncio.sleep(interval)
+
+    async def _prime_loop_wakeup_stores(self) -> None:
+        """Warm every scanned profile's goals SessionDB before the watcher's first scan (PRX-5989).
+
+        The first scan opens each served home's ``state.db`` for the first time in this process:
+        200-650 ms per home on the 17-profile host (5.3 s for the fan-out) against ~5 ms once
+        warm, and that fan-out is what the first ``Tick cost loop_wakeup_scan`` line recorded as
+        p95 1.3-17.1 s. Startup is where the cost is free — the watcher still sleeps 5 s before
+        its first scan and the adapters are already connected — so paying it here leaves the
+        first tick warm instead of spending the boot minute inside a probe.
+
+        Best-effort by design: a home whose store will not open is the scan's own failure to
+        report on its next tick, exactly as before. The scopes come from the watcher's own
+        resolver, so the warm covers the set the first scan will actually walk.
+        """
+        from gateway.run import _resolve_handoff_watch_scopes
+        from gateway.run_idle_gates import offload_for_poll
+        scopes = await _resolve_handoff_watch_scopes(self)
+        offload = offload_for_poll(self)
+        gate = asyncio.Semaphore(_WAKEUP_WARM_CONCURRENCY)
+        start = time.monotonic()
+
+        async def _warm(profile_home) -> None:
+            async with gate:
+                async with _wakeup_scan_scope(profile_home):
+                    await self._warm_goals_session_db("loop wakeup boot", offload=offload)
+
+        await asyncio.gather(*(_warm(home) for _name, home in scopes), return_exceptions=True)
+        logger.info("Boot first pass: warmed %d goal store(s) (%.0fms)",
+                    len(scopes), (time.monotonic() - start) * 1000.0)
