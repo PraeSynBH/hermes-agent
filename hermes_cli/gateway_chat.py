@@ -402,7 +402,13 @@ def launch_from_args(args) -> int:
             # (PRA-6722); an error carrying no field/detail reads exactly as before.
             from hermes_cli.cli_chat_error_copy import refusal_text
             message = refusal_text(exc)
-        return failed(message, 2 if isinstance(exc, GatewayClientError) and ("Unsupported" in message or "unsupported" in message) else 1)
+        # A class that names its own exit contract keeps it: a run the gateway never admitted is
+        # retryable EX_TEMPFAIL, not the generic 1 that a lost turn shares with an ordinary failure
+        # (PRX-5964). Anything else keeps the usage-vs-failure split.
+        code = getattr(exc, "exit_code", None)
+        if code is None:
+            code = 2 if isinstance(exc, GatewayClientError) and ("Unsupported" in message or "unsupported" in message) else 1
+        return failed(message, code)
     except KeyboardInterrupt:
         print("Detached; accepted work continues at the gateway.", file=sys.stderr)
         if emitter is not None:
