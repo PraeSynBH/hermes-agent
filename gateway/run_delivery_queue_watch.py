@@ -61,18 +61,35 @@ class DeliveryQueueWatch:
         return True
 
 
-def wait_for_next_tick(stop_event, interval: float, watch: Optional[DeliveryQueueWatch], chore) -> None:
-    """Sleep one housekeeping interval, draining the worker queue the moment it changes."""
-    if watch is None:
+def wait_for_next_tick(stop_event, interval: float, watch: Optional[DeliveryQueueWatch], chore,
+                        tickers: Iterable = ()) -> None:
+    """Sleep one housekeeping interval, running sub-tick work as it falls due.
+
+    Two kinds of sub-tick work ride this wait: the worker-queue drain (a stamp check, as soon as it
+    changes) and cadence *tickers* — objects with ``seconds``, ``label`` and ``tick()`` whose period
+    is shorter than the housekeeping interval (the wire-contract watch: 10 s inside a 60 s tick).
+    Both run on the housekeeping thread, so each is wrapped by the caller's single failure boundary.
+    """
+    tickers = list(tickers)
+    if watch is None and not tickers:
         stop_event.wait(timeout=interval)
         return
-    watch.refresh_homes()
+    if watch is not None:
+        watch.refresh_homes()
+    poll = min([DELIVERY_QUEUE_WATCH_SECONDS] + [t.seconds for t in tickers])
+    due = {id(t): 0.0 for t in tickers}  # first tick immediately: the boot snapshot is already known
     deadline = time.monotonic() + interval
     while True:
-        remaining = max(0.0, deadline - time.monotonic())
-        if stop_event.wait(timeout=min(remaining, DELIVERY_QUEUE_WATCH_SECONDS)):
+        now = time.monotonic()
+        remaining = max(0.0, deadline - now)
+        if stop_event.wait(timeout=min(remaining, poll)):
             return
-        if watch.changed():
+        now = time.monotonic()
+        if watch is not None and watch.changed():
             chore(DRAIN_LABEL, watch.drain)
-        if time.monotonic() >= deadline:
+        for ticker in tickers:
+            if now >= due[id(ticker)]:
+                due[id(ticker)] = now + ticker.seconds
+                chore(ticker.label, ticker.tick)
+        if now >= deadline:
             return

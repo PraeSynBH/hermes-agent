@@ -1619,7 +1619,21 @@ class GatewayShutdownMixin(GatewayDrainControlMixin, GatewaySessionEndMixin):
         logger.info("Restart deferred wait complete — active work drained; proceeding to stop()")
         return True
 
-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+    def request_restart(self, *, detached: bool = False, via_service: bool = False,
+                        interrupt_in_flight: bool = False) -> bool:
+        """Drain-aware restart. ``interrupt_in_flight`` skips the after-turn wait (see below).
+
+        Routine restarts (/restart, SIGUSR1, ``hermes update``) wait for in-flight turns up to
+        ``agent.restart_after_turn_timeout`` because an interrupted turn is lost work. ``contract_watch``
+        is the ONE caller that must not wait, and its reason is structural rather than a preference:
+        a PROVEN wire-contract skew means every in-flight turn is already doomed at its next model
+        call — the params model it declares is not the one this process serves — so holding the
+        restart for them converts a 20 s replacement into exactly the outage it exists to end
+        (SOU-3328: 40 runs, 13 agents, 6 companies, 0 tokens for ten minutes). It counts what it
+        interrupted into ``state/contract-self-replace.json`` and goes. Do not "improve" this into
+        wait-for-quiet or a max-active-agents gate like ``restart-gateway-quiet.sh``: that policy is
+        right for a routine bounce and wrong here.
+        """
         if self._restart_task_started:
             return False
         self._restart_requested = True
@@ -1635,7 +1649,8 @@ class GatewayShutdownMixin(GatewayDrainControlMixin, GatewaySessionEndMixin):
         self._mark_api_runs_shutdown_requested()
 
         async def _run_restart() -> None:
-            await self._await_active_work_before_restart()
+            if not interrupt_in_flight:
+                await self._await_active_work_before_restart()
             # Detached helper only AFTER the after-turn wait, or its drain_timeout+5 deadline fires mid-turn.
             if detached:
                 with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart helper: %s"):

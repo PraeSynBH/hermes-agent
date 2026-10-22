@@ -1074,6 +1074,10 @@ def _prepare_runtime_status_update(
     retrying_since: Any = _UNSET, served_profiles: Any = _UNSET, session_store: Any = _UNSET,
     parked_profiles: Any = _UNSET, serving_decision: Any = _UNSET,
     multiplex_standalone_reason: Any = _UNSET,
+    # The proven wire-contract skew this process is about to replace itself for (SOU-3329): both
+    # revisions, when it decided, the pid, and the interrupted turns per profile. ``None`` clears it,
+    # which is how a clean boot withdraws the previous life's claim.
+    contract_stale: Any = _UNSET,
     platform_metrics: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None,
@@ -1118,6 +1122,8 @@ def _prepare_runtime_status_update(
             ("serving_decision", serving_decision,
              lambda v: copy.deepcopy(v) if isinstance(v, dict) else None),
             ("multiplex_standalone_reason", multiplex_standalone_reason, lambda v: str(v) if v else None),
+            ("contract_stale", contract_stale,
+             lambda v: copy.deepcopy(v) if isinstance(v, dict) else None),
             ("session_store", session_store, _coerce_session_store),
         ))
         if platform is not _UNSET:

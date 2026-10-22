@@ -4507,12 +4507,24 @@ def _start_gateway_housekeeping(
         queue_watch = DeliveryQueueWatch(
             served_homes, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner))
 
+    # Sub-tick work: the wire-contract watch owns the SOU-3316 class — a merge that moves
+    # ``apps/shared/src/gateway-contract.openrpc.json`` while this process keeps the params model it
+    # booted. It is the only actor that knows its own boot snapshot, and it dies with the gateway, so
+    # there is no stale watchdog left behind. Its own cadence (``gateway.contract_watch_seconds``,
+    # 10 s) is shorter than this tick, so it rides the wait, never a chore cadence.
+    from gateway.contract_watch import watcher_for_runner
+    tickers = []
+    if runner is not None:
+        contract_watch = watcher_for_runner(runner, loop)
+        if contract_watch is not None:
+            tickers.append(contract_watch)
+
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
         _run_due_chores(chores, tick_count)
-        wait_for_next_tick(stop_event, interval, queue_watch, _housekeeping_chore)
+        wait_for_next_tick(stop_event, interval, queue_watch, _housekeeping_chore, tickers)
     logger.info("Gateway housekeeping stopped")
 
 
