@@ -781,9 +781,12 @@ gateway:
 - A profile past the ceiling is **not served by that process at all** — no adapters, no
   session authority, no threads, `/p/<profile>/` not answered — and is published under
   `parked_profiles` in `gateway_state.json` with a `capacity:` reason that states the cost
-  (`cost: 12 Paperclip agents, 0 enabled cron jobs, 0 adapter credentials`), so a client
-  routing to it gets a terminal verdict instead of waiting out its deadline. Its cron jobs
-  still tick (`profiles_to_tick` deliberately ignores the ceiling); adapters, ingress,
+  `cost: 12 Paperclip agents, 0 enabled cron jobs, 0 adapter credentials`. A client that
+  finds itself deferred is **not** written off: the deferral is provisional, so admission
+  files a pending-admission sighting (`want-profile`) and re-observes for up to
+  `PROFILE_SERVE_WAIT_S` (75 s, two rescans); if the rank never makes room it fails with the
+  `capacity:` reason and its remedy rather than with a boot or a stall. Its cron jobs still
+  tick (`profiles_to_tick` deliberately ignores the ceiling); adapters, ingress,
   `/p/<profile>/` and admission stop.
 - The ceiling never affects what is **installed**: `hermes profile list`, `hermes gateway
   status` and every `include_parked`/`include_standalone` enumeration still see the whole
@@ -806,7 +809,10 @@ gateway:
 
 The last row is the only signal that is not read from disk, and the only one that says somebody
 is blocked *now*: the gateway records the refusal (a `/p/<profile>/` scope miss or a routed
-message for a parked profile) and counts that profile as demand-bearing for
+message for a parked profile), and a local client that finds its profile ceiling-deferred files
+the same sighting over the control socket (`want-profile`) before it starts waiting, so a run
+dispatched to a deferred profile can rank it back in. The gateway counts that profile as
+demand-bearing for
 `gateway_multiplex_demand.WANTED_TTL_SECONDS` (300 s). A client that asked once and gave up
 cannot hold a slot: the sighting expires on its own, and one that keeps being asked keeps
 refreshing it. Note that this is a sighting, not a lease — the profile is hot-served on the next

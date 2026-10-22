@@ -660,6 +660,17 @@ def rescan_gateway_profiles(home: Path, *, timeout: float = 8.0) -> Optional[dic
     return query_gateway_control(home, "rescan-profiles", timeout=timeout)
 
 
+def note_gateway_profile_wanted(home: Path, name: str, *, timeout: float = 2.0) -> Optional[dict[str, Any]]:
+    """Ask the multiplexer serving ``home`` to record that a client is waiting on ``name`` now.
+
+    The demand rank's only LIVE input (``gateway_multiplex_demand.note_wanted``) lives inside the
+    gateway process, so a client that found its profile ceiling-deferred has to file the sighting
+    over this socket; the next reconcile tick then ranks the profile in. Returns
+    ``{"wanted": name, "served": bool, ...}`` or None when no gateway answers / it predates the verb
+    — the caller then just re-observes the served set (PRX-5963)."""
+    return query_gateway_control(home, "want-profile", params={"name": name}, timeout=timeout)
+
+
 def request_unserve_profile(home: Path, name: str) -> Optional[dict[str, Any]]:
     return query_gateway_control(home, "unserve-profile", params={"name": name}, timeout=8.0)
 

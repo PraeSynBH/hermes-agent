@@ -25,7 +25,7 @@ import logging
 import os
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from gateway.run_shutdown import _log_suppressed
 from utils import file_signature
@@ -40,7 +40,7 @@ _PROFILE_SIGNATURE_FILES = ("config.yaml", ".env")
 _OWN_GATEWAY_PROBE_TIMEOUT_SECS = 5.0
 
 
-def _load_profile_serving_config(profile_home: Path) -> tuple[Dict[str, Any], Any, Optional[str]]:
+def _load_profile_serving_config(profile_home: Path) -> tuple[dict[str, Any], Any, Optional[str]]:
     """``(runtime config, gateway config, open-policy violation)`` for a profile about to be served.
 
     Runs in a worker thread (``asyncio.to_thread``) because it reads that profile's YAML and walks
@@ -638,6 +638,34 @@ def unserve_profile_verb(runner):
 
 def serve_profile_verb(runner):
     return _profile_lifecycle_verb(runner, serve=True)
+
+
+def want_profile_verb(runner):
+    """Control verb: a client waiting on this profile's admission files LIVE demand for it.
+
+    ``hermes_cli.gateway_multiplex_demand.note_wanted`` is the rank's only live reading (PRX-5738)
+    and it lives in this process, so a run dispatched to a ceiling-deferred profile — the
+    ``profile_serving`` verdict — has to file the sighting here. The next reconcile tick then ranks
+    the profile IN, evicting a profile that holds no work, instead of the run waiting out a slot
+    nothing was going to free (PRX-5963).
+
+    Pure sighting: it never touches the served set, so a client cannot push this host past
+    ``gateway.multiplex_max_profiles`` — the ceiling still makes the trade, and it still decides.
+    """
+
+    def handler(params):
+        name = str((params or {}).get("name") or "").strip()
+        if not name:
+            return {"error": "name required"}
+        from hermes_cli import gateway_multiplex_demand as demand
+        demand.note_wanted(name)
+        served: list[str] = []
+        with _log_suppressed(logging.DEBUG, "served_profile_names failed", exc_info=True):
+            served = [str(n) for n in runner.served_profile_names()]
+        return {"wanted": name, "served": name in served,
+                "ttl_seconds": demand.WANTED_TTL_SECONDS}
+
+    return handler
 
 
 def _mcp_config_reconciler(runner=None):

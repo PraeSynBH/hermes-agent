@@ -1,6 +1,7 @@
 """Process startup phases; diagnostics remain in the gateway facade."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -267,7 +268,7 @@ async def _start_gateway_start_control_socket(runner):
         from gateway.control_socket import GatewayControlServer, build_identify_payload
         from gateway.run_profile_reconcile import (
             migrate_profile_identity_verb, purge_profile_identity_verb,
-            unserve_profile_verb, serve_profile_verb,
+            unserve_profile_verb, serve_profile_verb, want_profile_verb,
         )
         from gateway.run_plugin_rewire import reload_plugins_verb
         from gateway.run_active_work_verb import active_work_verb
@@ -341,6 +342,9 @@ async def _start_gateway_start_control_socket(runner):
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
                            "unserve-profile": unserve_profile_verb(runner),
                            "serve-profile": serve_profile_verb(runner),
+                           # A client blocked on a ceiling-deferred profile is live demand: the
+                           # sighting ranks it in on the next tick (PRX-5738/PRX-5963).
+                           "want-profile": want_profile_verb(runner),
                            "purge-profile-identity": purge_profile_identity_verb(runner),
                            # `hermes gateway stop/restart` refuse while this names live work.
                            "active-work": active_work_verb(runner, _main_loop),
@@ -716,6 +720,56 @@ def _start_gateway_early_demand_prewarm(config: Any) -> None:
         logger.debug("early demand pre-warm did not start", exc_info=True)
 
 
+#: How long boot waits for the demand read that ranks the served set. The same task is awaited again
+#: by adapter startup (SOU-3125), so this only bounds a wedged read: 15-22 s is the measured cost and
+#: a boot that has not landed it in a minute is better off with the documented cold rank than with no
+#: gateway at all.
+_DEMAND_RANK_TIMEOUT_S = 60.0
+
+
+async def _await_early_demand_prewarm(config: Any) -> None:
+    """Land the demand read before boot FREEZES the served set on it (PRX-5963).
+
+    ``_start_gateway_early_demand_prewarm`` schedules the read beside the boot imports, and
+    ``profiles_to_serve`` ranks the ``gateway.multiplex_max_profiles`` ceiling from whatever
+    ``snapshot()`` holds — a cold snapshot ranks priority-then-alphabetical. Boot used to freeze that
+    cold rank into the reservation, the ``served_profiles`` record and every adapter, and the first
+    warm reconcile tick then reversed it: on 2026-10-22 devops (Paperclip agents) was parked for an
+    idle ``cenergi-web`` and swapped in 2 m 47 s after boot, after a churn tick that served the
+    demand-bearing tail serially (113 s). Three devops runs dispatched inside that window failed
+    admission as a permanent verdict.
+
+    Never raises: a host with no ceiling has no task, and a read that fails or outlives the bound
+    leaves the cold rank in place exactly as before.
+    """
+    task = getattr(config, "_demand_prewarm_task", None)
+    if task is None:
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(task), _DEMAND_RANK_TIMEOUT_S)
+    except TimeoutError:
+        logger.warning("Demand read did not land in %gs; ranking the boot served set cold",
+                       _DEMAND_RANK_TIMEOUT_S)
+    except Exception:
+        logger.debug("Demand pre-warm failed; ranking the boot served set cold", exc_info=True)
+
+
+async def _ranked_served_set(config: Any) -> list:
+    """The served set boot reserves and freezes: the ceiling's DEMAND rank, never a cold guess.
+
+    ``profiles_to_serve`` ranks from ``gateway_multiplex_demand.snapshot()``, so the read has to have
+    landed before the set is taken — the reservation, the published ``served_profiles`` record and
+    every adapter follow from this one list (see ``_await_early_demand_prewarm``). A set already
+    frozen into ``config._runtime_profile_homes`` is returned untouched: later callers read the
+    reservation, they never re-rank it.
+    """
+    from gateway.run import _multiplex_profile_homes
+    if getattr(config, "_runtime_profile_homes", None) is not None:
+        return _multiplex_profile_homes(config)
+    await _await_early_demand_prewarm(config)
+    return _multiplex_profile_homes(config)
+
+
 def _start_gateway_early_environment_probe() -> None:
     """Background-start the host toolchain probe the warm-up and first prompt read (idempotent;
     honours ``agent.environment_probe: false``). Never raises: the warm-up still runs it lazily."""
@@ -800,6 +854,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return False
 
     from gateway.status import remove_pid_file, release_gateway_runtime_lock
+    if profile_homes:
+        # The ceiling that chose this set RANKS by live demand, and boot's rank is cold until the read
+        # started beside the imports lands. Freezing the cold rank reserved, published and served the
+        # WRONG set, which the first warm tick then reversed with a 25-107 s churn tick — the window
+        # three devops runs died in (PRX-5963). Take the set the landed read ranks, then freeze it.
+        profile_homes = await _ranked_served_set(resolved_config)
     if not _start_gateway_reserve_profiles(profile_homes):
         return False
     # Freeze discovery: later profile additions must restart and reserve before opening stores.

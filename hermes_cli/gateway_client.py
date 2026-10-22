@@ -80,6 +80,17 @@ BOOT_POLL_INTERVAL_S = 1.0
 # has new work to place. That owner answers identify in milliseconds and its drain is bounded by its
 # own cap, so a drain shorter than a second costs a wake-up rather than a run (PRX-5791).
 DRAIN_POLL_INTERVAL_S = 1.0
+# A profile the multiplexer's ceiling has deferred (`profile_serving`) is re-observed this often.
+# Cheap — one control-socket ``identify`` — and well inside the reconcile interval the rank moves on.
+PROFILE_SERVE_POLL_INTERVAL_S = 5.0
+# How long admission waits for that rank to move. A ceiling deferral is PROVISIONAL: the rank is
+# recomputed every reconcile tick (30 s) from live demand, and this client files itself as the
+# strongest demand signal there is the moment it sees the deferral (PRX-5738). Two ticks is when the
+# deferral is settled FOR THIS RUN: past it the run fails with the ceiling's own reason (cost,
+# remedy) instead of spending its whole 120 s admission budget on a slot nobody freed. Reading the
+# deferral as terminal at T=0 is what killed three devops runs in the 2-3 min boot reconcile that was
+# already re-ranking them in (PRX-5963).
+PROFILE_SERVE_WAIT_S = 75.0
 # The bound on sampling the owner's loop at the moment this run dies at admission: the owner is
 # already stalling, so the probe is allowed less than the slack a healthy loop answers in
 # milliseconds, and a no-answer is reported as a floor (``owner_loop>2s``), never as healthy.
@@ -601,9 +612,9 @@ async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
     ``new_work``: this client has a turn to place, so it must not attach to an owner that is only
     held reachable for its in-flight work (a restart's after-turn wait) — see ``admit_owner``."""
     from websockets.asyncio.client import connect
-    from hermes_constants import get_hermes_home
-    from hermes_cli.gateway_runtime import (DEFAULT_ENSURE_TIMEOUT, attachable, boot_evidence,
-                                            ensure_gateway_runtime, gateway_profile_home)
+    from hermes_constants import get_hermes_home, profile_name_for_home
+    from hermes_cli.gateway_runtime import (DEFAULT_ENSURE_TIMEOUT, PROFILE_SERVING_REASON, attachable,
+                                            boot_evidence, ensure_gateway_runtime, gateway_profile_home)
     from urllib.parse import urlsplit
 
     remote = "" if endpoint is not None else os.environ.get("HERMES_TUI_GATEWAY_URL", "").strip()
@@ -663,7 +674,14 @@ async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
     async def admit_owner(home):
         """Ensure an owner, waiting out what legitimately takes time instead of failing at it.
 
-        Three states are WAITS inside this run's one admission budget, not verdicts:
+        Four states are WAITS inside this run's one admission budget, not verdicts:
+
+        * ``profile_serving`` — the multiplexer's ceiling has this profile deferred, which is
+          PROVISIONAL (the rank is rebuilt every reconcile tick) and revises as soon as a client
+          files itself as waiting. Three devops runs read it as permanent and died in the 2-3 min
+          boot reconcile that was already re-ranking them in (PRX-5963). Bounded by
+          ``PROFILE_SERVE_WAIT_S``, so a profile that holds no slot at all still fails with the
+          ceiling's own reason instead of eating the whole budget.
 
         * ``update_paused`` — an update owns the install for minutes (2026-10-19: 18:54-19:03Z) and
           every run started in that window died in under a second on
@@ -689,13 +707,16 @@ async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
         fence = None
         boot = None
         drain = None
+        serving = None
+        serving_name = None
+        serving_until = 0.0
         while True:
             # The per-attempt cap is the boot deadline (now above the measured boot cost); the
             # whole loop is bounded by the one admission budget, so a lower cap can only cost
             # re-observation, never a run.
             cap = left(DEFAULT_ENSURE_TIMEOUT)
             if cap <= 0:
-                if fence is None and boot is None and drain is None:
+                if fence is None and boot is None and drain is None and serving is None:
                     raise spent("Gateway connection failed; no local fallback "
                                 f"(phase={phase}, elapsed={time.monotonic() - started:.1f}s, "
                                 "admission budget spent before an owner could be ensured)")
@@ -721,6 +742,27 @@ async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
                     f"never admitted (elapsed={time.monotonic() - started:.1f}s, "
                     f"retryAfterS={round(left_s)}, retryable=true): "
                     f"{result.detail or 'restart window open'}", float(left_s))
+            if result.reason_code == PROFILE_SERVING_REASON:
+                # The multiplexer's ceiling has this profile deferred. That is PROVISIONAL — the rank
+                # is rebuilt every reconcile tick — so wait it out inside this run's budget and file
+                # the sighting that makes the next tick rank the profile in (PRX-5738), instead of
+                # reporting a run-killer for a host that serves the profile seconds later (PRX-5963:
+                # devops, 3 runs, inside the 2-3 min boot reconcile).
+                if serving is None:
+                    serving = getattr(result, "detail", None) or "the multiplexer's ceiling defers it"
+                    # The park is keyed by profile id, and a home's basename is only that for a named
+                    # profile (the root home is `.hermes`, i.e. `default`, an install detail).
+                    serving_name = profile_name_for_home(home) or home.name
+                    serving_until = time.monotonic() + PROFILE_SERVE_WAIT_S
+                    boot = drain = None  # the owner is up; this wait is about a slot, not a boot
+                    from hermes_cli.gateway_multiplex_served import note_profile_wanted
+                    await asyncio.to_thread(note_profile_wanted, serving_name)
+                if left(1.0) <= 0 or time.monotonic() >= serving_until:
+                    break
+                phase = "profile-serve"
+                delay = result.retry_after_s or PROFILE_SERVE_POLL_INTERVAL_S
+                await asyncio.sleep(max(0.0, min(delay, left(delay), serving_until - time.monotonic())))
+                continue
             if new_work and result.state == "draining" and attachable(result):
                 drain = f"{result.state}: {result.reason_code or 'draining'}"
                 if left(1.0) <= 0:
@@ -738,6 +780,13 @@ async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
             return result
         # The budget is gone while the owner was still coming up. That is the admission class (the
         # owner never accepted this run), and the text says which wait ate the budget.
+        if serving is not None:
+            # The ceiling never made room inside the wait window: for THIS run the deferral is
+            # settled, and its own reason (cost, remedy) is the answer — not a boot, not starvation.
+            raise GatewayUnavailableError(
+                f"Gateway inaccessible: profile_not_served ({serving}; waited {PROFILE_SERVE_WAIT_S:g}s "
+                f"through ceiling re-ranks after filing this run as demand on '{serving_name}')",
+                "inaccessible")
         if boot is not None:
             # Only a real boot reaches here now: a silent owner is its own verdict (control_timeout)
             # and no longer borrows this name. Say how long this host's boot actually took.
