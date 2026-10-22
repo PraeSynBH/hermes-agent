@@ -519,8 +519,8 @@ class GatewayGoalsMixin:
         store — a ``/loop`` set from a secondary profile's chat would never fire. Every served
         profile's store is scanned under its own runtime scope (same shape as ``_handoff_watcher``),
         and each hit is fired against that profile's adapters."""
-        from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
-        from gateway.run_idle_gates import profile_has_active_loop
+        from gateway.run import _async_profile_runtime_scope
+        from gateway.run_idle_gates import active_loop_in_store, offload_for_poll, poll_plan
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
 
@@ -539,7 +539,10 @@ class GatewayGoalsMixin:
             # run the state.db init on the loop thread before the first read.
             await self._warm_goals_session_db("loop wakeup")
             # Off-loop too: the read is lock-free under WAL but convoys on the writer lock without it.
-            active_loops = await self._run_in_executor_with_context(list_active_loops)
+            # On the BOUNDED poll pool, not the turn pool (PRA-6660): this is a per-tick scan.
+            poll_offload = offload_for_poll(self)
+            active_loops = await (poll_offload(list_active_loops) if poll_offload is not None
+                                  else asyncio.to_thread(list_active_loops))
             now = time.time()
             for sid, state in active_loops:
                 await self._loop_wakeup_fire_one(sid, state, now, warned_no_route, profile_name)
@@ -548,11 +551,11 @@ class GatewayGoalsMixin:
             try:
                 # Multiplex resolution walks the filesystem off-loop; a stalled walk on the loop
                 # trips the loop-liveness watchdog (exit 75).
-                for profile_name, profile_home in await _resolve_handoff_watch_scopes(self):
-                    # Idle gate (run_idle_gates): skip the scope entry when the profile's store holds
-                    # no active loop. The root scan (None) is unscoped and stays cheap.
-                    if profile_home is not None and not await self._run_in_executor_with_context(
-                            profile_has_active_loop, profile_home):
+                # Idle gate (run_idle_gates.poll_plan): ONE sweep per scan for every served profile
+                # (PRA-6660), not one turn-pool hop each. The root scan (None) is unscoped and cheap.
+                scopes, busy = await poll_plan(self, active_loop_in_store)
+                for profile_name, profile_home in scopes:
+                    if profile_home is not None and profile_home not in busy:
                         continue
                     from gateway.loop_tick_timing import timed
                     with timed('loop_wakeup_scan'):

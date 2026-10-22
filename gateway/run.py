@@ -1742,11 +1742,16 @@ async def _resolve_handoff_watch_scopes(runner: object) -> list:
     """``_handoff_watch_scopes`` for an on-loop watcher tick. Multiplex resolution walks the filesystem
     (``profiles_to_serve``), so it hops to the executor; single-profile mode does no I/O and returns the
     root poll directly — no per-tick thread spawn on the unbounded executor. A config-less stand-in
-    (tests) and a runner without the executor hop fall through to the plain resolver."""
+    (tests) and a runner without the executor hop fall through to the plain resolver.
+
+    The hop prefers the BOUNDED poll pool (``_run_housekeeping_in_executor``): a per-tick scope walk is
+    polling, and on a many-profile gateway two pollers resolve scopes every 2 s and every 15 s, which
+    used to be a fresh OS thread each time on the turn pool (PRA-6660)."""
     config = getattr(runner, "config", None)
     if config is not None and not getattr(config, "multiplex_profiles", False):
         return [(None, None)]
-    offload = getattr(runner, "_run_in_executor_with_context", None)
+    from gateway.run_idle_gates import offload_for_poll
+    offload = offload_for_poll(runner)
     if callable(offload):
         return await offload(_handoff_watch_scopes, runner)
     return _handoff_watch_scopes(runner)
@@ -4032,7 +4037,7 @@ class GatewayRunner(
         return await loop.run_in_executor(self._get_executor(), ctx.run, func, *args)
 
     async def _run_housekeeping_in_executor(self, func, *args):
-        """Run best-effort session housekeeping off the TURN pool.
+        """Run best-effort session housekeeping and per-tick POLLING off the TURN pool.
 
         Callers of this helper bound their await with ``asyncio.wait_for`` and, on timeout, log
         "the worker thread is left to finish on its own" and proceed. That bounds the AWAIT but
@@ -4041,6 +4046,12 @@ class GatewayRunner(
         The turn pool is unbounded (one thread per turn), so sharing it would let wedged
         housekeeping grow threads without limit. Housekeeping therefore gets its own bounded pool;
         exhausting that one delays only more housekeeping, which is best-effort by construction.
+
+        Per-tick pollers (``gateway.run_idle_gates.offload_for_poll``: the handoff watcher's profile
+        sweep, the loop-wakeup scan, heartbeat restore) belong here for the same reason plus one of
+        their own: they run every couple of seconds for the life of the process, and as one-work-item
+        -per-hop work on the turn pool each poll was a fresh OS thread create/destroy — ~9 of the ~21
+        thread spawns/s PRA-6660 measured, from polls that do no agent work at all.
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -4069,6 +4080,13 @@ class GatewayRunner(
         session, plus turns abandoned by the inactivity timeout (run_turn keeps no handle; their
         thread runs to completion). ``max_concurrent_sessions`` is the only admission cap and is
         unset by default.
+
+        What must NOT live here (PRA-6660): per-tick polling and best-effort housekeeping. Every hop
+        is a fresh OS thread create/destroy, so a poller on this pool turns "how many profiles does
+        this gateway serve" and "how loaded is the host" into thread-spawn rate. Pollers use
+        ``_run_housekeeping_in_executor`` (bounded, reused workers) via
+        ``gateway.run_idle_gates.offload_for_poll``; turn bodies are the only population that needs
+        one thread of its own.
         """
         return GatewayRunner._get_or_create_pool(
             self, "_executor", lambda: _UnboundedThreadExecutor(thread_name_prefix="hermes-gateway"))

@@ -1,6 +1,7 @@
 """Recover heartbeat watches from the gateway's canonical persisted routing index."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -70,7 +71,11 @@ async def restore_heartbeat_watches(runner) -> None:
         return restored
 
     try:
-        candidates = await runner._run_in_executor_with_context(scan)
+        # The poll hop is the BOUNDED pool, never the one-thread-per-work-item turn pool: this scan
+        # runs every POLL_SECONDS for the whole process's lifetime (PRA-6660).
+        from gateway.run_idle_gates import offload_for_poll
+        poll_offload = offload_for_poll(runner)
+        candidates = await (poll_offload(scan) if poll_offload is not None else asyncio.to_thread(scan))
         for key, source, session_id in candidates:
             # A reset/compression may have published a new owner during the executor hop.
             if store.peek_session_id(key) == session_id:

@@ -5,6 +5,17 @@ terminal-policy build; on a multiplex gateway the pollers paid that per profile 
 to do. Each gate answers "does this profile's store hold work?" from the goals-cached SessionDB with
 ONLY the HERMES_HOME contextvar installed. Every gate fails OPEN: an unavailable store, a failing
 read or a corrupt row is "cannot prove emptiness", never "idle".
+
+Two rules keep the gate sweeps from turning into thread churn (PRA-6660):
+
+* **One work item per tick, not one per profile.** A poller asks ``off_loop_busy_homes`` for the whole
+  set of profiles at once; a dozens-profile gateway used to submit one executor hop per profile per
+  tick, and on the shared gateway those hops were ~9 of the ~21 thread spawns per second measured in
+  the turn executor (one fresh OS thread each).
+* **The bounded poll pool, never the turn pool.** ``offload_for_poll`` prefers
+  ``GatewayRunner._run_housekeeping_in_executor``: a fixed pool that reuses its workers. A cold sweep
+  (opening every profile's state.db at once) takes tens of seconds on a loaded host, and a probe must
+  never mint threads on the pool whose size is the gateway's turn concurrency.
 """
 from __future__ import annotations
 
@@ -47,20 +58,81 @@ def profile_has_active_heartbeat(profile_home: Path) -> bool:
     return _gate(profile_home, store_has_active_heartbeat)
 
 
-def profile_has_active_loop(profile_home: Path) -> bool:
+def active_loop_in_store(db: Any) -> bool:
+    """The loop wakeup watcher's gate body, exposed so a whole scan's sweep can share it."""
     from hermes_cli.loops import store_has_active_loop
 
-    return _gate(profile_home, store_has_active_loop)
+    return store_has_active_loop(db)
+
+
+def profile_has_active_loop(profile_home: Path) -> bool:
+    return _gate(profile_home, active_loop_in_store)
+
+
+def pending_handoff_in_store(db: Any) -> bool:
+    """The handoff watcher's gate body, exposed so a whole tick's sweep can share it."""
+    return db.has_pending_handoffs()
 
 
 def profile_has_pending_handoff(profile_home: Path) -> bool:
-    return _gate(profile_home, lambda db: db.has_pending_handoffs())
+    return _gate(profile_home, pending_handoff_in_store)
+
+
+def busy_homes(homes, store_has_work: Callable[[Any], bool]) -> set:
+    """Which of *homes* hold work; the whole sweep as ONE synchronous work item."""
+    return {home for home in homes if _gate(home, store_has_work)}
+
+
+def offload_for_poll(runner: object) -> Optional[Callable]:
+    """The runner hop for per-tick polling: the BOUNDED housekeeping pool before the turn pool.
+
+    ``_run_housekeeping_in_executor`` reuses a fixed set of workers, so a poller contributes no
+    thread spawns at all; the turn pool is one-thread-per-work-item and every hop there is a thread
+    create/destroy. The turn helper stays as the fallback for runners predating the split (and for
+    test doubles that stub only it).
+    """
+    for attr in ("_run_housekeeping_in_executor", "_run_in_executor_with_context"):
+        offload = getattr(runner, attr, None)
+        if callable(offload):
+            return offload
+    return None
 
 
 async def off_loop_gate(runner: object, probe: Callable[[], bool]) -> bool:
-    """Run a sync gate through the runner's executor hop. Runners without one (bare test stand-ins
+    """Run a sync gate through the runner's poll hop. Runners without one (bare test stand-ins
     for the handoff watcher) keep the historical always-enter behaviour."""
-    offload = getattr(runner, "_run_in_executor_with_context", None)
-    if not callable(offload):
+    offload = offload_for_poll(runner)
+    if offload is None:
         return True
     return bool(await offload(probe))
+
+
+async def off_loop_busy_homes(runner: object, homes, store_has_work: Callable[[Any], bool]) -> set:
+    """``busy_homes`` for a whole poller tick in ONE hop, and on the bounded pool.
+
+    Per-profile gates cost one executor submission each; with N served profiles a 2 s handoff tick
+    submitted N of them beside the scope walk (PRA-6660: ~9 thread spawns/s on the shared gateway,
+    16 profiles). A tick now costs one hop no matter what N is. Fail-open is unchanged: a home whose
+    probe cannot answer is IN the result, so its scope is entered as before.
+    """
+    homes = list(homes)
+    if not homes:
+        return set()
+    offload = offload_for_poll(runner)
+    if offload is None:
+        return set(homes)
+    return set(await offload(busy_homes, homes, store_has_work))
+
+
+async def poll_plan(runner: object, store_has_work: Callable[[Any], bool]) -> tuple:
+    """A poller tick's whole prerequisite: the scopes to walk, and which of them hold work.
+
+    Both halves are offloaded (a multiplex scope walk is a filesystem walk) and both land on the
+    bounded pool, so a tick is a fixed cost regardless of how many profiles the gateway serves.
+    """
+    from gateway.run import _resolve_handoff_watch_scopes
+
+    scopes = await _resolve_handoff_watch_scopes(runner)
+    busy = await off_loop_busy_homes(
+        runner, [home for _name, home in scopes if home is not None], store_has_work)
+    return scopes, busy
