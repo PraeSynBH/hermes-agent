@@ -55,9 +55,16 @@ def _connect_to(monkeypatch, peer):
 
 
 @pytest.mark.asyncio
-async def test_a_lost_socket_reports_the_owners_settled_turn_as_succeeded(monkeypatch, capsys):
-    """The adapter-side contract: exit 0 with the owner's ``final_response``, run recorded succeeded."""
+@pytest.mark.parametrize("stream_json", [False, True])
+async def test_a_lost_socket_reports_the_owners_settled_turn_as_succeeded(monkeypatch, capsys, stream_json):
+    """The adapter-side contract: exit 0 with the owner's ``final_response``, run recorded succeeded.
+
+    ``--format stream-json`` (what the Paperclip ``hermes_local`` adapter consumes) must close with a
+    ``result`` record carrying ``exit_code`` 0 — that record, not the socket, is the run's outcome.
+    """
+    import json
     from hermes_cli.gateway_chat_view import GatewayChatView
+    from hermes_cli.stream_json import StreamJsonEmitter
 
     peer = _ReceiptPeer([
         {"status": "started"},  # still running when the socket died: keep waiting
@@ -66,11 +73,16 @@ async def test_a_lost_socket_reports_the_owners_settled_turn_as_succeeded(monkey
     ])
     _connect_to(monkeypatch, peer)
 
-    view = GatewayChatView(_LostPeer(), {"stored_session_id": "stored"}, quiet=True)
+    emitter = StreamJsonEmitter(model="m", session_id="stored") if stream_json else None
+    view = GatewayChatView(_LostPeer(), {"stored_session_id": "stored"}, quiet=True, emitter=emitter)
     view.finite = True
     assert await asyncio.wait_for(view.run("query", oneshot=True), 5) == 0
     out = capsys.readouterr().out
     assert "the work finished" in out and "outcome is unknown" not in out
+    if stream_json:
+        result = [json.loads(line) for line in out.splitlines() if line.strip()][-1]
+        assert result["type"] == "result" and result["exit_code"] == 0, result
+        assert result["text"] == "the work finished", result
     assert len(peer.reads) == 2  # polled once while started, then read the settlement
 
 
