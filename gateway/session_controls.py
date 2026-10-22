@@ -23,16 +23,86 @@ def _refusal_data(exc: RuntimeStoreError) -> dict:
     """The ``error.data`` for one ``RuntimeStoreError``: always the reason, plus the field and the
     detail when the raiser named them."""
     data = {'reason': exc.reason}
-    for key in ('field', 'detail'):
+    for key in ('field', 'detail', 'client_revision'):
         value = getattr(exc, key, None)
         if value:
             data[key] = value
     for key in ('revision', 'execution_generation'):
         if isinstance(getattr(exc, key, None), int):
             data[key] = getattr(exc, key)
+    if getattr(exc, 'gateway_revision', None):
+        # The contract THIS process serves, beside the client's declaration: a skew report has to
+        # name both sides or the operator cannot tell which process needs replacing (SOU-3318).
+        data['gateway_revision'] = exc.gateway_revision
     if getattr(exc, 'admitted', None) is False:
         data['admitted'] = False  # nothing admitted yet: the sender may finalize with ``bot_relay.settle``
     return data
+
+
+def _declared_contract(params) -> str | None:
+    """The contract revision the client declared on this request, or ``None`` when it declared none."""
+    from gateway import contract_revision as contract
+    declared = params.get(contract.REVISION_PARAM) if isinstance(params, dict) else None
+    return declared.strip() if isinstance(declared, str) and declared.strip() else None
+
+
+def _skew_refusal(params, field: str, named: str):
+    """``contract_version_mismatch`` when the client declared a contract revision this process does not serve.
+
+    A long-lived gateway keeps the allow-lists it imported at boot (SOU-3316: a merge added
+    ``one_shot`` while the serving process held the old set) and a freshly spawned client knows
+    nothing about that. Before this, the disagreement was indistinguishable from a malformed
+    request: the client could not tell "you are too old for me" from "you sent a bad key", so it
+    neither stopped retrying nor said which process needed replacing. The refusal now carries the
+    field, the client's revision and this process's boot revision.
+
+    Only a DECLARED revision can be compared. A client that declares nothing gets today's
+    closed-set ``invalid_params`` (``None`` here) — a discriminator, never a looser validation.
+    """
+    from gateway import contract_revision as contract
+    declared, serving = _declared_contract(params), contract.boot_revision()
+    if not declared or not serving or declared == serving:
+        return None
+    return RuntimeStoreError(
+        'contract_version_mismatch', field=field,
+        detail=f'{named}; client {contract.describe(declared)} != gateway {contract.describe(serving)}',
+        gateway_revision=serving, client_revision=declared)
+
+
+def _submit_param_refusal(params, forbidden) -> RuntimeStoreError:
+    """The refusal for submit params the serving contract does not define: skew first, else invalid."""
+    keys = sorted(forbidden)
+    named = f'unexpected keys: {keys}'
+    return _skew_refusal(params, keys[0], named) or RuntimeStoreError(
+        'invalid_params', field='submission_params', detail=named)
+
+
+def _canonical_param_refusal(params, problems) -> RuntimeStoreError:
+    """The dispatcher's refusal for a params model mismatch (unknown/missing/ill-typed keys)."""
+    named = f'unknown or missing keys: {", ".join(problems)}'
+    return _skew_refusal(params, problems[0], named) or RuntimeStoreError(
+        'invalid_params', field='params', detail=named)
+
+
+def _refuse_malformed_declaration(params) -> None:
+    """A declaration that is not a non-empty string is a client bug, not a skew: keep it closed."""
+    from gateway import contract_revision as contract
+    declared = params.get(contract.REVISION_PARAM)
+    if declared is not None and not _declared_contract(params):
+        raise RuntimeStoreError('invalid_params', field=contract.REVISION_PARAM,
+                                detail='contract_revision must be a non-empty string')
+
+
+#: The submit params THIS process's wire contract defines. Read at call time, not captured in the
+#: function body: a running gateway holds the set it imported at boot, and a merge that widens it is
+#: invisible to that process — the skew the revision fence names (SOU-3316/SOU-3318). Keeping it a
+#: module constant is what lets a test stand a pre-merge contract up and drive the real path.
+SUBMIT_PARAMS = frozenset({
+    'session_id', 'text', 'submission_id', 'input_id', 'queued', 'attachments', 'finite',
+    'unattended', 'one_shot', 'surface', 'voice_context', 'interrupted', 'voice_turn',
+    'display_kind', 'title_preview', 'turn_author', 'api_text', 'model_override', 'clarify_batch',
+    'contract_revision',
+})
 
 
 def _profile_label(profile_id) -> str:
@@ -276,9 +346,13 @@ class AuthorityConnection:
         contract = CANONICAL_METHODS.get(method)
         if contract is not None and (problems := canonical_param_problems(contract, params)):
             # The declared wire contract (``tui_gateway/contracts/canonical.py``) is the closed
-            # key set: an unknown or missing key never reaches the handler.
+            # key set: an unknown or missing key never reaches the handler. A client that DECLARED
+            # a different contract revision gets the skew named instead — the same refusal a stale
+            # one-shot met as a bare ``invalid_params`` for 3h24m (SOU-3316/SOU-3318).
+            exc = _canonical_param_refusal(params, problems)
+            _log_refusal(getattr(self.actor, 'profile_id', None), method, exc)
             return {'jsonrpc': '2.0', 'id': rid, 'error': {
-                'code': 4001, 'message': 'invalid_params', 'data': {'reason': 'invalid_params', 'fields': problems}}}
+                'code': 4001, 'message': exc.reason, 'data': {**_refusal_data(exc), 'fields': problems}}}
         original_params = dict(params)
         contract = contract or METHODS.get(method)
         authority = self.authority
@@ -748,11 +822,10 @@ class AuthorityConnection:
         """The admission a ``prompt.submit``-shaped request asks for (``prompt.replace_queued`` too)."""
         if ref.session_id not in self.subscriptions:
             raise RuntimeStoreError('permission_denied')
-        forbidden = set(params) - {'session_id', 'text', 'submission_id', 'input_id', 'queued', 'attachments', 'finite', 'unattended', 'one_shot',
-                                   'surface', 'voice_context', 'interrupted', 'voice_turn', 'display_kind', 'title_preview',
-                                   'turn_author', 'api_text', 'model_override', 'clarify_batch'}
+        forbidden = set(params) - SUBMIT_PARAMS
         if forbidden:
-            raise RuntimeStoreError('invalid_params')
+            raise _submit_param_refusal(params, forbidden)
+        _refuse_malformed_declaration(params)
         request_id = params.get('submission_id') or params.get('input_id')
         if not isinstance(request_id, str) or not request_id:
             raise RuntimeStoreError('invalid_params')

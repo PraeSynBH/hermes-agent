@@ -305,9 +305,11 @@ class GatewayChatView:
         # (2026-10-18T09:39:53Z, elapsed 84.2 s, session_id present, no output). Same startup
         # deadline as the create: a late admission is recoverable, a dropped one is a lost run.
         sid, gaps = self.session_id, self.gaps
+        from hermes_cli.gateway_client import contract_submit_params
         receipt = await self.client.rpc("prompt.submit", _timeout=GATEWAY_STARTUP_RPC_DEADLINE_S,
                                         session_id=self.session_id,
                                         input_id=uuid.uuid4().hex, text=text,
+                                        **(contract_submit_params()),
                                         **({"finite": True} if self.finite else {}),
                                         # A one-shot's process exits with the turn, so a turn lost
                                         # across an owner restart has no waiter to pause for

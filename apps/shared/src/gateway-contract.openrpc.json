@@ -11401,6 +11401,18 @@
             "default": false,
             "title": "Clarify Batch",
             "type": "boolean"
+          },
+          "contract_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Contract Revision"
           }
         },
         "required": [

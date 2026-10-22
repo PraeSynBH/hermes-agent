@@ -5146,6 +5146,7 @@ export interface CanonicalSubmitParams {
   api_text?: string | null
   model_override?: CanonicalModelOverride | null
   clarify_batch?: boolean
+  contract_revision?: string | null
 }
 export interface CanonicalAttachment {
   path: string

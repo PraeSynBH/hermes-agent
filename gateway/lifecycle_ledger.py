@@ -327,6 +327,11 @@ def record_startup(home: Optional[Path] = None, *, defer_integrity_check: bool =
         logger.debug("Unclean-exit detection failed", exc_info=True)
     try:
         claim: dict[str, Any] = {"phase": "running", "pid": os.getpid(), "start_time": time.time(), "started_at": _now_iso()}
+        # The WIRE CONTRACT this life serves, frozen at boot like sys.modules: the deploy check reads
+        # it back to prove a contract change actually replaced the process (SOU-3318).
+        serving_contract = _serving_contract_revision()
+        if serving_contract:
+            claim["contract_revision"] = serving_contract
         # Process birth (psutil), distinct from ``start_time`` (the ledger claim, seconds later once
         # imports finish): the Windows start attestation binds PIDs to birth time (#110020 review).
         from hermes_cli.process_identity import _process_create_time
@@ -471,6 +476,53 @@ def mark_planned_stop(target_pid: Optional[int], reason: str = "gateway_stop", h
     except Exception:
         logger.debug("Failed to record a planned stop in the lifecycle sentinel", exc_info=True)
         return False
+
+
+def _serving_contract_revision() -> Optional[str]:
+    """The wire-contract revision THIS process serves (its boot snapshot). Never raises."""
+    try:
+        from gateway.contract_revision import boot_revision
+
+        return boot_revision()
+    except Exception:
+        logger.debug("Could not read this process's contract revision", exc_info=True)
+        return None
+
+
+def serving_contract_revision(home: Optional[Path] = None) -> Optional[str]:
+    """The contract revision the LIVE gateway stamped at boot, or ``None`` when unknown.
+
+    Read from the lifecycle sentinel, never re-hashed from the tree: a gateway imports its param
+    models at boot and keeps them, so an old process asked to describe itself from the current
+    checkout would report the NEW revision and call a skewed deploy healthy (SOU-3318).
+    """
+    sentinel = _read_json(get_lifecycle_sentinel_path(home))
+    if not sentinel or sentinel.get("phase") != "running":
+        return None
+    planned = sentinel.get("contract_revision")
+    return planned if isinstance(planned, str) and planned else None
+
+
+def contract_revision_verdict(home: Optional[Path] = None) -> tuple[str, str]:
+    """``(verdict, detail)`` for the deploy check: ``in_sync`` / ``stale`` / ``unknown``.
+
+    ``stale`` is the SOU-3316 shape exactly — a wire-contract change shipped while the process
+    serving the old contract stayed up — so a deploy in that state is NOT complete and the fleet
+    must not be declared ready. ``unknown`` (no sentinel, no contract document) never blocks: the
+    check exists to catch a proven mismatch, not to invent one.
+    """
+    try:
+        from gateway.contract_revision import revision as tree_revision
+    except Exception:
+        return "unknown", "contract module unavailable"
+    tree, serving = tree_revision(), serving_contract_revision(home)
+    if not tree or not serving:
+        return "unknown", f"tree={tree or 'unreadable'} serving={serving or 'not stamped'}"
+    if tree == serving:
+        return "in_sync", f"contract-{tree}"
+    return "stale", (
+        f"the serving gateway was built against contract-{serving} but the tree declares "
+        f"contract-{tree} — a wire-contract change shipped without restarting the gateway")
 
 
 def read_prior_exit_label(profile_home: Path) -> str:

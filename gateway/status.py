@@ -809,9 +809,26 @@ def _get_code_identity_fields() -> dict[str, Any]:
         from hermes_cli.version_info import get_code_identity
 
         identity = get_code_identity()
-        return {"code_sha": identity.get("sha"), "code_version": identity.get("version")}
+        fields = {"code_sha": identity.get("sha"), "code_version": identity.get("version")}
     except Exception:
-        return {}
+        fields = {}
+    # The WIRE CONTRACT this process serves (its boot snapshot), so a deploy can prove the contract
+    # change actually replaced the process instead of trusting code_sha alone (SOU-3318). Absent
+    # when the install ships no contract document.
+    revision = _get_serving_contract_revision()
+    if revision:
+        fields["contract_revision"] = revision
+    return fields
+
+
+def _get_serving_contract_revision() -> str | None:
+    """This process's boot contract revision, or ``None``. Never raises."""
+    try:
+        from gateway.contract_revision import boot_revision
+
+        return boot_revision()
+    except Exception:
+        return None
 
 
 def _pid_record_belongs_to_current_profile(record: Optional[dict[str, Any]]) -> bool:

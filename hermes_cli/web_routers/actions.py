@@ -210,6 +210,16 @@ async def gateway_drain(request: Request):
     principal = getattr(getattr(request.state, "token_principal", None), "principal", None) or "dashboard"
 
     if action == "cancel":
+        # The drain marker is the fleet's quiesce-for-replacement lease, so clearing it is the
+        # deploy's completion claim. A contract change served by a gateway that booted before it
+        # must FAIL the check here, loudly, instead of re-opening the fleet on the old contract
+        # (SOU-3316 prevention; the enforcement lives in ``clear_drain_request``).
+        from gateway.lifecycle_ledger import contract_revision_verdict
+
+        verdict, detail = contract_revision_verdict()
+        if verdict == "stale":
+            _log.error("Gateway drain CANCEL refused by %s — deploy incomplete: %s", principal, detail)
+            raise HTTPException(status_code=409, detail=f"deploy incomplete: {detail}")
         existed = clear_drain_request()
         _log.info("Gateway drain CANCEL requested by %s (existed=%s)", principal, existed)
         return {"ok": True, "action": "cancel", "was_draining": existed}
