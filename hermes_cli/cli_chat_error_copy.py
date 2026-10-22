@@ -33,6 +33,25 @@ def _short(text: str, limit: int | None = _SUMMARY_LIMIT) -> str:
     return first if limit is None or len(first) <= limit else first[: limit - 1].rstrip() + "…"
 
 
+def contract_skew_text(error: BaseException | str) -> str:
+    """``contract_version_mismatch`` as one line, naming both sides and the only fix.
+
+    SOU-3316: the refusal that cost 3h24m read ``invalid_params``, which says "your request is
+    malformed" when the truth was "this process is older than your tree". Both revisions are on the
+    frame (``gateway/session_controls.py``), so the run log alone tells an operator which process to
+    replace — and says it is a restart, not a retry.
+    """
+    data = getattr(error, "data", None)
+    data = data if isinstance(data, dict) else {}
+    client = str(data.get("client_revision") or getattr(error, "client_revision", None) or "").strip()
+    gateway = str(data.get("gateway_revision") or getattr(error, "gateway_revision", None) or "").strip()
+    field = str(data.get("field") or "").strip()
+    named = f" (field {field})" if field else ""
+    return (f"contract_version_mismatch{named}: this client was built for contract "
+            f"{client or 'unknown'}, the running gateway serves {gateway or 'unknown'} — the gateway "
+            f"process predates a wire-contract change. Restart the gateway; do not retry this run.")
+
+
 def refusal_text(error: BaseException | str) -> str:
     """The refusal as the client shows it: the reason code, plus the check that fired when the owner
     named one (``invalid_params (toolsets: unknown or invalid toolset name: 'mcp-codegraph')``).
@@ -43,6 +62,10 @@ def refusal_text(error: BaseException | str) -> str:
     reads exactly as before."""
     data = getattr(error, "data", None)
     data = data if isinstance(data, dict) else {}
+    if data.get("gateway_revision") or data.get("client_revision"):
+        # A wire-contract skew is not a field/detail refusal: it names both revisions and the fix
+        # (restart the gateway), which is the whole difference from the 3h24m bare code (SOU-3316).
+        return contract_skew_text(error)
     field, detail = str(data.get("field") or "").strip(), str(data.get("detail") or "").strip()
     if not field and not detail:
         # The canonical-contract gate refuses before any handler runs and names the offending key

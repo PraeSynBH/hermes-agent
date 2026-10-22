@@ -19,6 +19,9 @@ from hermes_constants import display_hermes_home
 SITE_FAILURE_CODES = frozenset({
     "context_overflow", "truncated", "invalid_response", "empty_response", "loop_error",
     "interpreter_shutdown", "session_busy", "gateway_connection", "host_error",
+    # A wire-contract skew between this client and the serving process (SOU-3318): the copy names
+    # both revisions and the restart, so it must not be re-classified as an unknown provider fault.
+    "contract_version_mismatch",
 })
 
 

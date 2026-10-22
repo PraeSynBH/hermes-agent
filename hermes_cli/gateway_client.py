@@ -143,6 +143,15 @@ def gateway_ws_target(endpoint, ticket):
     return url, [GATEWAY_WS_PROTOCOL, GATEWAY_WS_TICKET_PREFIX + ticket]
 
 
+def contract_submit_params() -> dict:
+    """The params a client attaches to ``prompt.submit`` to say which wire contract it was built
+    against. Empty when this install has no contract document to hash, which keeps the request
+    byte-identical to what an older client sends (SOU-3318)."""
+    from gateway.contract_revision import declaration
+
+    return declaration()
+
+
 class GatewayClientError(ValueError):
     pass
 
@@ -157,6 +166,29 @@ class GatewayRPCError(GatewayClientError):
         super().__init__(reason)
         self.code = code
         self.data = data or {}
+
+
+class GatewayContractSkewError(GatewayRPCError):
+    """The owner serves a different wire contract revision than this client was built against.
+
+    SOU-3316/SOU-3318: distinguishable from ``invalid_params`` (a malformed request this client can
+    fix) and from a transport failure (retry elsewhere). Neither side is wrong alone — the serving
+    PROCESS is older than the tree — so the only correct verdict is to fail this run fast, name
+    both revisions, and let the deploy replace the gateway. Never retried: a retry against the same
+    process answers identically, which is what turned a merge into a 3h24m fleet outage.
+    """
+
+    reason = "contract_version_mismatch"
+
+    def __init__(self, code=None, data=None):
+        data = data if isinstance(data, dict) else {}
+        self.gateway_revision = str(data.get("gateway_revision") or "").strip() or None
+        self.client_revision = str(data.get("client_revision") or "").strip() or None
+        super().__init__(self.reason, code, data)
+
+    @property
+    def retryable(self) -> bool:
+        return False
 
 
 class GatewayAdmissionTimeout(GatewayClientError):
@@ -281,8 +313,11 @@ def rpc_error(error):
     data = _bounded_error_data(error.get("data"))
     code = error.get("code")
     reason = _bounded_reason(error.get("message", "request_failed")) or _bounded_reason(data.get("reason"))
-    return GatewayRPCError(reason or "request_failed",
-                           code if isinstance(code, int) and not isinstance(code, bool) else None, data)
+    bounded_code = code if isinstance(code, int) and not isinstance(code, bool) else None
+    if reason == GatewayContractSkewError.reason:
+        # A distinct verdict the caller must not retry (SOU-3318), never a generic RPC refusal.
+        return GatewayContractSkewError(bounded_code, data)
+    return GatewayRPCError(reason or "request_failed", bounded_code, data)
 
 
 class GatewayUnavailableError(GatewayClientError):

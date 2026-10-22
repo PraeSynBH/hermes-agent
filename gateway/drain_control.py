@@ -259,8 +259,25 @@ def write_drain_request(
     return payload
 
 
-def clear_drain_request(*, home: Optional[Path] = None) -> bool:
-    """Remove the drain marker (cancel-drain, idempotent). Returns True if one existed."""
+def clear_drain_request(*, home: Optional[Path] = None, require_contract_in_sync: bool = True) -> bool:
+    """Remove the drain marker (cancel-drain, idempotent). Returns True if one existed.
+
+    Clearing the marker is the deploy's completion claim: the fleet is about to admit turns again.
+    A wire-contract change served by a process that booted before it is the SOU-3316 shape, so the
+    marker stays (the fleet does not re-open on the old contract), the refusal is an ERROR line
+    naming both revisions, and the marker's own lease bounds the damage. An ``unknown`` verdict
+    (no sentinel / no contract document) never blocks — this gate catches a proven mismatch only.
+    """
+    if require_contract_in_sync:
+        from gateway.lifecycle_ledger import contract_revision_verdict
+
+        verdict, detail = contract_revision_verdict(home)
+        if verdict == "stale":
+            _log.error(
+                "drain-control: REFUSING to clear the drain marker — the deploy is not complete: %s. "
+                "Restart the gateway on the new tree, then cancel the drain.", detail,
+            )
+            return False
     path = drain_request_path(home)
     try:
         path.unlink()

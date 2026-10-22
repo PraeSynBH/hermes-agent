@@ -18,7 +18,7 @@ import time
 import uuid
 from contextlib import suppress
 
-from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError
+from hermes_cli.gateway_client import GatewayClientError, GatewayContractSkewError, GatewayRPCError
 from hermes_cli.gateway_connection import DISCONNECTED, CallStopped, lost_before
 
 logger = logging.getLogger(__name__)
@@ -695,6 +695,11 @@ class GatewayAgent:
             # /moa one-shot: this admission alone runs the preset (unless it is the session's own
             # route); the session's route is untouched.
             params["model_override"] = {"model": self._moa_preset, "provider": "moa"}
+        # Declare the wire contract this client was built against, so an owner that booted before a
+        # contract change refuses with ``contract_version_mismatch`` instead of ``invalid_params``
+        # (SOU-3318). Absent when the install has no contract document: today's request, unchanged.
+        from hermes_cli.gateway_client import contract_submit_params
+        params.update(contract_submit_params())
         return params
 
     def _take_turn_route(self):
@@ -770,6 +775,15 @@ class GatewayAgent:
             except CallStopped:  # main moved on (a later turn, /new, Ctrl-C's bound) before the submit
                 self._give_back_turn_route()  # nothing was sent: the pick is still owed
                 return self._failed(history, user_message, "Stopped before the prompt was sent; nothing was sent.")
+            except GatewayContractSkewError as exc:
+                # A one-shot (or any turn) that met a gateway older than this tree must fail HERE,
+                # with the skew named: retrying against the same process answers identically, which
+                # is what turned a merge into a 3h24m fleet outage (SOU-3316). Nothing is admitted
+                # and no model call is made, so the run costs one round trip, not a turn.
+                from hermes_cli.cli_chat_error_copy import contract_skew_text
+                self._give_back_turn_route()
+                return self._failed(history, user_message, contract_skew_text(exc),
+                                    failure_reason="contract_version_mismatch", retryable=False)
             except GatewayRPCError as exc:
                 # The owner answered and refused: not a lost connection. Only its own site code
                 # (session_busy: send again) is a verdict; any other refusal stays unclassified.
