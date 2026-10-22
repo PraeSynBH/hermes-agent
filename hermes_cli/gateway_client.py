@@ -152,6 +152,45 @@ def contract_submit_params() -> dict:
     return declaration()
 
 
+def declaration_refused(error) -> bool:
+    """True when an owner refused a submit ONLY because of the optional contract declaration.
+
+    ``contract_revision`` exists to make a refusal diagnosable; it must never be the reason a
+    request fails. A client spawned from a tree newer than the running gateway declares a param
+    that process's param model does not define yet, and PRA-6722 made that refusal exact:
+    ``invalid_params`` naming that one key in ``data.fields``.
+
+    Anything else propagates: a refusal naming another key too (dropping the declaration would
+    leave a genuinely malformed request looking like an old owner), a bare refusal with no key
+    named (nothing proves the declaration was the cause), and ``contract_version_mismatch`` (the
+    skew the fence exists to report).
+    """
+    if not isinstance(error, GatewayRPCError) or str(error) != "invalid_params":
+        return False
+    from gateway.contract_revision import REVISION_PARAM
+
+    data = error.data if isinstance(error.data, dict) else {}
+    named = [str(name).strip() for name in (data.get("fields") or ()) if str(name).strip()]
+    if not named:
+        field = str(data.get("field") or "").strip()
+        named = [field] if field else []
+    return bool(named) and set(named) == {REVISION_PARAM}
+
+
+def declaration_retry_params(error, params: dict) -> dict | None:
+    """The params to resend when *error* was the declaration's refusal alone, else ``None``.
+
+    The caller resends exactly once, under the SAME admission identity: the param gate refuses
+    before anything is admitted, and a resend carrying an identical ``submission_id``/``input_id``
+    cannot double-admit even if that ever stops being true.
+    """
+    from gateway.contract_revision import REVISION_PARAM
+
+    if REVISION_PARAM not in params or not declaration_refused(error):
+        return None
+    return {key: value for key, value in params.items() if key != REVISION_PARAM}
+
+
 class GatewayClientError(ValueError):
     pass
 
