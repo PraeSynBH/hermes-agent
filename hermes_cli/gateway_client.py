@@ -484,7 +484,11 @@ def _deferral_numbers(detail: str | None) -> tuple[int | None, int | None, int |
         served = len(recorded) if recorded is not None else None
     with suppress(Exception):
         from hermes_cli.profiles_serve import profiles_to_serve
-        installed = len(profiles_to_serve(multiplex=True))
+        # INSTALLED, not "would serve": the serving enumeration applies the ceiling, so counting it
+        # here would print "17 served of 17 installed" and — worse — run a serve ranking (and its
+        # deferral WARNING) from inside a message builder.
+        installed = len(profiles_to_serve(multiplex=True, include_standalone=True,
+                                         include_parked=True))
     return ceiling, served, installed
 
 
