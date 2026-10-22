@@ -33,12 +33,17 @@ def report_incompatible_owner(pids) -> bool:
 
 def print_standalone_by_config() -> None:
     """Default-profile status: name the profiles that opted out of the host multiplexer by config,
-    so the served set the host gateway reports is not mistaken for the installed roster."""
-    from hermes_cli.profiles import get_active_profile_name, profiles_to_serve
+    so the served set the host gateway reports is not mistaken for the installed roster.
+
+    Read the ``gateway.standalone`` flag; never diff the roster against the served set. The served
+    set honours ``gateway.multiplex_max_profiles`` and ranks the edge by live demand, so that
+    difference is the capacity-deferred set — on this host it printed all 27 deferred profiles as
+    "standalone by config" and named a served one, contradicting the unserved block right above it
+    (PRX-5944).
+    """
+    from hermes_cli.profiles import get_active_profile_name, standalone_profiles
     if (get_active_profile_name() or "default") != "default":
         return
-    roster = {name for name, _home in profiles_to_serve(True, include_standalone=True)}
-    served = {name for name, _home in profiles_to_serve(True)}
-    names = sorted(roster - served - {"default"})
+    names = sorted(name for name, _home in standalone_profiles())
     if names:
         print(f"standalone by config (temporary compatibility shim): {', '.join(names)}")

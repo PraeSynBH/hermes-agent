@@ -24,7 +24,7 @@ from hermes_cli.profiles_remove import _rmtree_make_writable, _rmtree_with_retry
 # gateway.multiplex_max_profiles ceiling. Callers keep importing it from here.
 from hermes_cli.profiles_serve import (
     _parked_default_warned, parked_marker_path, profile_is_parked, profiles_to_serve,
-    profiles_to_tick,
+    profiles_to_tick, standalone_profiles,
 )
 from hermes_constants import (
     LOCAL_RUNTIME_ROOT_DIRS, PROFILE_ID_RE, clear_named_profile_deleted, mark_named_profile_deleted,

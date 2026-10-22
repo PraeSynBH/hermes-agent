@@ -89,6 +89,18 @@ def profiles_to_serve(multiplex: bool, *, include_standalone: bool = False,
     return serve
 
 
+def standalone_profiles() -> list[tuple[str, Path]]:
+    """Live named profiles whose own config opted out of the host multiplexer.
+
+    This is the *config* fact (``gateway.standalone: true``), which is what a status line claiming
+    "standalone by config" has to report. It is deliberately not ``roster - served``: the served set
+    is capped by ``gateway.multiplex_max_profiles`` and ranked by live demand, so that difference is
+    the capacity-deferred set and it moves whenever demand does (PRX-5944).
+    """
+    from hermes_cli.profiles import _iter_named_profile_dirs, profile_is_standalone
+    return [(entry.name, entry) for entry in _iter_named_profile_dirs() if profile_is_standalone(entry)]
+
+
 def profiles_to_tick(multiplex: bool, *, reserved: Iterable[tuple[str, Path]] = (),
                      active: str = "") -> list[tuple[str, Path]]:
     """``(profile_name, hermes_home)`` pairs a gateway's cron ticker has to visit.
