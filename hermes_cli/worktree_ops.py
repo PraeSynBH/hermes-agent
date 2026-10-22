@@ -1240,7 +1240,8 @@ def _prune_stale_worktree_trees(repo_root: str, max_age_hours: int) -> None:
 # <repo>/.worktrees once per profile — 47 walks of 149 trees in the 2026-10-20 22:08 boot, each a
 # near-timeout `du` (~17-22 s warm on this host), all of them concurrent, which is enough disk
 # pressure to stall the gateway event loop for >10 s (PRA-6637). Claimed under the lock BEFORE the
-# walk so concurrent profile ticks cannot both start one.
+# walk so concurrent profile ticks cannot both start one. The walk itself sizes each tree under its
+# own bounded probe (PRA-6783), so a big tree still reports a size instead of "(unknown size)".
 _footprint_audited: set = set()
 _footprint_audit_lock = threading.Lock()
 
@@ -1253,13 +1254,13 @@ def _warn_worktree_footprint(repo_root: str) -> None:
             return
         _footprint_audited.add(key)
     try:
-        from hermes_cli.worktree_gc import worktrees_summary
+        from hermes_cli.worktree_gc import worktrees_footprint
 
-        count, size_mb = worktrees_summary(repo_root)
-        if count >= 10 or (size_mb or 0) >= 5120:
-            size_txt = f"{size_mb / 1024:.1f}GB" if size_mb else "unknown size"
+        footprint = worktrees_footprint(repo_root)
+        if footprint.count >= 10 or (footprint.size_mb or 0) >= 5120:
             logger.warning(".worktrees/ holds %d tree(s) (%s) — run `hermes worktree list` "
-                           "to audit and `hermes worktree prune` to reclaim safely.", count, size_txt)
+                           "to audit and `hermes worktree prune` to reclaim safely.",
+                           footprint.count, footprint.size_text())
     except Exception:
         logger.debug("worktree summary failed", exc_info=True)
 

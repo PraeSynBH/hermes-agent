@@ -6,7 +6,7 @@ audit walks the same ``<repo>/.worktrees`` once per profile: 47 walks of 149 tre
 2026-10-20 22:08 boot, each a near-timeout ``du`` (~17-22 s on this host, warm cache), all of them
 concurrent. That disk pressure is the boot window's only >10 s event-loop stall.
 
-Contract: one ``worktrees_summary`` walk per repo root per PROCESS, and one warning.
+Contract: one ``worktrees_footprint`` walk per repo root per PROCESS, and one warning.
 """
 
 import threading
@@ -37,9 +37,9 @@ def _counting_walk(monkeypatch):
 
     def fake_summary(repo_root):
         walked.append(str(repo_root))
-        return 12, 2048
+        return worktree_gc.Footprint(12, 2048)
 
-    monkeypatch.setattr(worktree_gc, "worktrees_summary", fake_summary)
+    monkeypatch.setattr(worktree_gc, "worktrees_footprint", fake_summary)
     return walked
 
 
