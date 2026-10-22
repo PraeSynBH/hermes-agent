@@ -15,6 +15,11 @@ Two things make that skew nameable, and both live here:
   the serving process define?" is answered by the boot snapshot, never by re-reading the file: a
   stale process that re-read the tree would report the new revision and look healthy, which is
   precisely the failure this closes.
+* :func:`committed_revision` — the digest of the document as COMMITTED at ``HEAD``. :func:`revision`
+  reads the working copy, which is what the deploy check must compare with the serving process, but
+  a working copy is not a deploy: on 2026-10-22 a three-minute uncommitted edit of the JSON (digest
+  ``63166f1c88be``, matching no commit in the repo) replaced the live gateway and interrupted 9 runs
+  (PRX-5958). Anything about to act on a skew asks this first.
 
 Absent or unreadable contract document (an install shipped without ``apps/``) yields ``None``
 everywhere: a client then declares nothing and the owner keeps its closed-set ``invalid_params``,
@@ -24,10 +29,15 @@ which is today's behaviour. The diagnostic degrades, validation never loosens.
 from __future__ import annotations
 
 import hashlib
+import subprocess
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_RELATIVE_PATH = ("apps", "shared", "src", "gateway-contract.openrpc.json")
+
+#: A git read that hangs must not become a hung housekeeping tick: ``git show`` of one small blob
+#: answers in milliseconds, and a timeout reads as unprovable (never as a skew).
+_GIT_TIMEOUT_SECONDS = 5.0
 
 #: The submit param a client uses to declare the contract revision it was built against. Optional:
 #: a client that sends nothing keeps today's behaviour exactly.
@@ -67,6 +77,36 @@ def revision(root: Path | None = None) -> str | None:
         digest = None
     _cache[key] = digest
     return digest
+
+
+def committed_revision(root: Path | None = None) -> str | None:
+    """Content digest of the contract as COMMITTED at ``HEAD``, or ``None`` when unprovable.
+
+    :func:`revision` reads the working copy — right for the deploy check, which must compare what
+    is on disk with what the process serves — but a working copy is not a deploy. PRX-5958: a
+    ~3-minute uncommitted edit of the JSON (``63166f1c88be``, matching no commit in the repo)
+    replaced the live gateway under load and interrupted 9 runs. Reading the committed blob is how
+    a caller tells "the wire contract moved" from "somebody has an edit open".
+
+    ``None`` covers every way the answer can be unavailable — no git binary, a non-git install (a
+    shipped tarball has no ``.git``), the document absent from ``HEAD``, a git fault — and callers
+    must read it as unprovable, never as a skew. Only asked on a candidate skew, so a subprocess
+    here costs one spawn per watch tick during a debatable window, not on a steady tree.
+    """
+    relative = "/".join(CONTRACT_RELATIVE_PATH)
+    try:
+        result = subprocess.run(
+            # --no-optional-locks: never take a lock a concurrent merge would wait on; `show` reads
+            # the object store and does not touch the index.
+            ["git", "--no-optional-locks", "-C", str(Path(root or _PROJECT_ROOT)),
+             "show", f"HEAD:{relative}"],
+            capture_output=True, timeout=_GIT_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    return hashlib.sha256(result.stdout).hexdigest()[:_REVISION_CHARS]
 
 
 def record_boot_revision(root: Path | None = None) -> str | None:

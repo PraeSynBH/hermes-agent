@@ -11,12 +11,16 @@ These are the behaviour contracts that close it, one per direction:
 * old client (declares nothing) vs new gateway → unchanged: accepted, and an unknown key stays a
   closed-set ``invalid_params``;
 * deploy shipping a contract change without restarting the gateway → the drain-marker path refuses to
-  declare the deploy complete.
+  declare the deploy complete;
+* the COMMITTED document vs the working copy (PRX-5958): an edit nobody committed moves the tree
+  digest but never the committed one, and an install that cannot answer reads as unprovable.
 """
 
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 
 import pytest
 
@@ -199,3 +203,66 @@ def test_an_unknown_serving_revision_never_invents_a_block(tmp_path, monkeypatch
 
     assert contract_revision_verdict(tmp_path)[0] == 'unknown'
     assert clear_drain_request(home=tmp_path) is True
+
+
+# -- direction 5: the committed document, not the working copy (PRX-5958) -------------------------
+
+needs_git = pytest.mark.skipif(shutil.which('git') is None, reason='git proves the committed digest')
+
+
+def _git(repo, *args):
+    return subprocess.run(['git', *args], cwd=str(repo), check=True, capture_output=True,
+                          text=True, encoding='utf-8', errors='replace')
+
+
+def _committed_contract_repo(tmp_path):
+    """A real checkout whose contract document is committed once."""
+    repo = tmp_path / 'checkout'
+    repo.mkdir()
+    _git(repo, 'init', '-q')
+    contract = repo.joinpath(*contract_revision.CONTRACT_RELATIVE_PATH)
+    contract.parent.mkdir(parents=True)
+    contract.write_text('{"methods": []}\n', encoding='utf-8')
+    _git(repo, 'add', '-A')
+    _git(repo, '-c', 'user.email=dev@example.com', '-c', 'user.name=dev', 'commit', '-qm', 'contract v1')
+    return repo, contract
+
+
+@needs_git
+def test_the_committed_digest_is_the_blob_at_head_not_the_working_copy(tmp_path):
+    """PRX-5958: the watcher acted on a tree digest (``63166f1c88be``) that matched no commit."""
+    repo, contract = _committed_contract_repo(tmp_path)
+    committed = contract_revision.committed_revision(repo)
+    assert committed == contract_revision.revision(repo), 'in sync right after a commit'
+
+    contract.write_text('{"methods": [{"name": "one_shot"}]}\n', encoding='utf-8')
+    assert contract_revision.revision(repo) != committed, 'the tree digest follows the edit'
+    assert contract_revision.committed_revision(repo) == committed, 'the commit did not move'
+
+    _git(repo, 'add', '-A')
+    _git(repo, '-c', 'user.email=dev@example.com', '-c', 'user.name=dev', 'commit', '-qm', 'contract v2')
+    landed = contract_revision.committed_revision(repo)
+    assert landed == contract_revision.revision(repo)
+    assert landed != committed
+
+
+@needs_git
+def test_a_commit_that_never_carried_the_document_reads_as_unprovable(tmp_path):
+    """An untracked/hand-added contract has no committed digest to compare with."""
+    repo = tmp_path / 'checkout'
+    repo.mkdir()
+    _git(repo, 'init', '-q')
+    (repo / 'README.md').write_text('no contract here\n', encoding='utf-8')
+    _git(repo, 'add', '-A')
+    _git(repo, '-c', 'user.email=dev@example.com', '-c', 'user.name=dev', 'commit', '-qm', 'init')
+    assert contract_revision.committed_revision(repo) is None
+
+
+def test_a_non_git_install_and_a_missing_git_binary_read_as_unprovable(tmp_path, monkeypatch):
+    assert contract_revision.committed_revision(tmp_path / 'install') is None
+
+    def _no_git(*args, **kwargs):
+        raise FileNotFoundError('git')
+
+    monkeypatch.setattr(contract_revision.subprocess, 'run', _no_git)
+    assert contract_revision.committed_revision(tmp_path) is None

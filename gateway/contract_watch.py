@@ -11,12 +11,20 @@ the gateway — so there is no stale watchdog left behind to maintain. This modu
 in-process ticker (the gateway housekeeping thread) that compares boot versus tree, debounces, and
 takes the planned-restart route the process already owns.
 
-Five decisions a future reader will otherwise reverse, each with its reason:
+Six decisions a future reader will otherwise reverse, each with its reason:
 
 * **Debounce is a SETTLED window, not a second glance.** A merge writes the working tree before the
   commit object — SOU-3328's first refusal preceded its own merge commit by 45 s — so one digest
   once is not a tree worth dying for. The pair must repeat on consecutive ticks AND stay unchanged
   for ``2 * contract_watch_seconds`` (>= 20 s by default).
+* **A skew is judged against HEAD, not the working copy.** ``contract_watch.revision()`` reads the
+  document on disk — right for the deploy check, which must compare what is on disk with what the
+  process serves — but the tree also holds WIP. PRX-5958: a ~3-minute uncommitted edit of the JSON
+  (``63166f1c88be``, matching no commit in the repo) was read as a deploy and replaced the live
+  gateway under load, interrupting 9 runs for a change no commit ever declared. A candidate skew now
+  also asks :func:`gateway.contract_revision.committed_revision`; only a digest whose COMMITTED
+  document differs from the boot snapshot replaces the process. An uncommitted edit is published as
+  a finding (``contract_stale`` stays visible, S10 still FAILs it) and the process stays up.
 * **Restart-now, even with turns in flight.** ``restart-gateway-quiet.sh`` refuses a restart while
   more than two agents are active; that is right for a routine bounce and wrong here. A proven skew
   dooms every in-flight turn at its NEXT model call, so waiting converts a 20 s replacement into the
@@ -137,6 +145,13 @@ def _tree_revision() -> Optional[str]:
     return revision()
 
 
+def _committed_revision() -> Optional[str]:
+    """The digest ``HEAD`` commits, or ``None`` when this install cannot be asked (PRX-5958)."""
+    from gateway.contract_revision import committed_revision
+
+    return committed_revision()
+
+
 def _read_state(home: Optional[Path]) -> Optional[dict[str, Any]]:
     try:
         data = json.loads(state_path(home).read_text(encoding="utf-8-sig"))
@@ -190,6 +205,7 @@ class ContractWatcher:
         min_seconds_between_restarts: float = DEFAULT_MIN_SECONDS_BETWEEN_RESTARTS,
         boot: Callable[[], Optional[str]] = _boot_revision,
         tree: Callable[[], Optional[str]] = _tree_revision,
+        committed: Callable[[], Optional[str]] = _committed_revision,
         restart: Optional[Callable[[], bool]] = None,
         publish: Optional[Callable[[Optional[dict[str, Any]]], None]] = None,
         interrupted: Optional[Callable[[], dict[str, int]]] = None,
@@ -203,6 +219,7 @@ class ContractWatcher:
         self._min_gap = float(min_seconds_between_restarts)
         self._boot = boot
         self._tree = tree
+        self._committed = committed
         self._restart = restart
         self._publish = publish or self._publish_status
         self._interrupted = interrupted
@@ -212,6 +229,7 @@ class ContractWatcher:
         self._pending: Optional[tuple[str, str, float]] = None
         self._acted: Optional[tuple[str, str]] = None
         self._sightings = 0
+        self._finding: Optional[tuple[str, str, Optional[str]]] = None
         self._said_unprovable = False
         self._said_suppressed = False
         self._published: Optional[dict[str, Any]] = None
@@ -277,6 +295,21 @@ class ContractWatcher:
         return self._act(boot, tree, now)
 
     def _act(self, boot: str, tree: str, now: float) -> Verdict:
+        committed = self._committed()
+        if committed is None:
+            # ``git show HEAD:<contract>`` could not be read (no git, a shipped tarball, the file
+            # absent from HEAD). Unprovable is not a skew: publishing the finding is all this
+            # process may do (PRX-5958).
+            return self._hold(boot, tree, None, "commit_unprovable")
+        if committed == boot:
+            # The working copy disagrees with BOTH the boot snapshot and HEAD, so what moved is an
+            # edit, not a deploy: HEAD still declares exactly what this process serves. PRX-5958 —
+            # acting on this replaced the gateway for a 3-minute WIP edit and interrupted 9 runs.
+            return self._hold(boot, tree, committed, "uncommitted_edit")
+        # committed != boot: HEAD genuinely declares a contract this process does not serve, so the
+        # skew is real however the working copy looks. A WIP edit on top of it cannot re-open the
+        # loop — the next boot reads the same tree — and a revert moves the pair, which the guard
+        # then treats as the new decision it is.
         if self._drain_active():
             # ``hermes update`` (or an operator drain) already owns a restart. Its drain wins: a second
             # one here would amputate the same turns twice and race the supervisor's respawn.
@@ -322,6 +355,37 @@ class ContractWatcher:
             "is already doomed at its next model call. Interrupted per profile: %s",
             tree, boot, "accepted" if accepted else "already restarting", interrupted)
         return Verdict("restarting" if accepted else "restart_refused", boot, tree)
+
+    def _hold(self, boot: str, tree: str, committed: Optional[str], why: str) -> Verdict:
+        """Publish a skew as a FINDING and keep the process up (PRX-5958).
+
+        A working copy is not a deploy. The document on disk is still what the deploy check
+        recomputes (a FAIL is honest), but only a digest whose COMMITTED document differs from the
+        boot snapshot is worth dying for: the gateway was replaced for a ~3-minute uncommitted edit
+        of the JSON, costing 9 in-flight runs their turns. The state file is written once per
+        distinct ``(boot, tree, committed)`` triple — this path is re-entered on every tick for as
+        long as the edit stays open, and a status file rewritten every 10 s is its own bug.
+        """
+        if why == "commit_unprovable":
+            note = ("the committed document cannot be read (no git binary, no .git, or the file is "
+                    "absent from HEAD), so this process cannot prove the wire contract moved")
+        else:
+            note = (f"HEAD still commits contract-{committed}: the working copy is an uncommitted "
+                    "edit, which the deploy check may FAIL but a restart must not pay for")
+        payload = self._payload(boot, tree, status="uncommitted", interrupted={})
+        payload["committed"] = committed
+        payload["finding"] = why
+        payload["not_restarting"] = note
+        if self._finding != (boot, tree, committed):
+            self._finding = (boot, tree, committed)
+            self._publish(payload)
+            self._published = payload
+            logger.warning(
+                "Wire-contract skew left alone: the tree declares contract-%s but this process serves "
+                "contract-%s, while HEAD commits contract-%s (%s). Published as contract_stale; only a "
+                "committed contract move replaces this process (PRX-5958).",
+                tree, boot, committed or "unknown", why)
+        return Verdict(why, boot, tree, note)
 
     # -- publishing -------------------------------------------------------------------------
 
@@ -378,6 +442,7 @@ class ContractWatcher:
 
     def _forget_sequence(self) -> None:
         self._sightings = 0
+        self._finding = None
         self._said_suppressed = False
 
 
@@ -459,7 +524,8 @@ def watcher_for_runner(runner: Any, loop: Any, *, config: Any = None,
     # activation was in (a boot carrying SOU-3328/3329 that nobody could confirm had armed it).
     logger.info(
         "%s armed: the booted wire contract is compared with the tree every %gs; a settled skew "
-        "replaces this process at most once per %gs (%s)",
+        "replaces this process at most once per %gs (%s). Only a document HEAD commits can do that: "
+        "an uncommitted edit is published as contract_stale and never costs the process (PRX-5958)",
         LABEL, watcher.seconds, gap,
         "supervised gateway: the supervisor respawns it" if supervised
         else "UNSUPERVISED: the planned stop exits 75 and a boot guard must respawn it")
