@@ -3,6 +3,12 @@
 Worker identity is supplied by the caller, not inferred from a daemon's environment.
 """
 
+# EX_TEMPFAIL (sysexits.h): this run was never admitted, so it lost nothing and re-dispatching it is
+# safe — the same verdict the gateway service itself reports to its supervisor (``gateway/restart.py``
+# keeps the 75 for that reason). Deliberately not 1, which a lost/unknown turn shares with an
+# ordinary failure (PRX-5964).
+TURN_NOT_ADMITTED_EXIT_CODE = 75
+
 # Provider walls do not spend a Kanban task's retry budget.
 TRANSIENT_PROVIDER_REASONS = frozenset({
     "rate_limit", "upstream_rate_limit", "billing", "overloaded", "server_error", "timeout",

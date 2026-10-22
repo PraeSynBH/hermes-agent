@@ -119,6 +119,76 @@ async def test_an_unsettled_receipt_is_bounded_by_the_wait_budget(monkeypatch):
         await asyncio.wait_for(view.run("query", oneshot=True), 5)
 
 
+class _NoAdmissionPeer:
+    """The socket died while ``prompt.submit`` was in flight: no admission id ever came back."""
+
+    def __init__(self):
+        self.events = asyncio.Queue()
+
+    async def rpc(self, method, **params):
+        assert method == "prompt.submit", method
+        raise _LostPeer._lost()
+
+
+@pytest.mark.asyncio
+async def test_a_disconnect_before_admission_is_not_a_lost_turn(monkeypatch, capsys):
+    """PRX-5964: with no admission id there is nothing a receipt could be read for.
+
+    The run's own copy and its retryable exit code say "never admitted"; the mid-turn "outcome is
+    unknown" must not appear, and no receipt is read, so the class counter stops booking a no-op
+    with the runs that lost a whole turn.
+    """
+    from hermes_cli.gateway_chat_view import GatewayChatView
+    from hermes_cli.gateway_client import GatewayTurnNotAdmitted
+    from hermes_cli.turn_exit import TURN_NOT_ADMITTED_EXIT_CODE
+
+    receipt_peer = _ReceiptPeer([])  # any read here is the bug this test pins
+    _connect_to(monkeypatch, receipt_peer)
+
+    view = GatewayChatView(_NoAdmissionPeer(), {"stored_session_id": "stored"}, quiet=True)
+    with pytest.raises(GatewayTurnNotAdmitted) as caught:
+        await asyncio.wait_for(view.run("query", oneshot=True), 5)
+    text = str(caught.value)
+    assert "outcome is unknown" not in text and "Resume the printed session ID" not in text
+    assert "before the turn was admitted" in text and "Retry the run" in text
+    assert caught.value.exit_code == TURN_NOT_ADMITTED_EXIT_CODE
+    assert receipt_peer.reads == []
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.asyncio
+async def test_a_refused_submit_keeps_its_own_verdict(monkeypatch):
+    """Only a transport loss is a never-admitted disconnect; an owner's refusal is not rewritten."""
+    from hermes_cli.gateway_chat_view import GatewayChatView
+    from hermes_cli.gateway_client import GatewayRPCError
+
+    class Refusing:
+        events = asyncio.Queue()
+
+        async def rpc(self, method, **params):
+            raise GatewayRPCError("queue_full")
+
+    view = GatewayChatView(Refusing(), {"stored_session_id": "stored"}, quiet=True)
+    with pytest.raises(GatewayRPCError, match="queue_full"):
+        await asyncio.wait_for(view.run("query", oneshot=True), 5)
+
+
+def test_launch_reports_the_never_admitted_exit_code_and_copy(monkeypatch, capsys):
+    """The exit contract the adapter reads: EX_TEMPFAIL, and a copy with no "outcome is unknown"."""
+    from hermes_cli import gateway_chat, gateway_chat_startup
+    from hermes_cli.gateway_client import GatewayTurnNotAdmitted
+    from hermes_cli.turn_exit import TURN_NOT_ADMITTED_EXIT_CODE
+
+    async def run(args, emitter=None):
+        raise GatewayTurnNotAdmitted()
+
+    monkeypatch.setattr(gateway_chat_startup, "ensure_launch_provider", lambda args: True)
+    monkeypatch.setattr(gateway_chat, "run_gateway_chat", run)
+    assert gateway_chat.launch_from_kwargs({"q": "literal"}) == TURN_NOT_ADMITTED_EXIT_CODE
+    err = capsys.readouterr().err
+    assert "gateway_turn_not_admitted" in err and "turn outcome is unknown" not in err
+
+
 @pytest.mark.asyncio
 async def test_an_interactive_viewer_never_reads_a_receipt_for_a_lost_socket(monkeypatch):
     """Only a finite run has a turn whose outcome the caller needs; interactivity re-attaches."""

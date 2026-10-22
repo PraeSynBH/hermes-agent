@@ -6,7 +6,8 @@ import sys
 import time
 import uuid
 
-from hermes_cli.gateway_client import GATEWAY_STARTUP_RPC_DEADLINE_S, GatewayClientError
+from hermes_cli.gateway_client import (GATEWAY_STARTUP_RPC_DEADLINE_S, GatewayClientError,
+                                       GatewayTurnNotAdmitted)
 
 logger = logging.getLogger(__name__)
 
@@ -369,6 +370,21 @@ class GatewayChatView:
                         await self._recover(admission, sid)
         return receipt
 
+    async def _submit_admitted(self, query):
+        """This invocation's one query, submitted; a lost admission answer is named as itself.
+
+        No admission id came back, so there is nothing ``prompt.receipt`` could be asked about: this
+        is the one disconnect that is NOT a lost turn (PRX-5964). It says so in its own words and
+        fails with its own exit code before the receipt path, which stays the only thing that may
+        report an unknown outcome. A refusal is the owner's verdict and travels untouched.
+        """
+        try:
+            return await self.submit(query)
+        except GatewayClientError as exc:
+            if _transport_loss(exc):
+                raise GatewayTurnNotAdmitted() from None
+            raise
+
     async def command(self, text):
         command, _, rest = text.partition(" ")
         if command in {"/quit", "/exit", "/detach"}:
@@ -620,7 +636,7 @@ class GatewayChatView:
                                 "interactively; both are prompt.resolve_unknown), then retry.")
         renderer = asyncio.create_task(self.render())
         try:
-            receipt = await self.submit(query) if query else None
+            receipt = await self._submit_admitted(query) if query else None
             if oneshot:
                 admission = _oneshot_admission(receipt)
                 if admission is None:

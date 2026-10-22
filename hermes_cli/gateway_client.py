@@ -13,6 +13,7 @@ import time
 # The owner's protocol name; session_contract is dependency-free (no config/plugins load).
 from gateway.session_contract import CANONICAL_GATEWAY_PROTOCOL as GATEWAY_WS_PROTOCOL
 from hermes_cli.gateway_restart_window import RESTART_WINDOW_REASON
+from hermes_cli.turn_exit import TURN_NOT_ADMITTED_EXIT_CODE
 
 GATEWAY_WS_TICKET_PREFIX = "hermes-gateway-ticket."
 # Per-request answer budget. Owner verbs are admissions/reads that answer promptly; the one that
@@ -254,6 +255,29 @@ class GatewayAdmissionTimeout(GatewayClientError):
         owner = f", owner={self.code_sha[:12]}" if self.code_sha else ""
         host = f", {self.evidence}" if self.evidence else ""
         super().__init__(f"{self.reason}: {detail} (budget={budget:g}s{owner}{host})")
+
+
+class GatewayTurnNotAdmitted(GatewayClientError):
+    """The socket died before the owner answered ``prompt.submit``: this run holds no admission id.
+
+    A distinct CLASS because the difference is a contract, not wording: with no admission id there
+    is no receipt to read, so nothing is in doubt and there is no turn to resume — the mid-turn copy
+    ("turn outcome is unknown … resume the printed session ID") sent an operator looking for work
+    that never started, and the run class counter booked a no-op with the runs that lost a whole turn
+    (PRX-5964). Retry-safe: ``exit_code`` is EX_TEMPFAIL, and ``reason`` is the stable code a retry
+    chain keys on. (A submit whose answer was lost after the owner had already admitted it would be
+    admitted once — the retried run then sees that row as a pending admission on the session, so the
+    retry is not a silent duplicate.)
+    """
+
+    reason = "gateway_turn_not_admitted"
+    exit_code = TURN_NOT_ADMITTED_EXIT_CODE
+
+    def __init__(self):
+        super().__init__(
+            f"{self.reason}: the connection dropped before the turn was admitted, so this run has no "
+            "admission id — there is no turn outcome to recover and nothing to resume. Retry the run "
+            "if its work is still wanted.")
 
 
 def admission_budget_seconds() -> float:
