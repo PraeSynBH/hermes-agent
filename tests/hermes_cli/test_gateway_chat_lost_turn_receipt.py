@@ -188,6 +188,14 @@ def test_launch_reports_the_never_admitted_exit_code_and_copy(monkeypatch, capsy
     err = capsys.readouterr().err
     assert "gateway_turn_not_admitted" in err and "turn outcome is unknown" not in err
 
+    # The record the adapter actually parses (``--format stream-json``) closes with the same verdict.
+    import json
+    assert gateway_chat.launch_from_kwargs({"q": "literal", "output_format": "stream-json"}) == TURN_NOT_ADMITTED_EXIT_CODE
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    result = records[-1]
+    assert result["type"] == "result" and result["exit_code"] == TURN_NOT_ADMITTED_EXIT_CODE
+    assert "gateway_turn_not_admitted" in result["error"] and "outcome is unknown" not in result["error"]
+
 
 @pytest.mark.asyncio
 async def test_an_interactive_viewer_never_reads_a_receipt_for_a_lost_socket(monkeypatch):
