@@ -766,10 +766,16 @@ gateway:
 
 - The **default profile is always served**; `multiplex_max_profiles: 1` means
   "the default only", never "no gateway".
-- Slots go to profiles **ranked by live work**, not by a hand list. The rank is a ladder of four
-  classes, in this order: (1) **queued work** — Paperclip agents, a blocked admission, an enabled
-  cron job; (2) a **session store written in the last six hours** (`profiles/<name>/state.db`
-  `mtime`, i.e. somebody is using it); (3) **an adapter credential** in `.env`; (4) holds nothing.
+- Slots go to profiles **ranked by live work**, not by a hand list. The rank is a ladder of five
+  classes, in this order: (1) **a pending wake** — a blocked admission, or a `busy` run the
+  manifest reports for one of its agents, i.e. somebody dispatched work and it cannot be admitted;
+  (2) **queued work** — Paperclip agents it merely holds, an enabled cron job; (3) a **session
+  store written in the last six hours** (`profiles/<name>/state.db`
+  `mtime`, i.e. somebody is using it); (4) **an adapter credential** in `.env`; (5) holds nothing.
+  A wake is separate from assigned work because a tiebreak must never let a refused run lose to a
+  profile that is merely configured: before the split, a profile whose agent had just been woken
+  ranked level with every profile owning an idle agent, lost the name tiebreak, and every wake for
+  it was refused (PRA-6796).
   `multiplex_serve_priority` is only the tiebreak *inside* a class (and the name breaks the
   remaining ties), so a priority entry can never keep a work-free profile ahead of one with live
   work. Credentials rank below the others on purpose: every live profile has a bot token, so
@@ -785,8 +791,10 @@ gateway:
   finds itself deferred is **not** written off: the deferral is provisional, so admission
   files a pending-admission sighting (`want-profile`) and re-observes for up to
   `PROFILE_SERVE_WAIT_S` (75 s, two rescans); if the rank never makes room it fails with the
-  `capacity:` reason and its remedy rather than with a boot or a stall. Its cron jobs still
-  tick (`profiles_to_tick` deliberately ignores the ceiling); adapters, ingress,
+  `capacity:` reason and its remedy rather than with a boot or a stall. When the profile had a
+  wake pending, that reason says so (`a Paperclip wake is blocked on this profile (3 refused
+  admissions in 15 min)`), so a refusal booked onto a ticket never reads as an idle profile.
+  Its cron jobs still tick (`profiles_to_tick` deliberately ignores the ceiling); adapters, ingress,
   `/p/<profile>/` and admission stop.
 - The ceiling never affects what is **installed**: `hermes profile list`, `hermes gateway
   status` and every `include_parked`/`include_standalone` enumeration still see the whole
@@ -804,7 +812,7 @@ gateway:
 | cron store | enabled jobs in `profiles/<name>/cron/jobs.json` | core |
 | recency | `profiles/<name>/state.db` `mtime` inside `RECENT_USE_WINDOW_SECONDS` (6 h) — the only cheap evidence a profile is *being used* | core |
 | credentials | adapter credentials in `profiles/<name>/.env` (the same key table `hermes profile clone` uses) — a capability, ranked *below* every work signal | core |
-| manifest | `gateway.multiplex_demand_manifest` — agents that wake a profile from outside Hermes | a host-side collector |
+| manifest | `gateway.multiplex_demand_manifest` — agents that wake a profile from outside Hermes. Its `busy` and `blocked_admission_15m` counts are the **pending-wake** class; `agents` alone is assigned work | a host-side collector |
 | pending admission | a client that asked for a profile this gateway refused, live in the gateway process | core |
 
 The last row is the only signal that is not read from disk, and the only one that says somebody

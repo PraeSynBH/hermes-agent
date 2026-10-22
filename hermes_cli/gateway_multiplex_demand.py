@@ -24,6 +24,14 @@ asked for a profile and is waiting on its admission (``note_wanted``, PRX-5738).
 sighting the 2026-10-20 outage never produced — the busiest profile sat deferred while its runs
 failed admission. A sighting carries its own TTL and expires, so it cannot pin a slot forever.
 
+**A pending WAKE is its own rank class, above assigned work (PRA-6796).** ``agents`` counts cards a
+profile *holds*; it does not say anybody is trying to run one. So a profile whose Paperclip agent
+was woken a second ago ranked identically to one that merely owns two idle agents, and the tie
+fell through to the name — alphabetically last lost the last slot and its every wake was refused
+(release: 15 straight ``profile_not_served`` refusals behind an idle cron profile). The manifest's
+``busy`` count (queued/running runs for its agents) and ``blocked_admission_15m`` are the two ways
+the host says *this wake is waiting*, and both now rank ahead of assignment and recency.
+
 **Trust boundary:** core never reads Paperclip. The manifest is a documented, schema-versioned host
 input; any scheduler can write it. A malformed or absent manifest degrades to S1 ∨ S2 and is
 *reported*, never silently read as "no demand".
@@ -70,7 +78,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +121,10 @@ class DemandFacts:
     cron_jobs: int = 0
     credentials: tuple[str, ...] = ()
     blocked_admission_15m: int = 0
+    #: Runs for this profile's Paperclip agents that are queued or running (manifest ``busy``) — a
+    #: wake that has already been dispatched and is waiting for admission. Counted for the label
+    #: only: one pending run claims the slot exactly as a thousand would (no weights).
+    pending_runs: int = 0
     #: Seconds since ``profiles/<n>/state.db`` was last written, or ``None`` when the profile has no
     #: store. ``None`` is "no evidence of use", never "used long ago" — a profile created an hour
     #: ago and never opened must not outrank one whose store is a day old and also idle.
@@ -137,6 +149,8 @@ class DemandFacts:
         signals: list[str] = []
         if self.blocked_admission_15m:
             signals.append("admission")
+        if self.pending_runs:
+            signals.append("wake")
         if self.agents:
             signals.append("agents")
         if self.cron_jobs:
@@ -148,6 +162,15 @@ class DemandFacts:
         signals.extend(self.unreadable)
         return tuple(signals)
 
+    def has_pending_wake(self) -> bool:
+        """Is a wake for this profile WAITING right now — blocked admission, or a queued run?
+
+        The distinction this class exists for (PRA-6796): *assigned* work says a profile holds
+        cards, while a pending wake says somebody dispatched one and it cannot be admitted. Only
+        the second one is a client that has already paid for a run and is being refused.
+        """
+        return bool(self.blocked_admission_15m or self.pending_runs)
+
     def has_queued_work(self) -> bool:
         """Work that exists whether or not anybody touched the profile: cron, agents, an admission.
 
@@ -156,27 +179,33 @@ class DemandFacts:
         """
         if self.unreadable:
             return True
-        return bool(self.blocked_admission_15m or self.agents or self.cron_jobs)
+        return bool(self.has_pending_wake() or self.agents or self.cron_jobs)
 
     def has_work(self) -> bool:
         """Any work at all — queued work, or a session store written inside the use window."""
         return self.has_queued_work() or self.used_recently
 
     def rank_class(self) -> int:
-        """The rank's only key, ascending: 0 queued work, 1 recent use, 2 credentials, 3 nothing.
+        """The rank's only key, ascending: 0 a pending wake, 1 queued work, 2 recent use,
+        3 credentials, 4 nothing.
 
         Classes, not weights: a profile with 19 agents ties with one that has 1, so editing a job
         cannot flip the served set (SOU-3075's rule). The ladder exists because a cron job is work
         that outlives a human's last click — it must beat a profile that was merely opened an hour
-        ago, and both must beat the 40 profiles whose only claim is a bot token (PRX-5750).
+        ago, and both must beat the 40 profiles whose only claim is a bot token (PRX-5750). Class 0
+        is separate from assigned work because a refused wake is not a job edit: it is a run that
+        already failed, and no tiebreak may let it lose to a profile that is merely configured
+        (PRA-6796).
         """
-        if self.has_queued_work():
+        if self.has_pending_wake():
             return 0
-        if self.used_recently:
+        if self.has_queued_work():
             return 1
-        if self.credentials:
+        if self.used_recently:
             return 2
-        return 3
+        if self.credentials:
+            return 3
+        return 4
 
     def has_demand(self) -> bool:
         """Any claim to a slot at all — work first, and an unreadable source fails toward SERVING."""
@@ -191,6 +220,7 @@ class DemandFacts:
             "cron_jobs": self.cron_jobs,
             "credentials": list(self.credentials),
             "blocked_admission_15m": self.blocked_admission_15m,
+            "pending_runs": self.pending_runs,
             "state_age_seconds": (None if self.state_age_seconds is None
                                   else int(self.state_age_seconds)),
             "work": list(self.work_signals()),
@@ -236,11 +266,17 @@ class DemandSnapshot:
         """Can *name* connect as a bot? True only when it has no stronger claim to a slot."""
         return bool(self.for_profile(name).credentials)
 
-    def rank_class(self, name: str) -> int:
-        """How strongly *name* claims a slot: 0 queued work · 1 recent use · 2 credentials · 3 none.
+    def has_pending_wake(self, name: str) -> bool:
+        """Is a wake for *name* waiting — a live sighting, a blocked admission, a queued run?"""
+        return self.wanted(name) or self.for_profile(name).has_pending_wake()
 
-        A client waiting on the profile right now is the strongest claim there is (PRX-5738), so a
-        sighting pins the class at 0 regardless of what the disk says.
+    def rank_class(self, name: str) -> int:
+        """How strongly *name* claims a slot: 0 a pending wake · 1 queued work · 2 recent use ·
+        3 credentials · 4 none.
+
+        A client waiting on the profile right now is a pending wake with the shortest history, so a
+        sighting pins the class at 0 regardless of what the disk says (PRX-5738); so does a wake the
+        manifest already counted as blocked or queued (PRA-6796).
         """
         if self.wanted(name):
             return 0
@@ -286,7 +322,7 @@ def manifest_path(default_home: Optional[Path] = None) -> Path:
 
 
 def _read_manifest(path: Path):
-    """``(state, {name: (agents, blocked_admission_15m)}, age_seconds, error)`` for the manifest.
+    """``(state, {name: (agents, blocked_admission_15m, busy)}, age_seconds, error)`` for the manifest.
 
     Absent is its own state (the host runs no collector). Anything read but unusable — torn JSON,
     wrong schema, a non-object entry, a bad ``written_at`` — is ``malformed`` with the reason, so
@@ -317,18 +353,20 @@ def _read_manifest(path: Path):
     if written.tzinfo is None:
         written = written.replace(tzinfo=UTC)
     age = max(0.0, (datetime.now(UTC) - written).total_seconds())
-    parsed: dict[str, tuple[int, int]] = {}
+    parsed: dict[str, tuple[int, int, int]] = {}
     for name, entry in profiles.items():
         if not isinstance(entry, dict):
             return MANIFEST_MALFORMED, {}, None, f"manifest entry {name!r} is not an object"
         try:
             agents = int(entry.get("agents") or 0)
             blocked = int(entry.get("blocked_admission_15m") or 0)
+            # Older collectors wrote no ``busy``: absent is 0 (no queue), never malformed.
+            busy = int(entry.get("busy") or 0)
         except (TypeError, ValueError):
             return MANIFEST_MALFORMED, {}, None, f"manifest entry {name!r} has non-numeric counts"
-        if agents < 0 or blocked < 0:
+        if agents < 0 or blocked < 0 or busy < 0:
             return MANIFEST_MALFORMED, {}, None, f"manifest entry {name!r} has negative counts"
-        parsed[str(name)] = (agents, blocked)
+        parsed[str(name)] = (agents, blocked, busy)
     ttl = data.get("ttl_seconds")
     if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or ttl <= 0:
         ttl = DEFAULT_TTL_SECONDS
@@ -436,14 +474,15 @@ def refresh() -> DemandSnapshot:
         else:
             credentials, env_bad = _credentials(home, keys)
         agents: Optional[int] = None
-        blocked = 0
+        blocked = pending = 0
         if manifest_known:
-            agents, blocked = manifest.get(name, (0, 0))
+            agents, blocked, pending = manifest.get(name, (0, 0, 0))
         facts[name] = DemandFacts(
             agents=agents,
             cron_jobs=cron_jobs,
             credentials=credentials,
             blocked_admission_15m=blocked,
+            pending_runs=pending,
             state_age_seconds=_state_age(home),
             unreadable=cron_bad + env_bad,
         )
@@ -522,6 +561,23 @@ def wanted_signal(name: str) -> str:
     return "a client is waiting (pending admission)"
 
 
+def wake_signal(facts: Any) -> str:
+    """*Why* this profile's slot is claimed by a wake that is waiting, or ``""`` (PRA-6796).
+
+    The one sentence a deferral reason carries when the parked profile is not idle-but-configured
+    but actively failing to run something. It reads next to ``cost: …`` in ``parked_profiles`` and
+    in the refusal the dispatcher books, which is where an operator (or the owning agent) looks.
+    """
+    if facts.blocked_admission_15m:
+        refused = facts.blocked_admission_15m
+        return (f"a Paperclip wake is blocked on this profile "
+                f"({refused} refused admission{'s' if refused != 1 else ''} in 15 min)")
+    runs = int(facts.pending_runs or 0)
+    if runs:
+        return f"{runs} Paperclip run{'s' if runs != 1 else ''} queued for this profile"
+    return ""
+
+
 __all__ = [
     "DEFAULT_MANIFEST_NAME",
     "DEFAULT_TTL_SECONDS",
@@ -541,6 +597,7 @@ __all__ = [
     "refresh",
     "reset",
     "snapshot",
+    "wake_signal",
     "wanted",
     "wanted_signal",
 ]
