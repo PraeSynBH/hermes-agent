@@ -447,7 +447,20 @@ def watcher_for_runner(runner: Any, loop: Any, *, config: Any = None,
     def _interrupted() -> dict[str, int]:
         return _on_loop(loop, lambda: counts_by_profile(runner)) or {}
 
-    return ContractWatcher(
-        home=home, seconds=seconds, min_seconds_between_restarts=min_seconds_between_restarts(config),
+    supervised = is_supervised_gateway_launch()
+    gap = min_seconds_between_restarts(config)
+    watcher = ContractWatcher(
+        home=home, seconds=seconds, min_seconds_between_restarts=gap,
         restart=_restart, interrupted=_interrupted, drain_active=lambda: drain_active(runner),
-        supervised=is_supervised_gateway_launch())
+        supervised=supervised)
+    # Say it at boot, once (PRX-5881). Activation of this prevention is otherwise unprovable without
+    # waiting for a skew: the live gateway is only asked "is the watcher armed?" by the boot log, and a
+    # silent registration is indistinguishable from an absent one — exactly the state the last
+    # activation was in (a boot carrying SOU-3328/3329 that nobody could confirm had armed it).
+    logger.info(
+        "%s armed: the booted wire contract is compared with the tree every %gs; a settled skew "
+        "replaces this process at most once per %gs (%s)",
+        LABEL, watcher.seconds, gap,
+        "supervised gateway: the supervisor respawns it" if supervised
+        else "UNSUPERVISED: the planned stop exits 75 and a boot guard must respawn it")
+    return watcher
