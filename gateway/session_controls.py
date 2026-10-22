@@ -506,19 +506,24 @@ class AuthorityConnection:
         async with lock:
             return await self._create(params, title)
 
-    async def _create(self, params, title):
+    def _stage_create(self, params, title):
+        """The reads that decide create-vs-resume, and the staging that follows them, in one worker.
+
+        Returns ``(ref, staged)``: ``staged`` is False when the title/retry resolve already named an
+        existing session, True when this call minted (or re-staged) a creation the caller commits.
+
+        ``session.create`` used to run all of this on the owner loop, and the loop's single thread
+        made the pair atomic. A read that misses the read pool degrades to the writer connection
+        under ``SessionDB._lock`` (``hermes_state._read_ctx``'s documented fallback -- ``acquire()``
+        refuses descriptor work on a loop thread), so a held writer froze every session, timer and
+        socket this profile serves while a chat was created. gateway.error.log 2026-10-22 07:47:16
+        names it on the shared gateway: ``session.create`` -> ``stage_local_session:288`` ->
+        ``get_session`` -> ``_read_ctx:971`` (``with self._lock:``), a 40.1s probe-unanswered stall.
+        """
         from gateway.session_local import stage_local_session, staged_creation_follows
-        from gateway.session_local_recovery import restore_local_session
-        from gateway.session_local_title import resolve_titled_session, title_new_session
+        from gateway.session_local_title import resolve_titled_session
         from gateway.session_policy import BYPASS_FIELDS
-        from gateway.session_runtime_workers import tracked_write
-        from hermes_state_local import commit_local_session
-        # Bot Mode's forever-chat mint: born hidden from the sidebar. `follow_profile_config` stays in
-        # the frozen request: the policy re-reads the profile's current route every turn.
-        hidden = params.pop('hidden', False)
-        if type(hidden) is not bool:
-            raise RuntimeStoreError('invalid_params', field='hidden', detail='must be a boolean')
-        ref = title and resolve_titled_session(self.authority, self.actor, title, missing_ok=True)
+        ref = resolve_titled_session(self.authority, self.actor, title, missing_ok=True) if title else title
         if (not ref and title == 'Bot Chat'
                 and not any(params.get(name) is True for name in BYPASS_FIELDS)
                 and staged_creation_follows(self.authority, self.actor, params.get('request_id'))):
@@ -526,33 +531,54 @@ class AuthorityConnection:
             # or ignore-user-config launch never reads the profile, so it stays frozen. An exact
             # retry of a creation staged without the flag keeps that frozen request.
             params.setdefault('follow_profile_config', True)
-        if not ref:
-            skills_prompt = None
-            if 'skills' in params:
-                # Skill files are read off the owner loop, once per NEW session (a retried
-                # request_id resumes the frozen policy and never re-renders).
-                from gateway.session_local_recovery import local_identity
-                from gateway.session_policy import render_launch_skills
-                params.setdefault('request_id', uuid.uuid4().hex)
-                sid = local_identity(self.authority.profile_id, self.actor.subject, params['request_id'])
-                if self.authority.db.get_session(sid) is None:
-                    skills_prompt = await asyncio.to_thread(render_launch_skills, params, sid)
-            # Host-bound client values apply only over the gateway's own ticketed attach (run_api).
-            ref = stage_local_session(self.authority, self.actor, params, skills_prompt=skills_prompt,
-                                      client_local=self.native_owner)
+        if ref:
+            return ref, False  # resolved: an existing session, nothing staged
+        skills_prompt = None
+        if 'skills' in params:
+            # Skill files are read once per NEW session (a retried request_id resumes the frozen
+            # policy and never re-renders), in this worker, never in front of a turn.
+            from gateway.session_local_recovery import local_identity
+            from gateway.session_policy import render_launch_skills
+            params.setdefault('request_id', uuid.uuid4().hex)
+            sid = local_identity(self.authority.profile_id, self.actor.subject, params['request_id'])
+            if self.authority.db.get_session(sid) is None:
+                skills_prompt = render_launch_skills(params, sid)
+        # Host-bound client values apply only over the gateway's own ticketed attach (run_api).
+        return stage_local_session(self.authority, self.actor, params, skills_prompt=skills_prompt,
+                                   client_local=self.native_owner), True
+
+    async def _create(self, params, title):
+        from gateway.session_local_recovery import restore_local_session
+        from gateway.session_local_title import title_new_session
+        from gateway.session_runtime_workers import tracked_write
+        from hermes_state_local import commit_local_session
+        # Bot Mode's forever-chat mint: born hidden from the sidebar. `follow_profile_config` stays in
+        # the frozen request: the policy re-reads the profile's current route every turn.
+        hidden = params.pop('hidden', False)
+        if type(hidden) is not bool:
+            raise RuntimeStoreError('invalid_params', field='hidden', detail='must be a boolean')
+        # One owner step per authority: ``_stage_create`` does the reads and the staging in a worker
+        # (see there), and this lock keeps the pair atomic the way the loop's single thread used to,
+        # so two creates carrying one request_id still converge instead of racing.
+        lock = getattr(self.authority, '_staged_create_lock', None)
+        if lock is None:
+            lock = self.authority._staged_create_lock = asyncio.Lock()
+        async with lock:
+            ref, staged = await asyncio.to_thread(self._stage_create, params, title)
+        if staged:
             if isinstance(ref, dict):
                 # The creation commit runs off the owner loop: a held writer must not freeze
                 # every session behind one new chat (N50).
                 receipt = ref
                 await tracked_write(self.authority, partial(
                     commit_local_session, self.authority.db, epoch=self.authority.epoch, receipt=receipt))
-                ref = restore_local_session(self.authority, receipt['session_id'])
+                ref = await asyncio.to_thread(restore_local_session, self.authority, receipt['session_id'])
             # `--accept-hooks`: record this launch's consent; ``resume`` below registers the hooks.
             if params.get('accept_hooks') is True:
                 from gateway.session_policy import accept_launch_hooks, restore_policy
                 from hermes_state_local import local_receipt
-                policy = restore_policy(local_receipt(self.authority.db, ref.session_id)['policy'])
-                await asyncio.to_thread(accept_launch_hooks, policy)
+                saved = await asyncio.to_thread(local_receipt, self.authority.db, ref.session_id)
+                await asyncio.to_thread(accept_launch_hooks, restore_policy(saved['policy']))
             if title:
                 await tracked_write(self.authority, partial(title_new_session, self.authority, ref, title))
             if hidden:
