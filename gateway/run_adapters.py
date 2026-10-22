@@ -604,7 +604,8 @@ class GatewayAdapterLifecycleMixin:
             while self._running:
                 try:
                     # Idle gate per profile (run_idle_gates.poll_plan): one sweep per tick, on the
-                    # bounded pool, never one turn-pool thread per profile (PRA-6660).
+                    # poll lane, never one turn-pool thread per profile (PRA-6660) and never behind
+                    # the seconds-long housekeeping items (PRA-6791).
                     scopes, busy = await poll_plan(self, pending_handoff_in_store)
                     for profile_name, profile_home in scopes:
                         if profile_home is not None and profile_home not in busy:

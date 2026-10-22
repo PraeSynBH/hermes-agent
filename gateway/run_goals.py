@@ -46,14 +46,21 @@ class GatewayGoalsMixin:
         except Exception:
             return 20
 
-    async def _warm_goals_session_db(self, label: str) -> None:
+    async def _warm_goals_session_db(self, label: str, offload=None) -> None:
         """Warm the goals SessionDB cache off-loop (best-effort): a cold cache runs the state.db
         init on the loop thread and freezes the loop. The executor hop keeps the profile home
-        override alive under multiplex; a failed warm-up is a bounded stall, never a crash."""
+        override alive under multiplex; a failed warm-up is a bounded stall, never a crash.
+
+        ``offload`` is the hop to warm through. Per-tick pollers pass
+        ``run_idle_gates.offload_for_poll`` so a poll's warm hop rides the poll lane: on the turn
+        pool it was a fresh OS thread per poll (PRA-6660's class) and a cold init there also bought
+        nothing, since the poll's own store read runs on a worker anyway. Command paths leave it
+        unset and keep the turn hop, where a cold init must not queue behind another poll's sweep.
+        """
         try:
             from hermes_cli.goals import _get_session_db as _warm_goals_db
 
-            await self._run_in_executor_with_context(_warm_goals_db)
+            await (offload or self._run_in_executor_with_context)(_warm_goals_db)
         except Exception as exc:
             logger.warning("%s: session DB warm-up failed: %s", label, exc)
 
@@ -136,7 +143,9 @@ class GatewayGoalsMixin:
                 logger.debug("heartbeat poll for %s failed: %s", quick_key, exc)
 
     async def _heartbeat_poll_watch(self, watch, quick_key, source, session_id):
-        await self._warm_goals_session_db("heartbeat poll")
+        from gateway.run_idle_gates import offload_for_poll
+
+        await self._warm_goals_session_db("heartbeat poll", offload=offload_for_poll(self))
         store = getattr(self, "session_store", None)
         if store is not None:
             current = store.peek_session_id(quick_key)
@@ -536,11 +545,12 @@ class GatewayGoalsMixin:
             from hermes_cli.loops import list_active_loops
 
             # Warm once per scan: the scan reads every persisted loop and a cold cache would
-            # run the state.db init on the loop thread before the first read.
-            await self._warm_goals_session_db("loop wakeup")
-            # Off-loop too: the read is lock-free under WAL but convoys on the writer lock without it.
-            # On the BOUNDED poll pool, not the turn pool (PRA-6660): this is a per-tick scan.
+            # run the state.db init on the loop thread before the first read. Both hops ride the
+            # poll lane: neither is agent work, and a turn-pool hop here was one fresh OS thread
+            # per scanned profile per tick (PRA-6660's class, PRA-6791's lane).
             poll_offload = offload_for_poll(self)
+            await self._warm_goals_session_db("loop wakeup", offload=poll_offload)
+            # Off-loop too: the read is lock-free under WAL but convoys on the writer lock without it.
             active_loops = await (poll_offload(list_active_loops) if poll_offload is not None
                                   else asyncio.to_thread(list_active_loops))
             now = time.time()

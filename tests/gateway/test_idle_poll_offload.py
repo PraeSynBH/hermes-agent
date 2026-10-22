@@ -19,12 +19,14 @@ The contracts here are behaviour, not source shape:
 from __future__ import annotations
 
 import asyncio
+import threading
 import types
 from pathlib import Path
 
 import pytest
 
 from gateway import run
+from gateway.run import GatewayRunner, _HOUSEKEEPING_MAX_WORKERS
 from gateway.run_idle_gates import off_loop_busy_homes, offload_for_poll
 
 
@@ -182,3 +184,86 @@ def test_offload_for_poll_prefers_the_bounded_pool():
     assert offload_for_poll(runner) is poll_hop
     assert offload_for_poll(types.SimpleNamespace(_run_in_executor_with_context=turn_hop)) is turn_hop
     assert offload_for_poll(types.SimpleNamespace()) is None
+
+
+def test_offload_for_poll_prefers_the_poll_lane():
+    """PRA-6791: the poll lane wins over the housekeeping pool, which is seconds long per item."""
+    def lane_hop(*_args):
+        raise AssertionError("identity only; never called")
+
+    def housekeeping_hop(*_args):
+        raise AssertionError("identity only; never called")
+
+    def turn_hop(*_args):
+        raise AssertionError("identity only; never called")
+
+    runner = types.SimpleNamespace(
+        _run_poll_in_executor=lane_hop,
+        _run_housekeeping_in_executor=housekeeping_hop,
+        _run_in_executor_with_context=turn_hop,
+    )
+    assert offload_for_poll(runner) is lane_hop, (
+        "a poll hop queued behind best-effort housekeeping reports the queue, not the store: it "
+        "waited 1970 ms p50 behind four busy housekeeping workers and 10 ms on a lane of its own")
+
+
+def _pooled_runner():
+    """A real GatewayRunner (no __init__) with all three lanes, as boot creates them."""
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._executor_lock = threading.Lock()
+    runner._executor = None
+    runner._housekeeping_executor = None
+    runner._poll_executor = None
+    runner._executor_closing = False
+    return runner
+
+
+def test_a_poll_hop_runs_beside_a_saturated_housekeeping_pool():
+    """The lane pin: with EVERY housekeeping worker wedged for seconds, a poll still runs now."""
+    wedge = threading.Event()
+    housekeeping_started = threading.Event()
+    ran_on: list[str] = []
+
+    def wedged_housekeeping():
+        housekeeping_started.set()
+        assert wedge.wait(60), "wedged housekeeping item never released"
+
+    runner = _pooled_runner()
+    try:
+        housekeeping_pool = runner._get_housekeeping_executor()
+        for _ in range(_HOUSEKEEPING_MAX_WORKERS):
+            housekeeping_pool.submit(wedged_housekeeping)
+        assert housekeeping_started.wait(10), "housekeeping workers never started"
+
+        async def poll():
+            return await runner._run_poll_in_executor(
+                lambda: ran_on.append(threading.current_thread().name))
+
+        asyncio.run(asyncio.wait_for(poll(), timeout=10))
+        assert ran_on and ran_on[0].startswith("hermes-gateway-poll"), (
+            f"the poll hop did not run on its own lane: {ran_on}")
+    finally:
+        wedge.set()
+        runner._shutdown_executor()
+
+
+def test_loop_scan_warms_the_store_on_the_poll_lane(monkeypatch):
+    """The warm hop is per-tick polling too: it must not mint a turn-pool thread per scan."""
+    from gateway import run_goals
+    from hermes_cli import goals
+
+    hops: list[str] = []
+
+    async def _lane(func, *args):
+        hops.append("lane")
+        return func(*args)
+
+    async def _turn(func, *args):  # pragma: no cover - asserted never taken
+        hops.append("turn")
+        return func(*args)
+
+    monkeypatch.setattr(goals, "_get_session_db", lambda: object())
+    runner = _pooled_runner()
+    asyncio.run(GatewayRunner._warm_goals_session_db(runner, "test", offload=_lane))
+    assert hops == ["lane"], hops
+    assert _turn not in hops

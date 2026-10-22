@@ -75,6 +75,8 @@ class GatewayRuntimeInitMixin:
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         # Best-effort session housekeeping runs on its OWN pool; see _run_housekeeping_in_executor.
         self._housekeeping_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        # Per-tick polling gets a third, smaller lane of its own; see _run_poll_in_executor.
+        self._poll_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect the pool.
         self._executor_closing = False
         # ALL per-session state lives here (gateway/session_state.py); use _session_state / _peek_session_state.

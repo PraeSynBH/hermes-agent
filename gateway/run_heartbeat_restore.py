@@ -71,8 +71,9 @@ async def restore_heartbeat_watches(runner) -> None:
         return restored
 
     try:
-        # The poll hop is the BOUNDED pool, never the one-thread-per-work-item turn pool: this scan
-        # runs every POLL_SECONDS for the whole process's lifetime (PRA-6660).
+        # The poll hop is the poll lane, never the one-thread-per-work-item turn pool: this scan runs
+        # every POLL_SECONDS for the whole process's lifetime (PRA-6660), and it must not wait behind
+        # best-effort housekeeping either (PRA-6791).
         from gateway.run_idle_gates import offload_for_poll
         poll_offload = offload_for_poll(runner)
         candidates = await (poll_offload(scan) if poll_offload is not None else asyncio.to_thread(scan))

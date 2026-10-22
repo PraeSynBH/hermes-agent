@@ -63,6 +63,8 @@ _TELEGRAM_INITIAL_CONNECT_TIMEOUT_SECS_DEFAULT = 45.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 # Size of the separate pool for best-effort session HOUSEKEEPING; why it is separate: _run_housekeeping_in_executor.
 _HOUSEKEEPING_MAX_WORKERS = 4
+# Size of the POLL lane, and why it is not the housekeeping pool: _run_poll_in_executor.
+_POLL_LANE_MAX_WORKERS = 2
 
 # End reasons meaning the USER deliberately closed this thread. Shared by _classify_completion_target and
 # _resolve_async_delegation_session so they never disagree (else a "delivered" reason is acked, then lost).
@@ -1744,9 +1746,10 @@ async def _resolve_handoff_watch_scopes(runner: object) -> list:
     root poll directly — no per-tick thread spawn on the unbounded executor. A config-less stand-in
     (tests) and a runner without the executor hop fall through to the plain resolver.
 
-    The hop prefers the BOUNDED poll pool (``_run_housekeeping_in_executor``): a per-tick scope walk is
-    polling, and on a many-profile gateway two pollers resolve scopes every 2 s and every 15 s, which
-    used to be a fresh OS thread each time on the turn pool (PRA-6660)."""
+    The hop prefers the poll lane (``_run_poll_in_executor``): a per-tick scope walk is polling, and on
+    a many-profile gateway two pollers resolve scopes every 2 s and every 15 s, which used to be a
+    fresh OS thread each time on the turn pool (PRA-6660) and then queued behind housekeeping items on
+    the shared bounded pool (PRA-6791)."""
     config = getattr(runner, "config", None)
     if config is not None and not getattr(config, "multiplex_profiles", False):
         return [(None, None)]
@@ -4047,15 +4050,42 @@ class GatewayRunner(
         housekeeping grow threads without limit. Housekeeping therefore gets its own bounded pool;
         exhausting that one delays only more housekeeping, which is best-effort by construction.
 
-        Per-tick pollers (``gateway.run_idle_gates.offload_for_poll``: the handoff watcher's profile
-        sweep, the loop-wakeup scan, heartbeat restore) belong here for the same reason plus one of
-        their own: they run every couple of seconds for the life of the process, and as one-work-item
-        -per-hop work on the turn pool each poll was a fresh OS thread create/destroy — ~9 of the ~21
-        thread spawns/s PRA-6660 measured, from polls that do no agent work at all.
+        Per-tick pollers do NOT belong here; they get their own lane (``_run_poll_in_executor``).
+        They must not be on the turn pool because each hop there is a fresh OS thread
+        create/destroy (~9 of the ~21 thread spawns/s PRA-6660 measured, from polls that do no agent
+        work at all), and they must not be here because this pool's items are seconds long, so a
+        poll hop queued behind them reports the queue instead of the store (PRA-6791).
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self._get_housekeeping_executor(), copy_context().run, func, *args)
+
+    async def _run_poll_in_executor(self, func, *args):
+        """Run one per-tick POLL hop on the poll lane: bounded, reused workers of its own.
+
+        Polls (``gateway.run_idle_gates.offload_for_poll``: the handoff watcher's profile sweep, the
+        loop-wakeup scan, heartbeat restore) ask "is there work?" every 2-15 s and their answer is
+        only useful now. On the housekeeping pool they queue behind its seconds-long best-effort
+        items (session finalize, agent cleanup, reconcile pid probes): measured on this host, a poll
+        hop behind four busy housekeeping workers waited 1970 ms p50 to start, against 10 ms on a
+        lane of its own — while the poll itself costs single-digit milliseconds. That wait is what
+        turned ``loop_wakeup_scan`` p50 from ~30 ms into ~400 ms without any store getting slower
+        (PRA-6791).
+
+        Two workers on purpose: a cold sweep (opening every served profile's state.db, seconds on a
+        large store) can hold one while the other still answers, and the poll population's thread
+        count stays fixed instead of tracking host load.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._get_poll_executor(), copy_context().run, func, *args)
+
+    def _get_poll_executor(self) -> concurrent.futures.Executor:
+        """Return the gateway-owned executor for per-tick polling (why it exists: _run_poll_in_executor)."""
+        return GatewayRunner._get_or_create_pool(
+            self, "_poll_executor",
+            lambda: concurrent.futures.ThreadPoolExecutor(
+                max_workers=_POLL_LANE_MAX_WORKERS, thread_name_prefix="hermes-gateway-poll"))
 
     def _get_or_create_pool(self, attr: str, make_pool: Callable[[], concurrent.futures.Executor]) -> concurrent.futures.Executor:
         """Return (creating under ``_executor_lock``) the pool at ``attr``; one lock + closing flag fences both."""
@@ -4124,11 +4154,15 @@ class GatewayRunner(
             self._executor = None
             housekeeping = getattr(self, "_housekeeping_executor", None)
             self._housekeeping_executor = None
+            poll = getattr(self, "_poll_executor", None)
+            self._poll_executor = None
         # Housekeeping workers run SessionDB writes too (session finalize, agent cleanup), so a wedged
-        # one is exactly the mid-write worker the #101093 skip-close heuristic exists for. Both pools
-        # are therefore joined under the SAME drain deadline and both contribute to the live count.
-        # Class-qualified: run_shutdown and tests invoke these unbound on a duck-typed `self`.
-        workers = GatewayRunner._stop_pool(executor) + GatewayRunner._stop_pool(housekeeping)
+        # one is exactly the mid-write worker the #101093 skip-close heuristic exists for. Every pool
+        # is therefore joined under the SAME drain deadline and each contributes to the live count
+        # (the poll lane reads the same stores). Class-qualified: run_shutdown and tests invoke these
+        # unbound on a duck-typed `self`.
+        workers = (GatewayRunner._stop_pool(executor) + GatewayRunner._stop_pool(housekeeping)
+                   + GatewayRunner._stop_pool(poll))
         deadline = time.monotonic() + max(float(drain_timeout or 0.0), 0.0)
         for worker in workers:
             remaining = deadline - time.monotonic()

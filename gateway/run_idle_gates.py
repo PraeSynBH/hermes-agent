@@ -12,10 +12,12 @@ Two rules keep the gate sweeps from turning into thread churn (PRA-6660):
   set of profiles at once; a dozens-profile gateway used to submit one executor hop per profile per
   tick, and on the shared gateway those hops were ~9 of the ~21 thread spawns per second measured in
   the turn executor (one fresh OS thread each).
-* **The bounded poll pool, never the turn pool.** ``offload_for_poll`` prefers
-  ``GatewayRunner._run_housekeeping_in_executor``: a fixed pool that reuses its workers. A cold sweep
-  (opening every profile's state.db at once) takes tens of seconds on a loaded host, and a probe must
-  never mint threads on the pool whose size is the gateway's turn concurrency.
+* **The poll lane, never the turn pool and never the housekeeping pool.** ``offload_for_poll``
+  prefers ``GatewayRunner._run_poll_in_executor``: a fixed pool that reuses its workers. A probe must
+  never mint threads on the pool whose size is the gateway's turn concurrency (PRA-6660), and it must
+  not queue behind best-effort housekeeping either — a poll hop behind four in-flight housekeeping
+  items waited 1970 ms p50 to start on this host against 10 ms on a lane of its own, which is queue
+  time reported as poll cost (PRA-6791).
 """
 from __future__ import annotations
 
@@ -84,14 +86,15 @@ def busy_homes(homes, store_has_work: Callable[[Any], bool]) -> set:
 
 
 def offload_for_poll(runner: object) -> Optional[Callable]:
-    """The runner hop for per-tick polling: the BOUNDED housekeeping pool before the turn pool.
+    """The runner hop for per-tick polling: the POLL lane, then housekeeping, then the turn pool.
 
-    ``_run_housekeeping_in_executor`` reuses a fixed set of workers, so a poller contributes no
-    thread spawns at all; the turn pool is one-thread-per-work-item and every hop there is a thread
-    create/destroy. The turn helper stays as the fallback for runners predating the split (and for
-    test doubles that stub only it).
+    ``_run_poll_in_executor`` is a fixed set of workers of its own, so a poller contributes no thread
+    spawns and cannot queue behind a session finalize (PRA-6791). ``_run_housekeeping_in_executor``
+    is the older bounded pool and stays as the fallback for runners that predate the poll lane; the
+    turn helper is last, for test doubles that stub only it.
     """
-    for attr in ("_run_housekeeping_in_executor", "_run_in_executor_with_context"):
+    for attr in ("_run_poll_in_executor", "_run_housekeeping_in_executor",
+                 "_run_in_executor_with_context"):
         offload = getattr(runner, attr, None)
         if callable(offload):
             return offload
