@@ -5135,6 +5135,7 @@ export interface CanonicalSubmitParams {
   attachments?: CanonicalAttachment[] | null
   finite?: boolean
   unattended?: boolean
+  one_shot?: boolean
   surface?: string | null
   voice_context?: string | null
   interrupted?: boolean
@@ -5145,6 +5146,7 @@ export interface CanonicalSubmitParams {
   api_text?: string | null
   model_override?: CanonicalModelOverride | null
   clarify_batch?: boolean
+  contract_revision?: string | null
 }
 export interface CanonicalAttachment {
   path: string

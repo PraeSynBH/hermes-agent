@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
 
+from hermes_cli.gateway_restart_window import RESTART_WINDOW_REASON, declared_restart_window
+
 if TYPE_CHECKING:
     from gateway.runtime_contract import RuntimeState
+    from hermes_cli.gateway_restart_window import DeclaredRestartWindow
 
 # Total startup deadline a client waits for a cold daemon. A cold boot imports the whole
 # runtime, seeds the skill library and warms the turn machinery: ~10-20 s on a loaded
@@ -64,6 +67,11 @@ class GatewayDiscovery:
     # (``runtime_exited``), or the unsafe local control node a discovery refused (path, owner uid or
     # mode, and the fix); never raw peer data.
     detail: str | None = None
+    # Seconds after which a RETRYABLE verdict is worth retrying — set only when the caller's next
+    # move is to wait, not to give up: today the declared restart window
+    # (``gateway_restart_window``), whose remaining lease used to be spent as an admission budget
+    # and reported as the boot it never was (PRA-6692).
+    retry_after_s: float | None = None
 
 
 def attachable(result: GatewayDiscovery) -> bool:
@@ -507,6 +515,37 @@ def _fenced_verdict(home: Path, timeout: float, fence: str) -> GatewayDiscovery:
     return GatewayDiscovery("draining", reason_code="update_paused", detail=fence)
 
 
+def _restart_window_verdict(home: Path, window: DeclaredRestartWindow,
+                            timeout: float, *, new_work: bool = False) -> GatewayDiscovery:
+    """What ensure answers while a declared restart window is open, and never a spawned owner.
+
+    A window is not a boot: the owning job stopped the gateway on purpose and will start it itself,
+    so waiting here can only spend the caller's budget on a daemon nobody asked for. The verdict is
+    RETRYABLE and carries the lease it is waiting on (``retry_after_s``), which is the one thing a
+    dispatcher needs to re-queue instead of charging this host with a runtime failure (PRA-6692).
+
+    Two owners are not the fence:
+
+    * a ``ready`` owner — the job started it and the lease has not been cleared yet, so the answer
+      is the owner;
+    * a restart's after-turn wait (``draining``/``restart_wait``) for an INTERACTIVE client, whose
+      job is to answer a turn parked on approval/clarify (#139041).
+
+    That wait is not one for a client with NEW WORK. It closed admission at T=0 of the drain, so a
+    new-work client attaching to it dies at its first submit with ``runtime_draining`` (101 runs
+    across the 21:38 and 23:05-23:25 drains, PRX-5791/PRX-5787) — and inside a declared window there
+    is no replacement to wait for until the owning job starts one, which is longer than the whole
+    admission budget. Answering ``restarting`` for that client costs it no budget and loses no work.
+    """
+    observed = discover_gateway_endpoint(home, timeout=timeout)
+    if observed.state == "ready":
+        return observed
+    if attachable(observed) and not new_work:
+        return observed
+    return GatewayDiscovery("draining", reason_code=RESTART_WINDOW_REASON,
+                            detail=window.describe(), retry_after_s=float(window.remaining_s))
+
+
 _REPLACE_FAILED_DETAIL = "an older Hermes gateway still owns this profile after a stop; run: hermes gateway stop"
 # ``draining`` reasons after which the owner is going away by itself: its own idle exit, or the
 # older-Hermes owner this call just stopped. Ensure waits it out and starts the current owner.
@@ -535,7 +574,7 @@ def _observe_replacing_stale(home: Path, probe_timeout: float, deadline: float,
 
 
 def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT_ENSURE_TIMEOUT,
-                           idle_exit: bool = False) -> GatewayDiscovery:
+                           idle_exit: bool = False, new_work: bool = False) -> GatewayDiscovery:
     """Ensure once; pending remains pending at deadline.
 
     Never installs anything. The one owner it replaces is a gateway an older Hermes left running on
@@ -549,6 +588,8 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
     ``idle_exit``: an unmanaged daemon this call starts ends itself once idle (client entrypoints:
     chat, TUI, cron/kanban/ACP clients). A gateway that is ending that way reports ``draining``
     (``idle_exit``); this call waits for it to go and starts the replacement transparently.
+    ``new_work``: this caller has a turn to place, so inside a declared restart window a parkable
+    owner (a restart's after-turn wait) is not an answer for it — see ``_restart_window_verdict``.
     """
     import time
     from hermes_cli.gateway_runtime_service import (
@@ -567,7 +608,6 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
     # A gateway ending through its own idle exit is not a refusal: wait for it to go (its lock is
     # still held for a moment after its control socket closes, which reads as "starting"), then
     # start the replacement this call owes the client.
-    retiring = False
     replaced: set[Path] = set()
     # The one named verdict for an owner that took the connection and stopped answering. It is not
     # a boot, so it never becomes "starting"; it is retried while the budget lasts and reported if
@@ -585,6 +625,12 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
         while True:
             if fence := _update_fence(fence_homes):
                 return _fenced_verdict(home, remaining(deadline), fence)
+            # A declared restart window is read BEFORE the spawn branch below, so no client — cron,
+            # kanban, a chat attach, the dashboard — can put an owner on the host while the job that
+            # declared the window is still rewriting stores (PRA-6692: an external spawn at
+            # 14:08:36 landed inside the maintenance pass and made it refuse every held store).
+            if window := declared_restart_window(fence_homes):
+                return _restart_window_verdict(home, window, probe_timeout(), new_work=new_work)
             # Poll BEFORE discovering: an exit observed first, then "absent", cannot be a child that
             # published its owner a moment later. A winning racer shows up as starting/ready instead.
             status = child.poll() if child is not None else None
@@ -599,7 +645,10 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
             # This observation answered, so a silence seen earlier is not what the budget was spent on.
             stalled = None
             if observed.state == "draining" and observed.reason_code in _RETIRING:
-                retiring, requested, child = True, False, None
+                # The owner is ending by itself (its own idle exit, or the older-Hermes owner this
+                # call just stopped): it will never serve this client, so the next ``absent`` is a
+                # start this call owes — never a reason to keep waiting for it.
+                requested, child = False, None
                 time.sleep(min(0.1, remaining(deadline)))
                 continue
             if observed.state not in {"absent", "starting"}:
@@ -611,10 +660,14 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
                 from hermes_cli.gateway_runtime_start import startup_failure_report
                 return GatewayDiscovery("inaccessible", reason_code="runtime_exited",
                                         detail=startup_failure_report(child_home, child_offset, status, child.pid))
-            if observed.state == "starting" and not retiring:
-                requested = True
-            if observed.state == "absent":
-                retiring = False
+            # ``requested`` means THIS invocation asked for an owner, and only the two start branches
+            # below (a service start, a spawn) and a pending multiplexer reservation may set it.
+            # Merely observing another process's ``starting`` used to latch it True for the rest of
+            # the budget: on 2026-10-21 the boot that was being observed died at 14:07:08, the
+            # runtime lock was free, and nothing booted until an external watchdog spawned at
+            # 14:08:36 — 88 s in which six clients watched a ``starting`` that could never answer
+            # because no owner existed (PRA-6692, secondary). A boot that dies without answering is
+            # an ``absent`` on the next observation, and that is a start this call owes the client.
             reserved = _starting_multiplexer_root(home) if observed.state == "absent" and not requested else None
             if reserved is not None and (reason := _standalone_multiplexer_reason(reserved)):
                 return GatewayDiscovery("inaccessible", reason_code="profile_parked", detail=reason)
@@ -622,7 +675,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
             # spawn a competing per-profile daemon while its reservation is pending.
             if reserved is not None:
                 requested = True
-            if observed.state == "absent" and not requested:
+            if observed.state == "absent" and not requested and child is None:
                 # A named profile the default multiplexer serves has no daemon of its own: start
                 # (or await) the MULTIPLEXER. A per-profile spawn here would become a second owner
                 # that blocks the multiplexer's next all-or-nothing reserve.

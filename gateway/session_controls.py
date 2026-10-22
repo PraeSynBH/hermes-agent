@@ -23,16 +23,86 @@ def _refusal_data(exc: RuntimeStoreError) -> dict:
     """The ``error.data`` for one ``RuntimeStoreError``: always the reason, plus the field and the
     detail when the raiser named them."""
     data = {'reason': exc.reason}
-    for key in ('field', 'detail'):
+    for key in ('field', 'detail', 'client_revision'):
         value = getattr(exc, key, None)
         if value:
             data[key] = value
     for key in ('revision', 'execution_generation'):
         if isinstance(getattr(exc, key, None), int):
             data[key] = getattr(exc, key)
+    if getattr(exc, 'gateway_revision', None):
+        # The contract THIS process serves, beside the client's declaration: a skew report has to
+        # name both sides or the operator cannot tell which process needs replacing (SOU-3318).
+        data['gateway_revision'] = exc.gateway_revision
     if getattr(exc, 'admitted', None) is False:
         data['admitted'] = False  # nothing admitted yet: the sender may finalize with ``bot_relay.settle``
     return data
+
+
+def _declared_contract(params) -> str | None:
+    """The contract revision the client declared on this request, or ``None`` when it declared none."""
+    from gateway import contract_revision as contract
+    declared = params.get(contract.REVISION_PARAM) if isinstance(params, dict) else None
+    return declared.strip() if isinstance(declared, str) and declared.strip() else None
+
+
+def _skew_refusal(params, field: str, named: str):
+    """``contract_version_mismatch`` when the client declared a contract revision this process does not serve.
+
+    A long-lived gateway keeps the allow-lists it imported at boot (SOU-3316: a merge added
+    ``one_shot`` while the serving process held the old set) and a freshly spawned client knows
+    nothing about that. Before this, the disagreement was indistinguishable from a malformed
+    request: the client could not tell "you are too old for me" from "you sent a bad key", so it
+    neither stopped retrying nor said which process needed replacing. The refusal now carries the
+    field, the client's revision and this process's boot revision.
+
+    Only a DECLARED revision can be compared. A client that declares nothing gets today's
+    closed-set ``invalid_params`` (``None`` here) — a discriminator, never a looser validation.
+    """
+    from gateway import contract_revision as contract
+    declared, serving = _declared_contract(params), contract.boot_revision()
+    if not declared or not serving or declared == serving:
+        return None
+    return RuntimeStoreError(
+        'contract_version_mismatch', field=field,
+        detail=f'{named}; client {contract.describe(declared)} != gateway {contract.describe(serving)}',
+        gateway_revision=serving, client_revision=declared)
+
+
+def _submit_param_refusal(params, forbidden) -> RuntimeStoreError:
+    """The refusal for submit params the serving contract does not define: skew first, else invalid."""
+    keys = sorted(forbidden)
+    named = f'unexpected keys: {keys}'
+    return _skew_refusal(params, keys[0], named) or RuntimeStoreError(
+        'invalid_params', field='submission_params', detail=named)
+
+
+def _canonical_param_refusal(params, problems) -> RuntimeStoreError:
+    """The dispatcher's refusal for a params model mismatch (unknown/missing/ill-typed keys)."""
+    named = f'unknown or missing keys: {", ".join(problems)}'
+    return _skew_refusal(params, problems[0], named) or RuntimeStoreError(
+        'invalid_params', field='params', detail=named)
+
+
+def _refuse_malformed_declaration(params) -> None:
+    """A declaration that is not a non-empty string is a client bug, not a skew: keep it closed."""
+    from gateway import contract_revision as contract
+    declared = params.get(contract.REVISION_PARAM)
+    if declared is not None and not _declared_contract(params):
+        raise RuntimeStoreError('invalid_params', field=contract.REVISION_PARAM,
+                                detail='contract_revision must be a non-empty string')
+
+
+#: The submit params THIS process's wire contract defines. Read at call time, not captured in the
+#: function body: a running gateway holds the set it imported at boot, and a merge that widens it is
+#: invisible to that process — the skew the revision fence names (SOU-3316/SOU-3318). Keeping it a
+#: module constant is what lets a test stand a pre-merge contract up and drive the real path.
+SUBMIT_PARAMS = frozenset({
+    'session_id', 'text', 'submission_id', 'input_id', 'queued', 'attachments', 'finite',
+    'unattended', 'one_shot', 'surface', 'voice_context', 'interrupted', 'voice_turn',
+    'display_kind', 'title_preview', 'turn_author', 'api_text', 'model_override', 'clarify_batch',
+    'contract_revision',
+})
 
 
 def _profile_label(profile_id) -> str:
@@ -276,9 +346,16 @@ class AuthorityConnection:
         contract = CANONICAL_METHODS.get(method)
         if contract is not None and (problems := canonical_param_problems(contract, params)):
             # The declared wire contract (``tui_gateway/contracts/canonical.py``) is the closed
-            # key set: an unknown or missing key never reaches the handler.
+            # key set: an unknown or missing key never reaches the handler. ``data.fields`` already
+            # carries the offending key paths to the client; the log line names them too, so the
+            # gateway log alone explains a run that never reached a handler (PRA-6722/PRA-6720).
+            # A client that DECLARED a different contract revision gets the skew named instead —
+            # the refusal a stale one-shot met as a bare ``invalid_params`` for 3h24m
+            # (SOU-3316/SOU-3318) — with both revisions on the frame.
+            exc = _canonical_param_refusal(params, problems)
+            _log_refusal(getattr(self.actor, 'profile_id', None), method, exc)
             return {'jsonrpc': '2.0', 'id': rid, 'error': {
-                'code': 4001, 'message': 'invalid_params', 'data': {'reason': 'invalid_params', 'fields': problems}}}
+                'code': 4001, 'message': exc.reason, 'data': {**_refusal_data(exc), 'fields': problems}}}
         original_params = dict(params)
         contract = contract or METHODS.get(method)
         authority = self.authority
@@ -429,19 +506,24 @@ class AuthorityConnection:
         async with lock:
             return await self._create(params, title)
 
-    async def _create(self, params, title):
+    def _stage_create(self, params, title):
+        """The reads that decide create-vs-resume, and the staging that follows them, in one worker.
+
+        Returns ``(ref, staged)``: ``staged`` is False when the title/retry resolve already named an
+        existing session, True when this call minted (or re-staged) a creation the caller commits.
+
+        ``session.create`` used to run all of this on the owner loop, and the loop's single thread
+        made the pair atomic. A read that misses the read pool degrades to the writer connection
+        under ``SessionDB._lock`` (``hermes_state._read_ctx``'s documented fallback -- ``acquire()``
+        refuses descriptor work on a loop thread), so a held writer froze every session, timer and
+        socket this profile serves while a chat was created. gateway.error.log 2026-10-22 07:47:16
+        names it on the shared gateway: ``session.create`` -> ``stage_local_session:288`` ->
+        ``get_session`` -> ``_read_ctx:971`` (``with self._lock:``), a 40.1s probe-unanswered stall.
+        """
         from gateway.session_local import stage_local_session, staged_creation_follows
-        from gateway.session_local_recovery import restore_local_session
-        from gateway.session_local_title import resolve_titled_session, title_new_session
+        from gateway.session_local_title import resolve_titled_session
         from gateway.session_policy import BYPASS_FIELDS
-        from gateway.session_runtime_workers import tracked_write
-        from hermes_state_local import commit_local_session
-        # Bot Mode's forever-chat mint: born hidden from the sidebar. `follow_profile_config` stays in
-        # the frozen request: the policy re-reads the profile's current route every turn.
-        hidden = params.pop('hidden', False)
-        if type(hidden) is not bool:
-            raise RuntimeStoreError('invalid_params', field='hidden', detail='must be a boolean')
-        ref = title and resolve_titled_session(self.authority, self.actor, title, missing_ok=True)
+        ref = resolve_titled_session(self.authority, self.actor, title, missing_ok=True) if title else title
         if (not ref and title == 'Bot Chat'
                 and not any(params.get(name) is True for name in BYPASS_FIELDS)
                 and staged_creation_follows(self.authority, self.actor, params.get('request_id'))):
@@ -449,33 +531,54 @@ class AuthorityConnection:
             # or ignore-user-config launch never reads the profile, so it stays frozen. An exact
             # retry of a creation staged without the flag keeps that frozen request.
             params.setdefault('follow_profile_config', True)
-        if not ref:
-            skills_prompt = None
-            if 'skills' in params:
-                # Skill files are read off the owner loop, once per NEW session (a retried
-                # request_id resumes the frozen policy and never re-renders).
-                from gateway.session_local_recovery import local_identity
-                from gateway.session_policy import render_launch_skills
-                params.setdefault('request_id', uuid.uuid4().hex)
-                sid = local_identity(self.authority.profile_id, self.actor.subject, params['request_id'])
-                if self.authority.db.get_session(sid) is None:
-                    skills_prompt = await asyncio.to_thread(render_launch_skills, params, sid)
-            # Host-bound client values apply only over the gateway's own ticketed attach (run_api).
-            ref = stage_local_session(self.authority, self.actor, params, skills_prompt=skills_prompt,
-                                      client_local=self.native_owner)
+        if ref:
+            return ref, False  # resolved: an existing session, nothing staged
+        skills_prompt = None
+        if 'skills' in params:
+            # Skill files are read once per NEW session (a retried request_id resumes the frozen
+            # policy and never re-renders), in this worker, never in front of a turn.
+            from gateway.session_local_recovery import local_identity
+            from gateway.session_policy import render_launch_skills
+            params.setdefault('request_id', uuid.uuid4().hex)
+            sid = local_identity(self.authority.profile_id, self.actor.subject, params['request_id'])
+            if self.authority.db.get_session(sid) is None:
+                skills_prompt = render_launch_skills(params, sid)
+        # Host-bound client values apply only over the gateway's own ticketed attach (run_api).
+        return stage_local_session(self.authority, self.actor, params, skills_prompt=skills_prompt,
+                                   client_local=self.native_owner), True
+
+    async def _create(self, params, title):
+        from gateway.session_local_recovery import restore_local_session
+        from gateway.session_local_title import title_new_session
+        from gateway.session_runtime_workers import tracked_write
+        from hermes_state_local import commit_local_session
+        # Bot Mode's forever-chat mint: born hidden from the sidebar. `follow_profile_config` stays in
+        # the frozen request: the policy re-reads the profile's current route every turn.
+        hidden = params.pop('hidden', False)
+        if type(hidden) is not bool:
+            raise RuntimeStoreError('invalid_params', field='hidden', detail='must be a boolean')
+        # One owner step per authority: ``_stage_create`` does the reads and the staging in a worker
+        # (see there), and this lock keeps the pair atomic the way the loop's single thread used to,
+        # so two creates carrying one request_id still converge instead of racing.
+        lock = getattr(self.authority, '_staged_create_lock', None)
+        if lock is None:
+            lock = self.authority._staged_create_lock = asyncio.Lock()
+        async with lock:
+            ref, staged = await asyncio.to_thread(self._stage_create, params, title)
+        if staged:
             if isinstance(ref, dict):
                 # The creation commit runs off the owner loop: a held writer must not freeze
                 # every session behind one new chat (N50).
                 receipt = ref
                 await tracked_write(self.authority, partial(
                     commit_local_session, self.authority.db, epoch=self.authority.epoch, receipt=receipt))
-                ref = restore_local_session(self.authority, receipt['session_id'])
+                ref = await asyncio.to_thread(restore_local_session, self.authority, receipt['session_id'])
             # `--accept-hooks`: record this launch's consent; ``resume`` below registers the hooks.
             if params.get('accept_hooks') is True:
                 from gateway.session_policy import accept_launch_hooks, restore_policy
                 from hermes_state_local import local_receipt
-                policy = restore_policy(local_receipt(self.authority.db, ref.session_id)['policy'])
-                await asyncio.to_thread(accept_launch_hooks, policy)
+                saved = await asyncio.to_thread(local_receipt, self.authority.db, ref.session_id)
+                await asyncio.to_thread(accept_launch_hooks, restore_policy(saved['policy']))
             if title:
                 await tracked_write(self.authority, partial(title_new_session, self.authority, ref, title))
             if hidden:
@@ -748,14 +851,20 @@ class AuthorityConnection:
         """The admission a ``prompt.submit``-shaped request asks for (``prompt.replace_queued`` too)."""
         if ref.session_id not in self.subscriptions:
             raise RuntimeStoreError('permission_denied')
-        forbidden = set(params) - {'session_id', 'text', 'submission_id', 'input_id', 'queued', 'attachments', 'finite', 'unattended',
-                                   'surface', 'voice_context', 'interrupted', 'voice_turn', 'display_kind', 'title_preview',
-                                   'turn_author', 'api_text', 'model_override', 'clarify_batch'}
+        forbidden = set(params) - SUBMIT_PARAMS
         if forbidden:
-            raise RuntimeStoreError('invalid_params')
+            # PRA-6722: a bare ``invalid_params`` cost a 3h10m/47-run outage (PRA-6720) because the
+            # operator could not tell an unknown key from a bad type. The key set stays closed; the
+            # refusal names the check and the keys, so the run log's one line is the whole
+            # diagnosis — and names the contract skew when the client declared a revision this
+            # process does not serve (SOU-3318).
+            raise _submit_param_refusal(params, forbidden)
+        _refuse_malformed_declaration(params)
         request_id = params.get('submission_id') or params.get('input_id')
         if not isinstance(request_id, str) or not request_id:
-            raise RuntimeStoreError('invalid_params')
+            named = 'submission_id' if 'submission_id' in params else 'input_id'
+            raise RuntimeStoreError('invalid_params', field='submission_id',
+                                    detail=f'{named} must be a non-empty string')
         from gateway.session_finite import admit_finite
         from gateway.session_display import submit_display_fields
         from gateway.session_surface import submit_surface_fields

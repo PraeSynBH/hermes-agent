@@ -210,6 +210,10 @@ class CanonicalSubmitParams(CanonicalSessionParams):
     attachments: list[CanonicalAttachment] | None = None
     finite: bool = False
     unattended: bool = False
+    # The submitting one-shot exits with its turn, so a turn lost across an owner restart may be
+    # settled without a human instead of pausing the session forever (PRX-5850). Same grant as
+    # ``unattended`` in ``gateway/session_finite.py::admit_finite``.
+    one_shot: bool = False
     surface: str | None = None
     voice_context: str | None = None
     interrupted: bool = False
@@ -228,6 +232,11 @@ class CanonicalSubmitParams(CanonicalSessionParams):
     # The submitter answers the clarify tool's whole batch in one ``clarify`` server request (main's
     # batch panel); without it the turn's viewers get one ``clarify.request`` card per question.
     clarify_batch: bool = False
+    # The wire-contract revision this client was built against (``gateway/contract_revision.py``).
+    # Optional and additive: a client that omits it is refused exactly as before (closed-set
+    # ``invalid_params``), and an owner that sees an undeclared key beside a DECLARED mismatch
+    # answers ``contract_version_mismatch`` naming both revisions instead (SOU-3318).
+    contract_revision: str | None = None
 
 
 class CanonicalVoiceStopped(Result):

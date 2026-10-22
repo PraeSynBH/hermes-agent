@@ -38,11 +38,11 @@ async def test_delete_of_secondary_profile_session_does_not_409(tmp_path, monkey
             from gateway.session import SessionEntry
             store = runner.session_store
             now = datetime.now(UTC)
-            store._entries['agent:main:telegram:111'] = SessionEntry(
-                session_key='agent:main:telegram:111', session_id=ref.session_id,
-                created_at=now, updated_at=now)
             with store._lock:
-                store._save()
+                store._entries['agent:main:telegram:111'] = SessionEntry(
+                    session_key='agent:main:telegram:111', session_id=ref.session_id,
+                    created_at=now, updated_at=now)
+            store._save()
             result = await mutate_session(authority, actor, ref, dict(
                 session_id=ref.session_id, request_id='delete', expected_revision=0,
                 expected_generation=0, operation='delete', payload={}))

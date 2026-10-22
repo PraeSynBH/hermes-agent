@@ -19,6 +19,9 @@ from hermes_constants import display_hermes_home
 SITE_FAILURE_CODES = frozenset({
     "context_overflow", "truncated", "invalid_response", "empty_response", "loop_error",
     "interpreter_shutdown", "session_busy", "gateway_connection", "host_error",
+    # A wire-contract skew between this client and the serving process (SOU-3318): the copy names
+    # both revisions and the restart, so it must not be re-classified as an unknown provider fault.
+    "contract_version_mismatch",
 })
 
 
@@ -50,6 +53,13 @@ AUTOMATION_INTERRUPTED_NOTICE = (
     "An automated delivery was interrupted and was not run again. Some "
     "actions may already have run; verify their effects."
 )
+# A finite one-shot turn (``hermes chat -q`` / ``hermes -z``) lost the same way: its submitting
+# process exited, so the caller re-runs its command rather than being told to resend into a chat
+# that no longer exists (PRX-5850: a stuck one-shot admission blocked every later wake).
+ONE_SHOT_INTERRUPTED_NOTICE = (
+    "This one-shot turn was interrupted and was not run again. Some actions may already have "
+    "run; verify their effects before re-running it."
+)
 # ``messages.display_kind`` of that row: display-only (stripped before every provider request),
 # so renderers show a Hermes notice and room pollers never read it as the model's reply.
 FAILED_TURN_DISPLAY_KIND = "failed_turn"
@@ -60,6 +70,7 @@ def untyped_failed_turn_display_kind(role: Any, content: Any) -> Optional[str]:
     (exact notice text, so a real reply quoting it stays a reply); read-side only."""
     if role == "assistant" and isinstance(content, str) and content.strip() in (
         FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE, AUTOMATION_INTERRUPTED_NOTICE,
+        ONE_SHOT_INTERRUPTED_NOTICE,
     ):
         return FAILED_TURN_DISPLAY_KIND
     return None

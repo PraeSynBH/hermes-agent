@@ -62,11 +62,15 @@ class SessionPromptPinMixin:
             entry = self._entry_locked(session_key)
             if entry is None or (expected_session_id is not None and entry.session_id != expected_session_id):
                 return False
-            if entry.prompt_pin != cleaned:
-                self._save_entry(
-                    session_key, entry_data=replace(entry, prompt_pin=cleaned).to_dict(), lock_held=True)
+            if entry.prompt_pin == cleaned:
+                return True
+            candidate, observed = replace(entry, prompt_pin=cleaned).to_dict(), entry.prompt_pin
+        # Durable before published, and off ``_lock``: the UPSERT is I/O (PRX-5789).
+        self._save_entry(session_key, entry_data=candidate)
+        with self._lock:
+            if self._entries.get(session_key) is entry and entry.prompt_pin == observed:
                 entry.prompt_pin = cleaned
-            return True
+        return True
 
     def get_prompt_pin(
         self, session_key: str, *, expected_session_id: Optional[str] = None,

@@ -487,13 +487,13 @@ class InProcessCronScheduler(CronScheduler):
         while not stop_event.is_set():
             ok = False
             try:
-                if can_dispatch is not None and not can_dispatch():
-                    logger.debug("Cron dispatch paused while gateway drains existing work")
-                else:
-                    cron_tick(
-                        verbose=False, adapters=adapters, loop=loop, sync=False,
-                        can_dispatch=can_dispatch,
-                    )
+                # A drain is the tick's own business: tick() runs the loud hold (one WARNING per
+                # boundary, last_fire_error stamped, ERROR when the drain drags on) instead of being
+                # pre-empted here with a DEBUG line nothing joins back to the missing job (SOU-3252).
+                cron_tick(
+                    verbose=False, adapters=adapters, loop=loop, sync=False,
+                    can_dispatch=can_dispatch,
+                )
                 ok = True
             except BaseException as e:
                 # BaseException, not Exception: a SystemExit must not silently kill the ticker;
@@ -613,31 +613,31 @@ class InProcessCronScheduler(CronScheduler):
                 _tick_error = f"{type(e).__name__}: {e}"
                 consecutive_failures = _note_tick_failure(e, consecutive_failures)
             try:
-                if can_dispatch is not None and not can_dispatch():
-                    logger.debug("Cron dispatch paused while gateway drains existing work")
-                else:
-                    for _pname, home in cycle_homes:
-                        try:
-                            with _profile_cron_scope(home):
-                                cron_tick(
-                                    verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
-                                    sync=False, can_dispatch=can_dispatch,
-                                )
-                        except CronTickYielded as e:
-                            # Yield for THIS profile only; one fresh gateway must not stop others.
-                            logger.info("Cron tick yielded for profile at %s: %s", home, e)
-                            _profile_errors[str(home)] = f"{type(e).__name__}: {e}"
-                        except BaseException as e:
-                            # THIS profile only; BaseException as in the single-profile loop.
-                            logger.error(
-                                "Cron tick error for profile at %s: %s", home, e, exc_info=True
+                # Per profile, INSIDE the scope: the drain's marker lives in the draining home and
+                # the hold stamps that profile's jobs, so it must not be decided for all profiles
+                # from the launch home with a DEBUG line (SOU-3252).
+                for _pname, home in cycle_homes:
+                    try:
+                        with _profile_cron_scope(home):
+                            cron_tick(
+                                verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
+                                sync=False, can_dispatch=can_dispatch,
                             )
-                            _profile_errors[str(home)] = f"{type(e).__name__}: {e}"
-                            if _cycle_exc is None or _is_fd_exhaustion(e):
-                                _cycle_exc = e
-                    ok = not _profile_errors
-                    if _cycle_exc is not None:
-                        consecutive_failures = _note_tick_failure(_cycle_exc, consecutive_failures)
+                    except CronTickYielded as e:
+                        # Yield for THIS profile only; one fresh gateway must not stop others.
+                        logger.info("Cron tick yielded for profile at %s: %s", home, e)
+                        _profile_errors[str(home)] = f"{type(e).__name__}: {e}"
+                    except BaseException as e:
+                        # THIS profile only; BaseException as in the single-profile loop.
+                        logger.error(
+                            "Cron tick error for profile at %s: %s", home, e, exc_info=True
+                        )
+                        _profile_errors[str(home)] = f"{type(e).__name__}: {e}"
+                        if _cycle_exc is None or _is_fd_exhaustion(e):
+                            _cycle_exc = e
+                ok = not _profile_errors
+                if _cycle_exc is not None:
+                    consecutive_failures = _note_tick_failure(_cycle_exc, consecutive_failures)
             except BaseException as e:
                 logger.error("Cron tick error: %s", e, exc_info=True)
                 _tick_error = f"{type(e).__name__}: {e}"

@@ -94,9 +94,9 @@ def _tick_admitted(
     headless: bool = False):
     """Check and run all due jobs. File-locked so only one tick runs at a time (gateway ticker vs
     standalone daemon / manual tick). ``can_dispatch``: optional gate; false leaves due jobs for the
-    next allowed tick. ``headless``: the tick runs outside any gateway (system crontab, ``hermes
-    cron tick``) and must refuse agent jobs rather than spawn one. Returns the number of jobs
-    executed (0 if another tick holds the lock)."""
+    next allowed tick and records why (cron/scheduler_drain_gate.py). ``headless``: the tick runs
+    outside any gateway (system crontab, ``hermes cron tick``) and must refuse agent jobs rather than
+    spawn one. Returns the number of jobs executed (0 if another tick holds the lock)."""
     from cron import scheduler as _sched
 
     # Stale-code yield gate — BEFORE the lock race. A process whose checkout was updated under it
@@ -118,9 +118,16 @@ def _tick_admitted(
             if _estop_check_paused("cron", _sched.logger):
                 return 0
 
-        if can_dispatch is not None and not can_dispatch():
-            _sched.logger.debug("Cron dispatch paused while gateway drains existing work")
-            return 0
+        if can_dispatch is not None:
+            from cron import scheduler_drain_gate as _drain_gate
+
+            if can_dispatch():
+                _drain_gate.note_dispatch_resumed()
+            else:
+                # A held slot is never silent: one WARNING per boundary with the due job ids, the
+                # reason stamped on each job, and an ERROR once the drain outlives the tightest
+                # served detector (SOU-3252).
+                return _drain_gate.hold_for_drain()
 
         _pre_dispatch_housekeeping(_sched, headless)
         # Periodic worktree GC (6h, threaded) — the only sweep gateway-only boxes get.

@@ -12,6 +12,7 @@ import time
 
 # The owner's protocol name; session_contract is dependency-free (no config/plugins load).
 from gateway.session_contract import CANONICAL_GATEWAY_PROTOCOL as GATEWAY_WS_PROTOCOL
+from hermes_cli.gateway_restart_window import RESTART_WINDOW_REASON
 
 GATEWAY_WS_TICKET_PREFIX = "hermes-gateway-ticket."
 # Per-request answer budget. Owner verbs are admissions/reads that answer promptly; the one that
@@ -142,6 +143,54 @@ def gateway_ws_target(endpoint, ticket):
     return url, [GATEWAY_WS_PROTOCOL, GATEWAY_WS_TICKET_PREFIX + ticket]
 
 
+def contract_submit_params() -> dict:
+    """The params a client attaches to ``prompt.submit`` to say which wire contract it was built
+    against. Empty when this install has no contract document to hash, which keeps the request
+    byte-identical to what an older client sends (SOU-3318)."""
+    from gateway.contract_revision import declaration
+
+    return declaration()
+
+
+def declaration_refused(error) -> bool:
+    """True when an owner refused a submit ONLY because of the optional contract declaration.
+
+    ``contract_revision`` exists to make a refusal diagnosable; it must never be the reason a
+    request fails. A client spawned from a tree newer than the running gateway declares a param
+    that process's param model does not define yet, and PRA-6722 made that refusal exact:
+    ``invalid_params`` naming that one key in ``data.fields``.
+
+    Anything else propagates: a refusal naming another key too (dropping the declaration would
+    leave a genuinely malformed request looking like an old owner), a bare refusal with no key
+    named (nothing proves the declaration was the cause), and ``contract_version_mismatch`` (the
+    skew the fence exists to report).
+    """
+    if not isinstance(error, GatewayRPCError) or str(error) != "invalid_params":
+        return False
+    from gateway.contract_revision import REVISION_PARAM
+
+    data = error.data if isinstance(error.data, dict) else {}
+    named = [str(name).strip() for name in (data.get("fields") or ()) if str(name).strip()]
+    if not named:
+        field = str(data.get("field") or "").strip()
+        named = [field] if field else []
+    return bool(named) and set(named) == {REVISION_PARAM}
+
+
+def declaration_retry_params(error, params: dict) -> dict | None:
+    """The params to resend when *error* was the declaration's refusal alone, else ``None``.
+
+    The caller resends exactly once, under the SAME admission identity: the param gate refuses
+    before anything is admitted, and a resend carrying an identical ``submission_id``/``input_id``
+    cannot double-admit even if that ever stops being true.
+    """
+    from gateway.contract_revision import REVISION_PARAM
+
+    if REVISION_PARAM not in params or not declaration_refused(error):
+        return None
+    return {key: value for key, value in params.items() if key != REVISION_PARAM}
+
+
 class GatewayClientError(ValueError):
     pass
 
@@ -156,6 +205,29 @@ class GatewayRPCError(GatewayClientError):
         super().__init__(reason)
         self.code = code
         self.data = data or {}
+
+
+class GatewayContractSkewError(GatewayRPCError):
+    """The owner serves a different wire contract revision than this client was built against.
+
+    SOU-3316/SOU-3318: distinguishable from ``invalid_params`` (a malformed request this client can
+    fix) and from a transport failure (retry elsewhere). Neither side is wrong alone — the serving
+    PROCESS is older than the tree — so the only correct verdict is to fail this run fast, name
+    both revisions, and let the deploy replace the gateway. Never retried: a retry against the same
+    process answers identically, which is what turned a merge into a 3h24m fleet outage.
+    """
+
+    reason = "contract_version_mismatch"
+
+    def __init__(self, code=None, data=None):
+        data = data if isinstance(data, dict) else {}
+        self.gateway_revision = str(data.get("gateway_revision") or "").strip() or None
+        self.client_revision = str(data.get("client_revision") or "").strip() or None
+        super().__init__(self.reason, code, data)
+
+    @property
+    def retryable(self) -> bool:
+        return False
 
 
 class GatewayAdmissionTimeout(GatewayClientError):
@@ -280,8 +352,11 @@ def rpc_error(error):
     data = _bounded_error_data(error.get("data"))
     code = error.get("code")
     reason = _bounded_reason(error.get("message", "request_failed")) or _bounded_reason(data.get("reason"))
-    return GatewayRPCError(reason or "request_failed",
-                           code if isinstance(code, int) and not isinstance(code, bool) else None, data)
+    bounded_code = code if isinstance(code, int) and not isinstance(code, bool) else None
+    if reason == GatewayContractSkewError.reason:
+        # A distinct verdict the caller must not retry (SOU-3318), never a generic RPC refusal.
+        return GatewayContractSkewError(bounded_code, data)
+    return GatewayRPCError(reason or "request_failed", bounded_code, data)
 
 
 class GatewayUnavailableError(GatewayClientError):
@@ -291,6 +366,26 @@ class GatewayUnavailableError(GatewayClientError):
     def __init__(self, message, state):
         super().__init__(message)
         self.state = state
+        #: Seconds until the host is worth asking again. None = no owner-side schedule to honour.
+        self.retry_after_s: float | None = None
+
+    @property
+    def retryable(self) -> bool:
+        """Whether re-dispatching this run can succeed without anything on this host changing."""
+        return self.retry_after_s is not None
+
+
+class GatewayRestartingError(GatewayUnavailableError):
+    """A declared restart window owns the gateway: a bounded, RETRYABLE verdict, never a boot.
+
+    Raised the moment the window is read, so a run dispatched into one fails in seconds and can be
+    re-queued for ``retry_after_s`` instead of spending its whole admission budget on a daemon the
+    owning job has deliberately stopped (PRA-6692: 6 runs, 120 s each, inside a 187 s window).
+    """
+
+    def __init__(self, message: str, retry_after_s: float):
+        super().__init__(message, "restarting")
+        self.retry_after_s = retry_after_s
 
 
 class EventQueue(asyncio.Queue):
@@ -581,7 +676,8 @@ async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
                                 f"(phase={phase}, elapsed={time.monotonic() - started:.1f}s, "
                                 "admission budget spent before an owner could be ensured)")
                 break
-            result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True, timeout=cap)
+            result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True, timeout=cap,
+                                             new_work=new_work)
             if result.reason_code == "update_paused":
                 fence = getattr(result, "detail", None) or "update fence live"
                 if left(1.0) <= 0:
@@ -589,6 +685,18 @@ async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
                 phase = "update-fence"
                 await asyncio.sleep(min(UPDATE_FENCE_POLL_INTERVAL_S, left(UPDATE_FENCE_POLL_INTERVAL_S)))
                 continue
+            if result.reason_code == RESTART_WINDOW_REASON:
+                # A declared restart window: the owning job stopped the gateway and will start it
+                # itself, on a schedule this client can read. This is the one case in admission that
+                # must NOT wait — the outage is longer than the budget by design (187 s vs 120 s), so
+                # waiting can only convert a retryable window into a runtime-boot failure. Fail in
+                # seconds, name the lease, let the dispatcher re-queue (PRA-6692).
+                left_s = result.retry_after_s if result.retry_after_s is not None else 0.0
+                raise GatewayRestartingError(
+                    "Gateway restarting: a declared restart window owns the gateway, so this run was "
+                    f"never admitted (elapsed={time.monotonic() - started:.1f}s, "
+                    f"retryAfterS={round(left_s)}, retryable=true): "
+                    f"{result.detail or 'restart window open'}", float(left_s))
             if new_work and result.state == "draining" and attachable(result):
                 drain = f"{result.state}: {result.reason_code or 'draining'}"
                 if left(1.0) <= 0:

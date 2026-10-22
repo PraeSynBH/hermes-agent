@@ -763,6 +763,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Snapshot the revision while sys.modules matches disk so a later `git pull` is detected safely.
     from gateway.code_skew import record_boot_fingerprint
     record_boot_fingerprint()
+    # Snapshot the WIRE CONTRACT this process serves, for the same reason: a merge that adds a
+    # submit param is invisible to a process that booted before it, and a client declaring the
+    # new revision has to be able to say so instead of being refused as malformed (SOU-3318).
+    from gateway.contract_revision import record_boot_revision
+    record_boot_revision()
 
     # Config verdicts come before the duplicate-instance guard: `--replace` must not stop a healthy
     # gateway for a launch that cannot start.

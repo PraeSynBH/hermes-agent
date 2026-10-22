@@ -18,6 +18,7 @@ from xml.sax.saxutils import escape
 from datetime import UTC
 
 from hermes_cli import gateway_service_owner
+from hermes_cli.gateway_restart_window import refuse_outside_declared_window_for_host
 
 
 def _gw():
@@ -689,6 +690,7 @@ def launchd_uninstall():
 
 
 def launchd_start():
+    refuse_outside_declared_window_for_host("start")
     gateway_service_owner.refuse_foreign_launchd_plist("start")
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
@@ -805,6 +807,7 @@ def _wait_for_launchd_service_pid(
 
 
 def launchd_restart():
+    refuse_outside_declared_window_for_host("restart")
     gateway_service_owner.refuse_foreign_launchd_plist("restart")
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()

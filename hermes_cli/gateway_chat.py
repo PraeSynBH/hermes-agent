@@ -394,7 +394,14 @@ def launch_from_args(args) -> int:
         return asyncio.run(run_gateway_chat(args, emitter=emitter))
     except (GatewayClientError, OSError, TimeoutError, WebSocketException) as exc:
         # WebSocket errors can embed credential URLs/remote bodies.
-        message = str(exc) if isinstance(exc, GatewayClientError) else "Gateway connection/read failed; no local fallback"
+        if not isinstance(exc, GatewayClientError):
+            message = "Gateway connection/read failed; no local fallback"
+        else:
+            # A refusal names the check that fired (``invalid_params (submission_params: unexpected
+            # keys: ['one_shot'])``) instead of the bare code the run log used to be stuck with
+            # (PRA-6722); an error carrying no field/detail reads exactly as before.
+            from hermes_cli.cli_chat_error_copy import refusal_text
+            message = refusal_text(exc)
         return failed(message, 2 if isinstance(exc, GatewayClientError) and ("Unsupported" in message or "unsupported" in message) else 1)
     except KeyboardInterrupt:
         print("Detached; accepted work continues at the gateway.", file=sys.stderr)

@@ -25,10 +25,15 @@ class RuntimeStoreError(ValueError):
     string); ``field`` and ``detail`` name the check that fired and why, so a client and the gateway
     log can tell the reasons' many checks apart instead of reporting the bare code."""
 
-    def __init__(self, reason: str, *, field: str | None = None, detail: str | None = None):
+    def __init__(self, reason: str, *, field: str | None = None, detail: str | None = None,
+                 gateway_revision: str | None = None, client_revision: str | None = None):
         self.reason = reason
         self.field = _one_line(field, 80)
         self.detail = _one_line(detail, 160)
+        # ``contract_version_mismatch`` (SOU-3318): the two wire-contract revisions that disagree.
+        # On any other reason they stay absent and the frame carries no revision.
+        self.gateway_revision = _one_line(gateway_revision, 40)
+        self.client_revision = _one_line(client_revision, 40)
         super().__init__(reason)
 
 

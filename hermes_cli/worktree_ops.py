@@ -1234,8 +1234,24 @@ def _prune_stale_worktree_trees(repo_root: str, max_age_hours: int) -> None:
     _warn_worktree_footprint(repo_root)
 
 
+# Repo roots whose footprint has been audited in this process. "Once per launch" is a per-PROCESS
+# promise, not a per-profile one: the shared daemon runs the pruner once per served profile
+# (cron/scheduler.py:_maybe_run_worktree_maintenance), so an unmemoised audit walks the same
+# <repo>/.worktrees once per profile — 47 walks of 149 trees in the 2026-10-20 22:08 boot, each a
+# near-timeout `du` (~17-22 s warm on this host), all of them concurrent, which is enough disk
+# pressure to stall the gateway event loop for >10 s (PRA-6637). Claimed under the lock BEFORE the
+# walk so concurrent profile ticks cannot both start one.
+_footprint_audited: set = set()
+_footprint_audit_lock = threading.Lock()
+
+
 def _warn_worktree_footprint(repo_root: str) -> None:
-    """The startup pass can leave trees it may not reclaim; say so once per launch."""
+    """The startup pass can leave trees it may not reclaim; say so once per launch (per repo)."""
+    key = os.path.realpath(repo_root)
+    with _footprint_audit_lock:
+        if key in _footprint_audited:
+            return
+        _footprint_audited.add(key)
     try:
         from hermes_cli.worktree_gc import worktrees_summary
 

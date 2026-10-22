@@ -658,11 +658,20 @@ class SessionAuthority:
     async def _submit(self, actor, request, *, _authorize_write=None, queue_only=False, _replay_guard=None,
                       _kanban_card=None):
         self._require_admission_open(queue_only=queue_only)
-        if (request.intent != 'queue' or not {'text'} <= set(request.payload) <= {
-                'text', 'attachments', 'finite', 'unattended', 'surface', 'voice_context', 'interrupted',
-                'voice_turn', 'display_kind', 'title_preview', 'turn_author', 'api_text', 'model_override', 'clarify_batch'}
-                or not isinstance(request.payload['text'], str)):
-            raise RuntimeStoreError('invalid_params')
+        # The closed payload set stays closed; each refusal names the clause and the offending keys
+        # (PRA-6722: a bare ``invalid_params`` was unreadable in both the run log and the gateway log).
+        forbidden = set(request.payload) - {
+            'text', 'attachments', 'finite', 'unattended', 'one_shot', 'surface', 'voice_context', 'interrupted',
+            'voice_turn', 'display_kind', 'title_preview', 'turn_author', 'api_text', 'model_override', 'clarify_batch'}
+        if request.intent != 'queue':
+            raise RuntimeStoreError('invalid_params', field='intent',
+                                    detail=f'unsupported intent: {request.intent}')
+        if forbidden:
+            raise RuntimeStoreError('invalid_params', field='payload',
+                                    detail=f'unexpected keys: {sorted(forbidden)}')
+        if not isinstance(request.payload.get('text'), str):
+            raise RuntimeStoreError('invalid_params', field='text',
+                                    detail='text must be a string')
         from gateway.session_ingress_media import admit_attachments
         from gateway.session_finite import admit_finite
         from gateway.session_surface import admit_surface

@@ -8,7 +8,7 @@ public submission parameters cannot supply it.
 from hermes_state_runtime import RuntimeStoreError
 
 # Fields ``SessionAuthority.submit`` commits for a local session's input; producers commit their own envelope.
-LOCAL_INPUT_FIELDS = frozenset({'text', 'attachments_v1', 'finite', 'unattended', 'surface_v1', 'display_v1',
+LOCAL_INPUT_FIELDS = frozenset({'text', 'attachments_v1', 'finite', 'unattended', 'one_shot', 'surface_v1', 'display_v1',
                                 'cli_turn_v1', 'kanban_card_v1'})
 
 
@@ -33,5 +33,11 @@ def check_local_input(authority, ref, row, *, source=None):
         source = source or authority.sessions[ref.session_id].source
         if row['principal_id'] != source.user_id:
             raise RuntimeStoreError('permission_denied')
-    if not {'text'} <= set(payload) <= allowed:
-        raise RuntimeStoreError('permission_denied')
+    # A refused key set names the keys (PRA-6722): the submitter wrote them, so nothing is leaked,
+    # and the alternative was a bare verdict nobody could act on. Identity refusals above stay bare.
+    unexpected = set(payload) - allowed
+    if unexpected:
+        raise RuntimeStoreError('permission_denied', field='payload',
+                                detail=f'unexpected keys: {sorted(unexpected)}')
+    if 'text' not in payload:
+        raise RuntimeStoreError('permission_denied', field='payload', detail='missing text')

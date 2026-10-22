@@ -150,8 +150,9 @@ class SessionTranscriptMixin:
                 return entry
             if not self._heal_compression_tip_locked(entry, expected_session_id, target_session_id):
                 return None  # route moved (session_id != expected) or nothing to heal
-            self._save()  # bookkeeping, not user activity: leave ``updated_at`` alone
-            return entry
+        # Bookkeeping, not user activity: leave ``updated_at`` alone. Written off ``_lock``.
+        self._save()
+        return entry
 
     def _get_transcript_drain_lock(self):
         """Return the lock that serializes pending-queue drain boundaries."""
@@ -267,7 +268,7 @@ class SessionTranscriptMixin:
             for entry in self._entries.values():
                 if entry.session_id == session_id:
                     entry.session_id = child_id
-            self._save()
+        self._save()
         (getattr(self, "_session_owner_hints", None) or {}).pop(child_id, None)
 
     def _append_to_transcript_serialized(self, session_id: str, message: dict[str, Any]) -> None:

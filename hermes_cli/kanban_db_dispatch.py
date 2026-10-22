@@ -365,8 +365,9 @@ def _process_fingerprint(pid: int) -> Optional[str]:
     """Restart-stable identity of a live process: ``"<instantiation epoch>|<start time>"``. The start
     time alone (``/proc/<pid>/stat`` field 22 on Linux) is clock ticks since THIS boot, so a row that
     survives a reboot could match an unrelated process with the same PID and the same tick value;
-    ``gateway.drain_control.current_instantiation_epoch`` (``boot_id`` + PID-1 start) changes on every
-    reboot / container recreate, so the composed value never survives one. ``None`` when unreadable."""
+    ``gateway.drain_control.current_instantiation_epoch`` (``boot_id`` + PID-1 start on Linux, the
+    ``kern.boottime`` stamp on macOS) changes on every reboot / container recreate, so the composed
+    value never survives one. ``None`` when unreadable."""
     from gateway.drain_control import current_instantiation_epoch
     from gateway.status import get_process_start_time
     start = get_process_start_time(int(pid))

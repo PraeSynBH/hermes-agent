@@ -809,9 +809,23 @@ def _get_code_identity_fields() -> dict[str, Any]:
         from hermes_cli.version_info import get_code_identity
 
         identity = get_code_identity()
-        return {"code_sha": identity.get("sha"), "code_version": identity.get("version")}
+        fields = {"code_sha": identity.get("sha"), "code_version": identity.get("version")}
     except Exception:
-        return {}
+        fields = {}
+    # The WIRE CONTRACT this process serves (its boot snapshot), so a deploy can prove the contract
+    # change actually replaced the process instead of trusting code_sha alone (SOU-3318). Absent
+    # when the install ships no contract document.
+    revision = _get_serving_contract_revision()
+    if revision:
+        fields["contract_revision"] = revision
+    return fields
+
+
+def _get_serving_contract_revision() -> str | None:
+    """This process's boot contract revision, or ``None`` when no contract document is readable."""
+    from gateway.contract_revision import boot_revision
+
+    return boot_revision()
 
 
 def _pid_record_belongs_to_current_profile(record: Optional[dict[str, Any]]) -> bool:
@@ -1060,6 +1074,10 @@ def _prepare_runtime_status_update(
     retrying_since: Any = _UNSET, served_profiles: Any = _UNSET, session_store: Any = _UNSET,
     parked_profiles: Any = _UNSET, serving_decision: Any = _UNSET,
     multiplex_standalone_reason: Any = _UNSET,
+    # The proven wire-contract skew this process is about to replace itself for (SOU-3329): both
+    # revisions, when it decided, the pid, and the interrupted turns per profile. ``None`` clears it,
+    # which is how a clean boot withdraws the previous life's claim.
+    contract_stale: Any = _UNSET,
     platform_metrics: Any = _UNSET,
     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
     drop_profile_platforms: Optional[str] = None,
@@ -1104,6 +1122,8 @@ def _prepare_runtime_status_update(
             ("serving_decision", serving_decision,
              lambda v: copy.deepcopy(v) if isinstance(v, dict) else None),
             ("multiplex_standalone_reason", multiplex_standalone_reason, lambda v: str(v) if v else None),
+            ("contract_stale", contract_stale,
+             lambda v: copy.deepcopy(v) if isinstance(v, dict) else None),
             ("session_store", session_store, _coerce_session_store),
         ))
         if platform is not _UNSET:
