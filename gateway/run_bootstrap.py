@@ -740,7 +740,9 @@ async def _await_early_demand_prewarm(config: Any) -> None:
     admission as a permanent verdict.
 
     Never raises: a host with no ceiling has no task, and a read that fails or outlives the bound
-    leaves the cold rank in place exactly as before.
+    leaves the cold rank in place exactly as before. Adapter startup awaits the same task before it
+    starts anything (SOU-3125), so this does not add the read's cost to a boot — it only gives up the
+    overlap with runner init, which is seconds against the minutes a wrong set costs.
     """
     task = getattr(config, "_demand_prewarm_task", None)
     if task is None:

@@ -229,6 +229,7 @@ def test_a_poll_hop_runs_beside_a_saturated_housekeeping_pool():
         assert wedge.wait(60), "wedged housekeeping item never released"
 
     runner = _pooled_runner()
+    poll_pool = None
     try:
         housekeeping_pool = runner._get_housekeeping_executor()
         for _ in range(_HOUSEKEEPING_MAX_WORKERS):
@@ -242,9 +243,13 @@ def test_a_poll_hop_runs_beside_a_saturated_housekeeping_pool():
         asyncio.run(asyncio.wait_for(poll(), timeout=10))
         assert ran_on and ran_on[0].startswith("hermes-gateway-poll"), (
             f"the poll hop did not run on its own lane: {ran_on}")
+        poll_pool = runner._poll_executor
     finally:
         wedge.set()
         runner._shutdown_executor()
+    assert poll_pool is not None, "the poll lane was never created"
+    assert poll_pool._shutdown, "the poll lane outlived the runner (its threads would leak)"
+    assert runner._poll_executor is None
 
 
 def test_loop_scan_warms_the_store_on_the_poll_lane(monkeypatch):
