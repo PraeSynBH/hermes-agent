@@ -1,7 +1,9 @@
 """A profile the ``gateway.multiplex_max_profiles`` ceiling defers stays published as parked (PRX-5734).
 
-The ceiling parks a profile outside the served set — no adapters, no session authority, admission
-fails fast with ``profile_not_served`` — and that verdict is what a client and an operator read.
+The ceiling parks a profile outside the served set — no adapters, no session authority — and that
+verdict is what a client and an operator read: admission sees the ``capacity:`` reason as the
+PROVISIONAL ``profile_serving`` wait and only reports ``profile_not_served`` once the rank has had
+its re-rank window (PRX-5963).
 Two writers used to fight over it: the reconcile's deleted-profile sweep treated every parked name
 missing from the CAPPED roster as deleted and unparked it, and the capacity fold (which re-parks
 them) only ran when a tick actually applied a change. So on any quiet tick the host published

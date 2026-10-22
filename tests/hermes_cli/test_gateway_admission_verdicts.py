@@ -138,6 +138,128 @@ def test_a_profile_the_live_multiplexer_does_not_serve_fails_in_seconds(tmp_path
     assert spawned == [], "an unserved profile must never spawn a competing daemon"
 
 
+_CAPACITY_PARK = ("capacity: 16 profiles per gateway (gateway.multiplex_max_profiles) — this profile "
+                  "is deferred; cost: 1 Paperclip agents, 0 enabled cron jobs, 0 adapter credentials, "
+                  "work: agents — raise the ceiling or move it up gateway.multiplex_serve_priority")
+
+
+def _parked_payload(root: Path, other: Path, reason: str) -> dict:
+    """``identify`` from a READY multiplexer that serves ``other`` and parks ``devops`` by ``reason``."""
+    return {"runtime_protocol": 1, "state": "ready",
+            "served_profiles": [{"profile_id": str(root), "home": str(root)},
+                                {"profile_id": str(other), "home": str(other)}],
+            "parked_profiles": {"devops": reason}}
+
+
+def _multiplexer_fixture(tmp_path):
+    """``(root, other, home)``: a host whose policy serves a named profile it does not list."""
+    root = tmp_path / ".hermes"
+    root.mkdir(mode=0o700)
+    (root / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\n", encoding="utf-8")
+    other = root / "profiles" / "alpha"
+    (other / "config.yaml").parent.mkdir(parents=True, mode=0o700)
+    (other / "config.yaml").write_text("model: {default: m}\n", encoding="utf-8")
+    home = root / "profiles" / "devops"
+    _dead_owner_lock(home)
+    (home / "config.yaml").write_text("model: {default: m}\n", encoding="utf-8")
+    return root, other, home
+
+
+@pytest.mark.platforms("posix")
+def test_a_ceiling_deferral_is_a_wait_not_a_permanent_verdict(tmp_path, monkeypatch):
+    """PRX-5963: ``capacity:`` in ``parked_profiles`` is PROVISIONAL — the rank is rebuilt every tick.
+
+    devops was parked by the ceiling during boot (the rank was still cold) and served 2 m 47 s later
+    by the first warm tick; three runs dispatched in between read the park as "can never complete"
+    and died. A ceiling deferral therefore reports ``profile_serving`` (a retryable wait), while
+    every other park reason keeps the terminal ``profile_parked``.
+    """
+    from gateway.control_socket import GatewayControlServer
+    from hermes_cli import gateway_runtime as runtime
+
+    root, other, home = _multiplexer_fixture(tmp_path)
+
+    async def probe(payload):
+        server = GatewayControlServer(root, verb_handlers={"identify": lambda: payload})
+        assert await server.start()
+        try:
+            return await asyncio.to_thread(runtime.ensure_gateway_runtime, home, timeout=10.0)
+        finally:
+            await server.stop()
+
+    deferred = asyncio.run(probe(_parked_payload(root, other, _CAPACITY_PARK)))
+    assert (deferred.state, deferred.reason_code) == ("inaccessible", "profile_serving")
+    assert deferred.retry_after_s is not None, "a provisional verdict must say when to re-observe"
+    assert _CAPACITY_PARK[:40] in (deferred.detail or ""), deferred.detail
+
+    # A park that survives ticks (unusable store, home owned elsewhere) stays terminal.
+    settled = asyncio.run(probe(_parked_payload(root, other, "session store unusable: locked")))
+    assert (settled.state, settled.reason_code) == ("inaccessible", "profile_parked")
+    assert "session store unusable" in (settled.detail or "")
+
+
+@pytest.mark.platforms("posix")
+def test_admission_waits_a_ceiling_deferral_out_and_files_itself_as_demand(monkeypatch):
+    """The wait is bounded by the ceiling's own re-rank, and it files the sighting that moves it."""
+    from types import SimpleNamespace
+
+    from hermes_cli import gateway_client, gateway_multiplex_served, gateway_runtime
+
+    endpoint = SimpleNamespace(api_origin="http://127.0.0.1:1", profile_id="p", instance_id="i",
+                              code_sha="0b10", control_home=None)
+    queued = [gateway_runtime.GatewayDiscovery(
+        "inaccessible", reason_code="profile_serving", detail=_CAPACITY_PARK, retry_after_s=0.02),
+        gateway_runtime.GatewayDiscovery("ready", endpoint=endpoint)]
+    monkeypatch.setattr(gateway_runtime, "ensure_gateway_runtime",
+                        lambda *a, **k: queued.pop(0) if queued else gateway_runtime.GatewayDiscovery(
+                            "ready", endpoint=endpoint))
+    monkeypatch.setattr(gateway_runtime, "gateway_profile_home", lambda home: Path("/homes/devops"))
+    wanted: list[str] = []
+    monkeypatch.setattr(gateway_multiplex_served, "note_profile_wanted",
+                        lambda name, **k: wanted.append(name) or True)
+
+    def attach(*args, **kwargs):
+        raise gateway_client.GatewayClientError("ATTACHED")
+
+    monkeypatch.setattr(gateway_client, "_session_ticket", attach)
+
+    async def run():
+        async with gateway_client.connect_gateway():
+            raise AssertionError("the stub always refuses")
+
+    with pytest.raises(gateway_client.GatewayClientError) as caught:
+        asyncio.run(run())
+    assert "ATTACHED" in str(caught.value), "a deferred profile must be waited for, not failed at once"
+    assert wanted == ["devops"], "the waiting run has to be filed as live demand for the next tick"
+
+
+@pytest.mark.platforms("posix")
+def test_a_deferral_that_outlives_the_window_names_the_ceiling(monkeypatch):
+    """No slot inside the window: the run fails with the ceiling's reason, not as a boot or a stall."""
+    from hermes_cli import gateway_client, gateway_multiplex_served, gateway_runtime
+
+    monkeypatch.setattr(gateway_client, "PROFILE_SERVE_WAIT_S", 0.25)
+    monkeypatch.setattr(gateway_runtime, "ensure_gateway_runtime",
+                        lambda *a, **k: gateway_runtime.GatewayDiscovery(
+                            "inaccessible", reason_code="profile_serving", detail=_CAPACITY_PARK,
+                            retry_after_s=0.02))
+    monkeypatch.setattr(gateway_runtime, "gateway_profile_home", lambda home: Path("/homes/devops"))
+    monkeypatch.setattr(gateway_multiplex_served, "note_profile_wanted", lambda name, **k: True)
+
+    async def run():
+        async with gateway_client.connect_gateway():
+            raise AssertionError("a settled deferral must not admit the run")
+
+    before = time.monotonic()
+    with pytest.raises(gateway_client.GatewayUnavailableError) as caught:
+        asyncio.run(run())
+    elapsed = time.monotonic() - before
+    line = str(caught.value)
+    assert "profile_not_served" in line and "capacity: 16 profiles" in line, line
+    assert "boot" not in line and "starving" not in line, line
+    assert elapsed < 5, f"the deferral window bounds the wait, took {elapsed:.1f}s"
+
+
 @pytest.mark.platforms("posix")
 def test_a_standalone_profile_still_starts_its_own_owner(tmp_path, monkeypatch):
     """The unserved verdict is for the policy's served set only: `standalone: true` keeps its path."""
