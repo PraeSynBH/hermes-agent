@@ -479,14 +479,14 @@ def mark_planned_stop(target_pid: Optional[int], reason: str = "gateway_stop", h
 
 
 def _serving_contract_revision() -> Optional[str]:
-    """The wire-contract revision THIS process serves (its boot snapshot). Never raises."""
-    try:
-        from gateway.contract_revision import boot_revision
+    """The wire-contract revision THIS process serves (its boot snapshot).
 
-        return boot_revision()
-    except Exception:
-        logger.debug("Could not read this process's contract revision", exc_info=True)
-        return None
+    ``boot_revision`` reads the in-tree contract document once and answers from the snapshot: the
+    only failure it can see is an unreadable file, which yields ``None`` there.
+    """
+    from gateway.contract_revision import boot_revision
+
+    return boot_revision()
 
 
 def serving_contract_revision(home: Optional[Path] = None) -> Optional[str]:
@@ -511,10 +511,8 @@ def contract_revision_verdict(home: Optional[Path] = None) -> tuple[str, str]:
     must not be declared ready. ``unknown`` (no sentinel, no contract document) never blocks: the
     check exists to catch a proven mismatch, not to invent one.
     """
-    try:
-        from gateway.contract_revision import revision as tree_revision
-    except Exception:
-        return "unknown", "contract module unavailable"
+    from gateway.contract_revision import revision as tree_revision
+
     tree, serving = tree_revision(), serving_contract_revision(home)
     if not tree or not serving:
         return "unknown", f"tree={tree or 'unreadable'} serving={serving or 'not stamped'}"

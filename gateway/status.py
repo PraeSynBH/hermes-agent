@@ -822,13 +822,10 @@ def _get_code_identity_fields() -> dict[str, Any]:
 
 
 def _get_serving_contract_revision() -> str | None:
-    """This process's boot contract revision, or ``None``. Never raises."""
-    try:
-        from gateway.contract_revision import boot_revision
+    """This process's boot contract revision, or ``None`` when no contract document is readable."""
+    from gateway.contract_revision import boot_revision
 
-        return boot_revision()
-    except Exception:
-        return None
+    return boot_revision()
 
 
 def _pid_record_belongs_to_current_profile(record: Optional[dict[str, Any]]) -> bool:
