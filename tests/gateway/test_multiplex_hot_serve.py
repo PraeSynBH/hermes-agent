@@ -258,6 +258,45 @@ async def test_profile_control_verbs_round_trip_and_refusals(tmp_path, monkeypat
         assert runner._profile_adapters["worker"][Platform.DISCORD].token.endswith("new-worker-token\n")
 
 
+@pytest.mark.asyncio
+async def test_a_waiting_client_is_filed_as_demand_and_never_served_by_the_verb(tmp_path, monkeypatch):
+    """PRX-5963: admission's ``profile_serving`` wait has to be able to move the rank.
+
+    A run dispatched to a ceiling-deferred profile is the live demand signal the rank exists to see
+    (PRX-5738) — but that signal lives in this process, so the run files it over the control socket.
+    The sighting only pins a slot: the ceiling still makes the trade on the next tick, so a client can
+    never push the host past ``gateway.multiplex_max_profiles``.
+    """
+    from gateway import run_profile_reconcile as verbs
+    from hermes_cli import gateway_multiplex_demand as demand
+
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        runner, home = _capped_runner(tmp_path, monkeypatch, cap=2)
+        hidden = _mkprofile(home, "alpha")
+        zulu = _mkprofile(home, "zulu")
+        _cron_job(zulu)  # zulu holds the slot; alpha holds nothing
+        _boot(runner, home)
+        await runner._start_secondary_profile_adapters()
+        assert _served_record(home) == ["default", "zulu"]
+        assert _state(home)["parked_profiles"]["alpha"].startswith("capacity: ")
+
+        wanted = verbs.want_profile_verb(runner)
+        assert await asyncio.to_thread(wanted, {"name": ""}) == {"error": "name required"}
+        answer = await asyncio.to_thread(wanted, {"name": "alpha"})
+        assert (answer["wanted"], answer["served"]) == ("alpha", False)
+        assert answer["ttl_seconds"] == demand.WANTED_TTL_SECONDS
+        # The verb files demand only: the served set is untouched until the ceiling re-ranks.
+        assert demand.wanted("alpha") is True
+        assert _served_record(home) == ["default", "zulu"]
+
+        result = await runner.reconcile_served_profiles()
+
+    assert result["added"] == ["alpha"] and result["removed"] == ["zulu"], result
+    assert _served_record(home) == ["default", "alpha"]
+    assert "alpha" not in _state(home)["parked_profiles"]
+    assert hidden.exists() and zulu.exists()  # a deferral is not a deletion
+
+
 @pytest.mark.platforms("linux")
 @pytest.mark.asyncio
 async def test_profile_lifecycle_over_real_control_socket(tmp_path, monkeypatch):
@@ -693,11 +732,11 @@ async def test_a_demand_flip_hot_serves_and_parks_without_a_restart(tmp_path, mo
 
 @pytest.mark.asyncio
 async def test_a_cold_boot_reservation_is_corrected_by_the_first_tick(tmp_path, monkeypatch):
-    """SOU-3125: boot may reserve on a cold (priority-only) view; one tick makes it demand-ranked.
+    """SOU-3125: if boot could only get a cold (priority-only) view, one tick makes it demand-ranked.
 
-    ``snapshot()`` no longer reads, so the reservation ``start_gateway`` freezes is the priority order
-    until the boot pre-warm lands (<= 30 s by design). The first reconcile tick refreshes first, then
-    enumerates — this is the correction, and it must be a real add+remove, not just a repaint.
+    ``start_gateway`` now lands the demand read before it freezes the served set, so this correction
+    is the fallback for a read that failed or timed out (still documented as a <= 30 s window). The
+    first reconcile tick refreshes first, then enumerates — a real add+remove, not just a repaint.
     """
     with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
         runner, home = _capped_runner(tmp_path, monkeypatch)

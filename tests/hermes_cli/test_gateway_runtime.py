@@ -123,12 +123,15 @@ def test_start_decisions_do_not_turn_uncertainty_into_another_owner():
         next_start_action(RuntimeObservation("invalid"))
 
 
-def test_a_capacity_park_is_a_terminal_verdict_carrying_the_cost(tmp_path):
-    """A profile over the ceiling must fail fast with its cost, not wait out the admission deadline.
+def test_a_capacity_park_is_a_provisional_wait_carrying_the_cost(tmp_path):
+    """A profile over the ceiling is a WAIT, not a verdict — and its cost survives the read intact.
 
-    ``ensure_gateway_runtime`` turns this verdict into ``profile_parked`` in seconds (SOU-3075 §5),
-    so the reason published under ``parked_profiles`` has to survive the read intact — including
-    the cost clause that tells the client what the deferral costs.
+    ``ensure_gateway_runtime`` reports the deferral as ``profile_serving`` (retryable, PRX-5963): the
+    rank is rebuilt on every reconcile tick and a waiting client pins a slot (PRX-5738), so reading
+    it as terminal killed runs for a profile the host served seconds later. The reason published
+    under ``parked_profiles`` still has to arrive intact, cost clause included (SOU-3075 §5), so the
+    client can report the trade if the wait runs out. A park that is NOT a ceiling deferral (unusable
+    store, home owned elsewhere) keeps the terminal verdict.
     """
     from hermes_cli.gateway_runtime import _parked_by_multiplexer
 
@@ -138,8 +141,13 @@ def test_a_capacity_park_is_a_terminal_verdict_carrying_the_cost(tmp_path):
                                       tmp_path / "devops")
 
     assert discovery.state == "inaccessible"
-    assert discovery.reason_code == "profile_parked"
+    assert discovery.reason_code == "profile_serving"
+    assert discovery.retry_after_s is not None
     assert "cost: 12 Paperclip agents, 3 enabled cron jobs, 0 adapter credentials" in discovery.detail
+
+    settled = _parked_by_multiplexer({"parked_profiles": {"devops": "session store unusable: locked"}},
+                                     tmp_path / "devops")
+    assert (settled.state, settled.reason_code) == ("inaccessible", "profile_parked")
 
 
 def test_a_profile_absent_from_parked_profiles_keeps_the_ordinary_verdict(tmp_path):

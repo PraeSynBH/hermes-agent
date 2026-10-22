@@ -55,9 +55,10 @@ Cold is not "no demand": :meth:`DemandSnapshot.demand_source` reports ``state="c
 ``age_seconds=None``, and the host check renders that as ``demand=cold (first reconcile pending)``
 instead of implying real facts. Only :func:`refresh` reads, and only its two owners call it: the
 reconcile tick (``asyncio.to_thread``, every 30 s) and the boot path's own pre-warm (off-loop,
-started beside boot so the discovery overlaps the rest of startup). **By design the rank is
-priority-only for up to 30 s after boot**, until the first tick replaces the cold view — a 20 s
-stall inside cold boot is the worse trade (SOU-3125).
+started beside boot so the discovery overlaps the rest of startup, then awaited before boot freezes
+the served set — PRX-5963). A read that fails or outlives its bound leaves a priority-only boot set,
+which the first tick then corrects — the previous behaviour, and the worse trade for every boot that
+can afford the overlap (SOU-3125).
 """
 
 from __future__ import annotations

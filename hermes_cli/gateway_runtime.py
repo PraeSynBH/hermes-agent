@@ -38,6 +38,17 @@ DEFAULT_ENSURE_TIMEOUT = 120.0
 # budget, a stall costs a probe instead of the run.
 PROBE_TIMEOUT = 2.0
 
+#: Reason code for a profile the live multiplexer has NOT served yet but can still serve: the
+#: ceiling defers it provisionally and re-ranks on every reconcile tick, and a client that is
+#: waiting pins a slot (PRX-5738). This is a wait inside the caller's budget, never a verdict about
+#: the owner — three devops runs took the terminal reading of it and died inside the boot reconcile
+#: window (PRX-5963).
+PROFILE_SERVING_REASON = "profile_serving"
+
+#: How soon a ``profile_serving`` client re-observes. Cheap (one ``identify``) and well inside the
+#: reconcile interval the rank actually moves on, so admission notices a serve within one tick.
+PROFILE_SERVE_RETRY_S = 5.0
+
 
 @dataclass(frozen=True)
 class GatewayEndpoint:
@@ -208,9 +219,17 @@ def _standalone_multiplexer_reason(root: Path) -> str | None:
 
 
 def _parked_by_multiplexer(payload: dict, home: Path) -> GatewayDiscovery | None:
-    """A secondary the multiplexer could not serve (unusable store, home owned elsewhere) is
-    published under ``parked_profiles`` (name -> reason). That is a terminal verdict for its
-    clients: waiting for a ``served_profiles`` entry that will never appear is the wrong answer."""
+    """A secondary the multiplexer is not serving is published under ``parked_profiles``
+    (name -> reason) — and that map holds two very different verdicts.
+
+    A CEILING deferral (``capacity:``) is provisional by construction: the rank is recomputed on
+    every reconcile tick from live demand, and a client that is waiting pins a slot (PRX-5738). It is
+    reported as ``profile_serving`` — a wait — because reading it as terminal killed three devops
+    runs during the 2-3 minute boot reconcile that was already re-ranking them in (PRX-5963).
+
+    Every other reason (unusable store, home owned elsewhere, config refusal) is a settled park: it
+    survives ticks and needs a rescan or an operator, so waiting for a ``served_profiles`` entry that
+    will never appear is the wrong answer (``profile_parked``)."""
     parked = payload.get("parked_profiles")
     if not isinstance(parked, dict):
         return None
@@ -219,7 +238,15 @@ def _parked_by_multiplexer(payload: dict, home: Path) -> GatewayDiscovery | None
     reason = next((r for n, r in parked.items() if normalize_profile_name(str(n)) == name), None)
     if reason is None:
         return None
-    return GatewayDiscovery("inaccessible", reason_code="profile_parked", detail=str(reason)[:500] or None)
+    from hermes_cli.gateway_multiplex_capacity import CAPACITY_REASON_PREFIX
+    text = str(reason)[:500] or None
+    if str(reason).startswith(CAPACITY_REASON_PREFIX):
+        return GatewayDiscovery(
+            "inaccessible", reason_code=PROFILE_SERVING_REASON,
+            detail=(f"{text} — the ceiling re-ranks on every reconcile tick and a waiting client "
+                    f"pins a slot, so this profile can be served without a restart"),
+            retry_after_s=PROFILE_SERVE_RETRY_S)
+    return GatewayDiscovery("inaccessible", reason_code="profile_parked", detail=text)
 
 
 def boot_evidence(home: str | Path) -> str | None:
@@ -317,11 +344,13 @@ def _not_served_by_live_multiplexer(payload: dict, home: Path, root: Path) -> Ga
     """A profile the boot policy says this host serves, which the LIVE multiplexer does not list.
 
     The multiplexer's ``identify`` is the authority on this boot's served set: it is settled at
-    boot, and a profile it could not load is published under ``parked_profiles``. So a READY
-    multiplexer that omits *home* never adds it, and waiting for the entry is the "boot" that was
-    never a boot (PRX-5725: ``general``/``devops``/``troopmaster``/``fundraising``, 35 of 183 lost
-    runs, each spending the full budget twice). A ``gateway.standalone: true`` secondary (policy
-    ``False``) keeps its own start path, and a home that owns a live gateway of its own keeps the
+    boot, and a profile it could not load — or provisionally deferred by the ceiling — is published
+    under ``parked_profiles``, which ``_parked_by_multiplexer`` reads FIRST (a ceiling deferral is a
+    wait there, PRX-5963). So this verdict is the remaining case: a READY multiplexer that serves
+    and parks nobody by that name, where waiting for the entry is the "boot" that was never a boot
+    (PRX-5725: ``general``/``devops``/``troopmaster``/``fundraising``, 35 of 183 lost runs, each
+    spending the full budget twice). A ``gateway.standalone: true`` secondary (policy ``False``)
+    keeps its own start path, and a home that owns a live gateway of its own keeps the
     control-timeout verdict instead — that owner is wedged, not unserved.
     """
     if payload.get("state") != "ready":

@@ -154,6 +154,33 @@ def format_ingress_url_lines(urls: dict[str, str], indent: str = "  ") -> list[s
     return [f"{indent}{platform}: {url}" for platform, url in sorted(urls.items())]
 
 
+def note_profile_wanted(profile_name: str, *, timeout: float = 2.0) -> bool:
+    """Tell the live default multiplexer a client is waiting on ``profile_name``'s admission.
+
+    The demand rank has exactly one LIVE reading — a client that asked and is waiting
+    (``gateway_multiplex_demand.note_wanted``) — and it lives inside the gateway process, so the
+    sighting has to be filed over the control socket. That is what lets a run dispatched to a
+    ceiling-deferred profile be ranked IN on the next reconcile tick, evicting a profile that holds
+    no work, instead of re-observing a slot nobody was ever going to free (PRX-5963). Returns False
+    (never raises) when no multiplexer answers: a single-profile host, a gateway predating the verb,
+    or an unreadable socket — the caller then just re-observes the served set.
+
+    Blocking: the answer arrives on the multiplexer's own event loop, so a caller already on a loop
+    must hand this to a worker (``asyncio.to_thread``) — called inline it waits out its own timeout
+    and reports False.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+        from gateway.control_socket import note_gateway_profile_wanted
+        if live_default_gateway_pid() is None:
+            return False
+        answer = note_gateway_profile_wanted(get_default_hermes_root(), profile_name, timeout=timeout)
+    except Exception:
+        logger.debug("multiplexer wanted-sighting failed for %r", profile_name, exc_info=True)
+        return False
+    return isinstance(answer, dict) and bool(answer.get("wanted"))
+
+
 def notify_multiplexer_profiles_changed(profile_name: str, *, timeout: float = 8.0) -> Optional[list[str]]:
     """Tell the live default multiplexer that ``profiles/`` changed (``profile_name`` was created or
     deleted) so it hot-serves / unroutes it now instead of at its next periodic rescan. Returns the
