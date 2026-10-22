@@ -3,6 +3,7 @@ import asyncio
 from contextlib import suppress
 import logging
 import sys
+import time
 import uuid
 
 from hermes_cli.gateway_client import GATEWAY_STARTUP_RPC_DEADLINE_S, GatewayClientError
@@ -28,6 +29,30 @@ def _pending_preview(text):
 
 _UNKNOWN_OUTCOME = ("Execution outcome is unknown. Resume this session to inspect the lost turn "
                     "and /discard it; do not resend the input.")
+
+# A dropped socket mid-turn is not the turn's outcome: the owner keeps executing, and the admission
+# settles server-side. A finite run therefore never reports "turn outcome is unknown" without first
+# asking the owner for the receipt (``prompt.receipt`` with ``include_result``: the same read the
+# replay-gap path and the in-process one-shot use). PRX-5855: 44 runs / 19 agents in 16 h exited on
+# the transport error while their turns were still running — a whole turn of work booked as a lost
+# run, for want of one read. Polled while the admission is still queued/started, so a turn that
+# completes after the socket died is reported with its committed result and its own exit code.
+LOST_TURN_POLL_INTERVAL_S = 2.0
+# Backstop for a receipt that never settles and never reads ``unknown`` (a wedged owner that the
+# loop watchdog has not yet failed): the caller's run deadline — the adapter's ``timeoutSec`` — is
+# the real bound, and this only keeps an unattended CLI from polling forever on its own.
+LOST_TURN_WAIT_BUDGET_S = 900.0
+
+
+def _transport_loss(error):
+    """True for the event stream dying under this run (a dropped/failed socket), not for a refusal.
+
+    ``GatewayConnection`` and ``GatewayClient`` both report a lost socket with this one copy; a
+    refusal (``session_replay_gap``, a resume the owner rejected) is a verdict, not a lost answer.
+    """
+    from hermes_cli.gateway_connection import DISCONNECTED
+    return isinstance(error, GatewayClientError) and str(error).startswith(DISCONNECTED)
+
 
 _BLOCKING_CONTROL_EVENTS = frozenset({
     "approval.request", "approval.settled", "clarify.request", "clarify.settled",
@@ -479,6 +504,62 @@ class GatewayChatView:
             logger.debug("settled result for %s unavailable: %s", admission, exc)
             return {}
 
+    async def _read_lost_turn_receipt(self, admission):
+        """``prompt.receipt`` for *admission* on a fresh connection, polled while it is unsettled.
+
+        Returns ``(receipt, settled_verdict)``, or ``(None, ...)`` when the owner never answered.
+        ``settled_verdict`` is :func:`gateway_replay_gap.settled`'s answer: ``True`` settled with a
+        reply, ``None`` terminal without a readable result, ``False`` still queued/started — polled
+        until ``LOST_TURN_WAIT_BUDGET_S``, except for an ``unknown`` admission (the owner lost the
+        turn: no amount of waiting settles it, so the run fails instead of spending its deadline).
+        """
+        from websockets.exceptions import WebSocketException
+        from hermes_cli.gateway_client import connect_gateway
+        from hermes_cli.gateway_replay_gap import settled
+        deadline = time.monotonic() + LOST_TURN_WAIT_BUDGET_S
+        while True:
+            try:
+                async with connect_gateway() as fresh:
+                    while True:
+                        receipt = await fresh.rpc("prompt.receipt", session_id=self.session_id,
+                                                  admission_id=admission, include_result=True)
+                        verdict = settled(receipt)
+                        # False = still queued/started: the only verdict worth waiting out.
+                        if verdict is not False or receipt.get("status") == "unknown":
+                            return receipt, verdict
+                        if time.monotonic() >= deadline:
+                            return receipt, verdict
+                        await asyncio.sleep(LOST_TURN_POLL_INTERVAL_S)
+            except (GatewayClientError, OSError, TimeoutError, WebSocketException) as exc:
+                # The read itself can be lost/incomplete: retry it until the budget, then report
+                # the failure the caller must still handle.
+                logger.debug("lost-turn receipt read for %s unavailable: %s", admission, exc)
+                if time.monotonic() >= deadline:
+                    return None, False
+                await asyncio.sleep(LOST_TURN_POLL_INTERVAL_S)
+
+    async def _recover_lost_turn(self, admission, failure):
+        """Ask the owner for the receipt of a turn whose socket died under this finite run.
+
+        True: the turn settled, its completion is recorded (its committed result, and with it the
+        exit code, is what this run now reports) and the transport error is no longer this run's
+        outcome. False: the run still fails on *failure* — the receipt read ``unknown`` (the owner
+        lost the turn), was refused, or never settled inside ``LOST_TURN_WAIT_BUDGET_S``.
+        """
+        if not self.finite or not admission or not _transport_loss(failure):
+            return False
+        receipt, verdict = await self._read_lost_turn_receipt(admission)
+        if receipt is None or verdict is not True:
+            # ``unknown`` (the owner lost the turn), a refusal, or a receipt that never settled
+            # inside the budget: the run fails, and it fails now rather than after a longer wait.
+            return False
+        outcome = {"interrupted": "cancelled"}.get(receipt.get("outcome"), receipt.get("outcome"))
+        self._complete(admission, {"outcome": outcome, "_receipt": receipt, "replay_gap": True,
+                                   "text": (receipt.get("result") or {}).get("final_response") or ""})
+        self.failure = None  # the socket died, the turn did not: this run has an answer after all
+        logger.debug("turn for %s settled on the owner after the socket dropped (%s)", admission, outcome)
+        return True
+
     def _print_exit_ids(self):
         """The finite run's durable id on stderr (automation wrappers parse it; it names the
         physical row a compaction may have advanced) and, for `chat -q`, main's resume block. Main's
@@ -539,6 +620,10 @@ class GatewayChatView:
                 while admission not in self.completions:
                     self.changed.clear()
                     if self.failure:
+                        # A dropped socket is not the turn's outcome: ask the owner for the
+                        # receipt before this run reports the work as lost (PRX-5855).
+                        if await self._recover_lost_turn(admission, self.failure):
+                            continue
                         raise self.failure
                     blocked = self._finite_block(admission)
                     if blocked:
