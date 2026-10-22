@@ -317,6 +317,25 @@ def test_a_disabled_watch_starts_no_ticker():
         SimpleNamespace(), SimpleNamespace(), config={"gateway": {"contract_watch_seconds": 0}}) is None
 
 
+def test_an_armed_watch_states_its_cadence_in_the_boot_log(caplog):
+    """Armed is a fact the boot log has to carry, or nobody can verify an activation (PRX-5881).
+
+    The live gateway can only be asked "did this boot arm the watcher?" after the fact, and a silent
+    registration reads exactly like an unregistered one until the skew it prevents becomes an outage.
+    """
+    caplog.set_level(logging.INFO, logger="gateway.contract_watch")
+    watcher = contract_watch.watcher_for_runner(
+        SimpleNamespace(), SimpleNamespace(),
+        config={"gateway": {"contract_watch_seconds": 15,
+                           "contract_watch_min_seconds_between_restarts": 900}})
+
+    assert watcher is not None
+    armed = [record.getMessage() for record in caplog.records if contract_watch.LABEL in record.getMessage()]
+    assert armed, [record.getMessage() for record in caplog.records]
+    assert "15s" in armed[-1], "the deployed cadence, not the module default"
+    assert "900s" in armed[-1], "the replacement cap, so a restart loop is visible from the log"
+
+
 # -- the live wiring: the watcher reaches the runner through the gateway loop -----------------------
 
 
