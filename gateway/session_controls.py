@@ -276,7 +276,11 @@ class AuthorityConnection:
         contract = CANONICAL_METHODS.get(method)
         if contract is not None and (problems := canonical_param_problems(contract, params)):
             # The declared wire contract (``tui_gateway/contracts/canonical.py``) is the closed
-            # key set: an unknown or missing key never reaches the handler.
+            # key set: an unknown or missing key never reaches the handler. ``data.fields`` already
+            # carries the offending key paths to the client; the log line names them too, so the
+            # gateway log alone explains a run that never reached a handler (PRA-6722/PRA-6720).
+            _log_refusal(getattr(self.actor, 'profile_id', None), method, RuntimeStoreError(
+                'invalid_params', field='params', detail=f'unknown or missing keys: {", ".join(problems)}'))
             return {'jsonrpc': '2.0', 'id': rid, 'error': {
                 'code': 4001, 'message': 'invalid_params', 'data': {'reason': 'invalid_params', 'fields': problems}}}
         original_params = dict(params)
@@ -752,10 +756,16 @@ class AuthorityConnection:
                                    'surface', 'voice_context', 'interrupted', 'voice_turn', 'display_kind', 'title_preview',
                                    'turn_author', 'api_text', 'model_override', 'clarify_batch'}
         if forbidden:
-            raise RuntimeStoreError('invalid_params')
+            # PRA-6722: a bare ``invalid_params`` cost a 3h10m/47-run outage (PRA-6720) because the
+            # operator could not tell an unknown key from a bad type. The key set stays closed; the
+            # refusal names the check and the keys, so the run log's one line is the whole diagnosis.
+            raise RuntimeStoreError('invalid_params', field='submission_params',
+                                    detail=f'unexpected keys: {sorted(forbidden)}')
         request_id = params.get('submission_id') or params.get('input_id')
         if not isinstance(request_id, str) or not request_id:
-            raise RuntimeStoreError('invalid_params')
+            named = 'submission_id' if 'submission_id' in params else 'input_id'
+            raise RuntimeStoreError('invalid_params', field='submission_id',
+                                    detail=f'{named} must be a non-empty string')
         from gateway.session_finite import admit_finite
         from gateway.session_display import submit_display_fields
         from gateway.session_surface import submit_surface_fields
