@@ -33,5 +33,11 @@ def check_local_input(authority, ref, row, *, source=None):
         source = source or authority.sessions[ref.session_id].source
         if row['principal_id'] != source.user_id:
             raise RuntimeStoreError('permission_denied')
-    if not {'text'} <= set(payload) <= allowed:
-        raise RuntimeStoreError('permission_denied')
+    # A refused key set names the keys (PRA-6722): the submitter wrote them, so nothing is leaked,
+    # and the alternative was a bare verdict nobody could act on. Identity refusals above stay bare.
+    unexpected = set(payload) - allowed
+    if unexpected:
+        raise RuntimeStoreError('permission_denied', field='payload',
+                                detail=f'unexpected keys: {sorted(unexpected)}')
+    if 'text' not in payload:
+        raise RuntimeStoreError('permission_denied', field='payload', detail='missing text')

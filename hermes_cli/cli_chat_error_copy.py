@@ -68,7 +68,13 @@ def refusal_text(error: BaseException | str) -> str:
         return contract_skew_text(error)
     field, detail = str(data.get("field") or "").strip(), str(data.get("detail") or "").strip()
     if not field and not detail:
-        return str(error)
+        # The canonical-contract gate refuses before any handler runs and names the offending key
+        # paths as a list (``gateway/session_controls.py``); render them rather than the bare code,
+        # which is what made a 47-run outage unreadable (PRA-6720/PRA-6722).
+        fields = [str(name).strip() for name in data.get("fields") or () if str(name).strip()]
+        if not fields:
+            return str(error)
+        return f"{error} (params: unknown or missing keys: {', '.join(fields)})"
     return f"{error} ({field or 'unnamed field'}{': ' + detail if detail else ''})"
 
 

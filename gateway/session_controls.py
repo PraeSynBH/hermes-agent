@@ -346,9 +346,12 @@ class AuthorityConnection:
         contract = CANONICAL_METHODS.get(method)
         if contract is not None and (problems := canonical_param_problems(contract, params)):
             # The declared wire contract (``tui_gateway/contracts/canonical.py``) is the closed
-            # key set: an unknown or missing key never reaches the handler. A client that DECLARED
-            # a different contract revision gets the skew named instead — the same refusal a stale
-            # one-shot met as a bare ``invalid_params`` for 3h24m (SOU-3316/SOU-3318).
+            # key set: an unknown or missing key never reaches the handler. ``data.fields`` already
+            # carries the offending key paths to the client; the log line names them too, so the
+            # gateway log alone explains a run that never reached a handler (PRA-6722/PRA-6720).
+            # A client that DECLARED a different contract revision gets the skew named instead —
+            # the refusal a stale one-shot met as a bare ``invalid_params`` for 3h24m
+            # (SOU-3316/SOU-3318) — with both revisions on the frame.
             exc = _canonical_param_refusal(params, problems)
             _log_refusal(getattr(self.actor, 'profile_id', None), method, exc)
             return {'jsonrpc': '2.0', 'id': rid, 'error': {
@@ -824,11 +827,18 @@ class AuthorityConnection:
             raise RuntimeStoreError('permission_denied')
         forbidden = set(params) - SUBMIT_PARAMS
         if forbidden:
+            # PRA-6722: a bare ``invalid_params`` cost a 3h10m/47-run outage (PRA-6720) because the
+            # operator could not tell an unknown key from a bad type. The key set stays closed; the
+            # refusal names the check and the keys, so the run log's one line is the whole
+            # diagnosis — and names the contract skew when the client declared a revision this
+            # process does not serve (SOU-3318).
             raise _submit_param_refusal(params, forbidden)
         _refuse_malformed_declaration(params)
         request_id = params.get('submission_id') or params.get('input_id')
         if not isinstance(request_id, str) or not request_id:
-            raise RuntimeStoreError('invalid_params')
+            named = 'submission_id' if 'submission_id' in params else 'input_id'
+            raise RuntimeStoreError('invalid_params', field='submission_id',
+                                    detail=f'{named} must be a non-empty string')
         from gateway.session_finite import admit_finite
         from gateway.session_display import submit_display_fields
         from gateway.session_surface import submit_surface_fields
