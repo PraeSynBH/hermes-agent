@@ -2116,20 +2116,20 @@ DEFAULT_CONFIG = {
         "unmanaged_idle_exit_seconds": 600,  # client-auto-started gateway only; 0 disables
         # Seconds a SIGTERM-interrupted agent unwinds before teardown (short: service stop budgets).
         "signal_interrupt_grace_timeout": 1,
+        # Wire-contract watch (SOU-3329): tick cadence, and the shortest window between two
+        # self-replacements for the SAME pair (the durable loop guard). <=0 disables both. A merge
+        # moves the tree while a long-lived process keeps its imported params model (SOU-3316/3328).
+        "contract_watch_seconds": 10, "contract_watch_min_seconds_between_restarts": 600,
         "service_install_choice": None,  # null | install | decline; never authorizes ordinary launch installation.
         # Durable delivery-obligation ledger: final responses are recorded in state.db around the
         # platform send; a gateway that died between finalize and platform ACK redelivers on next
         # boot (ambiguous cases carry a "recovered reply — may be a duplicate" marker;
         # at-least-once). Disable to lose in-flight final responses on crash/restart.
         "delivery_ledger": True,
-        # Seconds to wait for one platform to connect at startup/reconnect; raise on "discord
-        # connect timed out" loops (many slash commands to sync). 0/negative = wait forever. Bridged
-        # to HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT, which wins if set explicitly.
-        # Seconds the gateway waits for a single messaging platform to finish connecting during startup (and
-        # on reconnect). Discord in particular can blow past the old fixed 30s when an account has many
-        # slash commands to sync (#19776: 90-173 skills → ~28-31s sync). Raise this if your gateway hits
-        # "discord connect timed out" / "Timeout waiting for connection to Discord" restart loops. ``0`` or
-        # negative disables the timeout entirely (wait indefinitely).
+        # Seconds one platform may take to connect at startup (and on reconnect); raise on "discord
+        # connect timed out" / "Timeout waiting for connection to Discord" loops — a big account's
+        # slash-command sync blows past a fixed 30s (#19776). 0/negative waits forever. Bridged to
+        # HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT, which wins if set explicitly.
         "platform_connect_timeout": 30,
         # Event-loop liveness watchdog: a daemon thread probes the asyncio loop; consecutive missed
         # probes dump all-thread stacks and hard-exit with the service-restart code, so systemd or
