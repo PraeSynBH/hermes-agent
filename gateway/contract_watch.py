@@ -326,12 +326,18 @@ class ContractWatcher:
     # -- publishing -------------------------------------------------------------------------
 
     def _payload(self, boot: str, tree: str, *, status: str, interrupted: dict[str, int]) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "boot": boot, "tree": tree, "decided_at": _now_iso(), "pid": os.getpid(),
             "status": status, "supervised": self._supervised,
             "interrupted": dict(interrupted or {}),
             "restart_after_seconds": int(self._min_gap),
         }
+        if not self._supervised:
+            # Say who brings it back: the planned stop exits 75 either way, but without a supervisor
+            # only the boot guard does, and a reader must not mistake "exited" for "replaced".
+            payload["respawn"] = (
+                "no supervisor: the planned stop exits 75; ai.hermes.ensure-gateway-boot must respawn")
+        return payload
 
     def _publish_once(self, payload: dict[str, Any]) -> None:
         if self._published == payload:

@@ -211,6 +211,17 @@ def test_in_flight_turns_do_not_hold_the_restart_and_are_counted_per_profile(tmp
     assert json.loads(state_path(tmp_path).read_text())["interrupted"] == {"default": 3, "sou": 1}
 
 
+def test_without_a_supervisor_the_published_claim_names_who_respawns_it(tmp_path):
+    """An unsupervised launch must not read as "replaced": it exits 75 and the boot guard comes back."""
+    rig = Rig(tmp_path)
+    rig.watcher._supervised = False
+    rig.settle()
+
+    assert rig.restarts == 1, "the planned stop is still the route: it exits 75 for the boot guard"
+    assert "ensure-gateway-boot" in rig.published[-1]["respawn"]
+    assert rig.published[-1]["supervised"] is False
+
+
 def test_an_in_progress_drain_wins_over_a_second_restart(tmp_path):
     rig = Rig(tmp_path, drained=True)
     rig.settle()
