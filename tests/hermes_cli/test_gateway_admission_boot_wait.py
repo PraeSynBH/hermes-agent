@@ -66,7 +66,7 @@ class _Boot:
         self.boot_s, self.per_call_s, self.origin = boot_s, per_call_s, origin
         self.calls, self.caps = [], []
 
-    def __call__(self, home, *, idle_exit=False, timeout=None):
+    def __call__(self, home, *, idle_exit=False, timeout=None, new_work=False):
         self.calls.append(timeout)
         self.caps.append(timeout)
         self.clock.advance(self.per_call_s)
@@ -127,7 +127,7 @@ def test_a_boot_that_outlives_the_budget_is_named_as_a_boot(monkeypatch):
     monkeypatch.setattr(gateway_client, "BOOT_POLL_INTERVAL_S", 0.0, raising=False)
     monkeypatch.setattr(gateway_client, "admission_budget_seconds", lambda: 120.0)
 
-    def ensure(home, *, idle_exit=False, timeout=None):
+    def ensure(home, *, idle_exit=False, timeout=None, new_work=False):
         clock.advance(60.0)
         return _discovery(gateway_runtime, "starting", reason_code="deadline")
 
@@ -170,7 +170,7 @@ def test_a_boot_verdict_carries_the_boot_it_waited_on(monkeypatch):
     monkeypatch.setattr(gateway_client, "BOOT_POLL_INTERVAL_S", 0.0, raising=False)
     monkeypatch.setattr(gateway_client, "admission_budget_seconds", lambda: 120.0)
 
-    def ensure(home, *, idle_exit=False, timeout=None):
+    def ensure(home, *, idle_exit=False, timeout=None, new_work=False):
         clock.advance(60.0)
         return _discovery(gateway_runtime, "starting", reason_code="deadline")
 
