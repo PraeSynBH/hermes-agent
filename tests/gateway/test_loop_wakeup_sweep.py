@@ -116,6 +116,35 @@ def test_a_read_that_raises_is_not_re_raised_to_the_tick(tmp_path, monkeypatch):
     assert run_idle_gates.loop_sweep(scopes) == []
 
 
+def test_overlapping_pool_reads_each_resolve_their_own_home(tmp_path, monkeypatch):
+    """The home override is a ContextVar, so reads on reused pool threads must not leak into each
+    other — leaking one would fire a profile's loop against another profile's adapters."""
+    scopes = _homes(tmp_path, ("alpha", "beta", "gamma", "delta"))
+    seen = []
+    lock = threading.Lock()
+    # exactly one pool batch, all in flight before any of them resolves
+    barrier = threading.Barrier(len(scopes), timeout=30)
+
+    import hermes_cli.goals as goals
+    from hermes_constants import get_hermes_home
+
+    def _fake_get_session_db():
+        barrier.wait()
+        home = str(get_hermes_home())
+        with lock:
+            seen.append(home)
+        return None
+
+    monkeypatch.setattr(run_idle_gates, "_LOOP_SWEEP_POOL", None)
+    monkeypatch.setattr(goals, "_get_session_db", _fake_get_session_db)
+
+    run_idle_gates.loop_sweep(scopes)
+
+    assert sorted(seen) == sorted(str(home) for _name, home in scopes)
+    run_idle_gates._LOOP_SWEEP_POOL.shutdown(wait=False)
+    monkeypatch.setattr(run_idle_gates, "_LOOP_SWEEP_POOL", None)
+
+
 def test_shutdown_joins_the_sweep_pool(tmp_path, monkeypatch):
     """The sweep reads the stores shutdown is about to close: its pool joins under the deadline."""
     scopes = _homes(tmp_path, ("alpha", "beta"))
