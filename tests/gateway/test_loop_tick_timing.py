@@ -125,6 +125,26 @@ def test_budget_used_reports_the_tick_against_its_ceiling():
     assert lines and 'budget_used=5500ms/2000ms over=1/1' in lines[0]
 
 
+def test_the_over_budget_count_is_per_window_beside_its_running_total():
+    """PRX-6075 ask 3: "cheaper" is a per-hour claim, so `over=` must window like `slow=` does.
+
+    On a boot that has been up for hours, a total that never resets reads `over=1/1` on every
+    line forever: the one overrun was at boot, and no later line can say the last hour was clean.
+    The summary resets the window half and leaves the total climbing.
+    """
+    interval = timing.SUMMARY_INTERVAL_S
+    timing.record('session_housekeeping', 5.5, budget_s=2.0, now=100.0)
+    first = timing.log_summary(now=100.0 + interval + 1.0)
+    assert first and 'over=1/1' in first[0]
+    # A clean hour: the window count is zero again, the total still remembers the boot overrun.
+    timing.record('session_housekeeping', 0.4, budget_s=2.0, now=200.0)
+    view = timing.snapshot()['session_housekeeping']
+    assert view['over_budget_since_summary'] == 0
+    assert view['over_budget_total'] == 1
+    second = timing.log_summary(now=200.0 + interval + 1.0)
+    assert second and 'budget_used=400ms/2000ms over=0/1' in second[0]
+
+
 def test_a_watcher_without_a_budget_reports_no_budget_fields():
     """Existing watchers keep the line they had: a ceiling nothing enforces must not be printed."""
     timing.record('profile_reconcile', 0.25, now=100.0)

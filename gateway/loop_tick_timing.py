@@ -155,7 +155,12 @@ def log_summary(now: float | None = None) -> list[str] | None:
         line = _line(name, value)
         logger.info(line)
         lines.append(line)
+        # Both counts are "since the last summary" in the line (`slow=` / `over=`), each beside its
+        # own running total. Resetting only one of them makes the other read `<total>/<total>` on
+        # every line, so a sweep cannot tell an overrun in THIS window from one at boot — which is
+        # the only question a per-hour claim asks (PRX-6075 ask 3, PRX-6091).
         _counters[name]['slow'] = 0
+        _counters[name]['over'] = 0
     return lines
 
 
