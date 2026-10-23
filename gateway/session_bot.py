@@ -294,27 +294,49 @@ async def _create_bot_chat(authority, actor, *, displace=None):
     if lock is None:
         lock = authority._titled_create_lock = asyncio.Lock()
     async with lock:
-        held = authority.db.get_session_by_title('Bot Chat')
-        if held is not None:
-            if displace is None or held['id'] != displace or displaceable_bot_chat(authority, held) != displace:
+        step, payload = await asyncio.to_thread(_bot_chat_step, authority, actor, displace)
+        if step == 'displace':
+            logger.warning("Bot Chat title held by %s, a conversation no FIFO can own: moving it aside", payload)
+            if not await tracked_write(authority, partial(_displace_bot_chat, authority.db, payload)):
                 return None
-            logger.warning("Bot Chat title held by %s, a conversation no FIFO can own: moving it aside", displace)
-            if not await tracked_write(authority, partial(_displace_bot_chat, authority.db, displace)):
-                return None
-        # The Bot Chat follows its profile whoever mints it (a Bot or cron delivery, a peer DM),
-        # the same contract Desktop's create asks for. A later profile change reaches it.
-        request_id = _bot_chat_creation_id(authority, actor)
-        params = {'request_id': request_id, 'source': 'cli', 'cwd': str(Path.home()),
-                  'follow_profile_config': True}
-        # A creation staged by an older build, before this flag, resumes as it was staged.
-        if not staged_creation_follows(authority, actor, request_id):
-            params.pop('follow_profile_config')
-        ref = stage_local_session(authority, actor, params)
+            step, payload = await asyncio.to_thread(_bot_chat_step, authority, actor, displace)
+        if step != 'staged':  # ('held', None): another owner of the title, nothing minted here
+            return None
+        ref = payload
         if isinstance(ref, dict):
             await tracked_write(authority, partial(commit_local_session, authority.db, epoch=authority.epoch, receipt=ref))
-            ref = restore_local_session(authority, ref['session_id'])
+            ref = await asyncio.to_thread(restore_local_session, authority, ref['session_id'])
         await tracked_write(authority, partial(title_new_session, authority, ref, 'Bot Chat'))
         return ref
+
+
+def _bot_chat_step(authority, actor, displace):
+    """The deciding reads and the staging for ``_create_bot_chat``, run in a worker.
+
+    Returns ``('held', None)`` when nothing may be minted, ``('displace', sid)`` when *displace*
+    must be moved off the title first, else ``('staged', ref_or_receipt)``.
+
+    A ``get_session`` (here and inside ``staged_creation_follows`` / ``stage_local_session``) that
+    misses the read pool degrades to the writer connection under ``SessionDB._lock``; on a loop
+    thread that freezes every session this profile serves. Same frame and same split as
+    ``session.create`` (PRX-6015 / PRA-6517): measured here as a 20 s loop stall behind a held
+    writer. The lock in the caller keeps lookup, staging and commit one owner step.
+    """
+    from gateway.session_local import stage_local_session, staged_creation_follows
+    held = authority.db.get_session_by_title('Bot Chat')
+    if held is not None:
+        if displace is None or held['id'] != displace or displaceable_bot_chat(authority, held) != displace:
+            return 'held', None
+        return 'displace', displace
+    # The Bot Chat follows its profile whoever mints it (a Bot or cron delivery, a peer DM),
+    # the same contract Desktop's create asks for. A later profile change reaches it.
+    request_id = _bot_chat_creation_id(authority, actor)
+    params = {'request_id': request_id, 'source': 'cli', 'cwd': str(Path.home()),
+              'follow_profile_config': True}
+    # A creation staged by an older build, before this flag, resumes as it was staged.
+    if not staged_creation_follows(authority, actor, request_id):
+        params.pop('follow_profile_config')
+    return 'staged', stage_local_session(authority, actor, params)
 
 
 def _bot_chat_creation_id(authority, actor):
