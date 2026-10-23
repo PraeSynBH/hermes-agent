@@ -405,16 +405,21 @@ def drop_unrestorable_receipts(authority):
     return sids
 
 
-def _unreconstructable_receipt_ids(authority):
-    """[sid] of local receipts whose stored policy ``restore_policy`` refuses.
+def _unreconstructable_receipts(authority):
+    """``[(sid, check)]``: local receipts whose stored ``policy`` ``restore_policy`` refuses.
 
     A receipt with an unreconstructable policy is as unrestorable as one whose row is gone
     (PRX-6122). The sessions row may still exist (an empty session), so only the receipt is
-    dropped: the row is not the receipt. One read parses every policy in the profile: this
-    pass already costs more than a query per receipt.
+    dropped: the row is not the receipt. ``check`` is the same ``_refused_check`` text the boot
+    refusal line would have named, so dropping keeps the field diagnostic (#140099).
+
+    Receipt text that does not decode, or that carries no ``policy`` object, is not a policy
+    refusal: ``local_receipt``/``owned_receipt`` own that diagnostic, and it stays on the boot line.
+    One read parses every policy in the profile: this pass already costs more than a query per
+    receipt.
     """
     from gateway.session_policy import restore_policy
-    sids = []
+    out = []
     with authority.db._read_ctx() as conn:
         rows = conn.execute(
             'SELECT key, value FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',)
@@ -423,27 +428,45 @@ def _unreconstructable_receipt_ids(authority):
         sid = key[len(POLICY_PREFIX):]
         try:
             data = json.loads(value)
-            restore_policy(data['policy'])
-        except (KeyError, TypeError, ValueError, RuntimeStoreError):
-            sids.append(sid)
-    return sids
+        except ValueError:
+            continue
+        policy = data.get('policy') if isinstance(data, dict) else None
+        if not isinstance(policy, dict):
+            continue
+        try:
+            restore_policy(policy)
+        except (TypeError, ValueError, RuntimeStoreError) as exc:
+            out.append((sid, _refused_check(exc)))
+    return out
 
 
 def drop_unreconstructable_receipts(authority):
-    """Drop the receipts :func:`_unreconstructable_receipt_ids` names: their stored policy cannot be
-    restored, so every boot refuses them. The sessions row is not the receipt and stays; only the
-    receipt key is dropped."""
-    sids = _unreconstructable_receipt_ids(authority)
-    if not sids:
+    """Drop the receipts :func:`_unreconstructable_receipts` names: their stored policy cannot be
+    restored, so every boot refuses them and no resume could ever serve them. The sessions row is
+    not the receipt and stays; only the receipt key is dropped.
+
+    The one line names the count, each receipt that was dropped and the check that refused it,
+    grouped by cause: the refusal would otherwise be re-logged per receipt on every boot, and a
+    field report still needs the layer that refused it (#140099)."""
+    found = _unreconstructable_receipts(authority)
+    if not found:
         return []
 
+    sids = [sid for sid, _ in found]
     def write(conn):
         conn.executemany('DELETE FROM state_meta WHERE key=?', [(POLICY_PREFIX + sid,) for sid in sids])
 
     authority.db._execute_write(write)
+    by_check = {}
+    for sid, check in found:
+        by_check.setdefault(check, []).append(sid)
+    parts = []
+    for check, group in sorted(by_check.items()):
+        named = ', '.join(sorted(group)[:5]) + (', …' if len(group) > 5 else '')
+        parts.append(f'{len(group)} x ({check}) {named}')
     logging.getLogger(__name__).warning(
-        'Dropped %d local receipt(s) whose stored policy could not be restored, so nothing could '
-        'restore them: %s', len(sids), ', '.join(sorted(sids)[:5]) + (', …' if len(sids) > 5 else ''))
+        'Dropped %d local receipt(s) whose stored policy cannot be restored, so nothing could ever '
+        'restore them: %s', len(sids), '; '.join(parts))
     return sids
 
 

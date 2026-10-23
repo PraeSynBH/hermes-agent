@@ -228,10 +228,10 @@ async def test_boot_drops_only_the_receipts_whose_session_row_is_gone(tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_boot_drops_only_the_receipts_whose_policy_cannot_be_restored(tmp_path, monkeypatch):
+async def test_boot_drops_only_the_receipts_whose_policy_cannot_be_restored(tmp_path, monkeypatch, caplog):
     """PRX-6122: a receipt whose stored policy ``restore_policy`` refuses is as unrestorable as one
     whose row is gone. Boot drops exactly those receipts and keeps their live sessions rows; a
-    restorable receipt still restores.
+    restorable receipt still restores. The boot line names the check that refused it (#140099).
     """
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
@@ -263,6 +263,12 @@ async def test_boot_drops_only_the_receipts_whose_policy_cannot_be_restored(tmp_
                             (json.dumps(receipt), POLICY_PREFIX + bad.session_id))
 
     await recovery.recover_local_sessions_offloop(authority, schedule=False)
+
+    dropped = [r.getMessage() for r in caplog.records if r.name == 'gateway.session_local_recovery'
+               and 'Dropped' in r.getMessage()]
+    assert len(dropped) == 1, f'one boot line for the whole drop, not one per receipt: {dropped}'
+    assert bad.session_id in dropped[0], dropped[0]
+    assert 'invalid policy' in dropped[0], f'the boot line names the failing check: {dropped[0]}'
 
     with authority.db._read_ctx() as conn:
         receipts = {k for (k,) in conn.execute(
