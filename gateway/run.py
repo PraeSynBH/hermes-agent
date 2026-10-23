@@ -4161,8 +4161,9 @@ class GatewayRunner(
         # is therefore joined under the SAME drain deadline and each contributes to the live count
         # (the poll lane reads the same stores). Class-qualified: run_shutdown and tests invoke these
         # unbound on a duck-typed `self`.
+        from gateway.run_idle_gates import stop_loop_sweep_pool
         workers = (GatewayRunner._stop_pool(executor) + GatewayRunner._stop_pool(housekeeping)
-                   + GatewayRunner._stop_pool(poll))
+                   + GatewayRunner._stop_pool(poll) + list(stop_loop_sweep_pool()))
         deadline = time.monotonic() + max(float(drain_timeout or 0.0), 0.0)
         for worker in workers:
             remaining = deadline - time.monotonic()

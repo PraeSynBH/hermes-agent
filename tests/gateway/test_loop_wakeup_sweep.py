@@ -116,6 +116,24 @@ def test_a_read_that_raises_is_not_re_raised_to_the_tick(tmp_path, monkeypatch):
     assert run_idle_gates.loop_sweep(scopes) == []
 
 
+def test_shutdown_joins_the_sweep_pool(tmp_path, monkeypatch):
+    """The sweep reads the stores shutdown is about to close: its pool joins under the deadline."""
+    scopes = _homes(tmp_path, ("alpha", "beta"))
+    monkeypatch.setattr(run_idle_gates, "_LOOP_SWEEP_POOL", None)
+    monkeypatch.setattr(run_idle_gates, "_active_loops_in_home", lambda _home: [])
+    run_idle_gates.loop_sweep(scopes)
+    assert run_idle_gates._LOOP_SWEEP_POOL is not None, "a two-home sweep creates the pool"
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._executor_lock = threading.Lock()
+    runner._executor = None
+    runner._housekeeping_executor = None
+    runner._executor_closing = False
+
+    assert runner._shutdown_executor(drain_timeout=5) == 0, "no pool worker outlives the drain"
+    assert run_idle_gates._LOOP_SWEEP_POOL is None, "shutdown stops the sweep pool too"
+
+
 def test_a_raising_read_on_the_pool_does_not_lose_the_other_homes(tmp_path, monkeypatch):
     """The fan-out arm swallows the same failure the serial arm does."""
     scopes = _homes(tmp_path, ("alpha", "beta"))

@@ -124,6 +124,27 @@ def _loop_sweep_pool():
     return _LOOP_SWEEP_POOL
 
 
+def stop_loop_sweep_pool() -> list:
+    """Stop the sweep's process-lifetime pool; return its threads so shutdown can join them.
+
+    The sweep reads the same SessionDB handles ``_shutdown_executor`` is about to close over, and a
+    cold open inside it blocks for seconds on a loaded host — the wedged-mid-DB-work case that path
+    already joins the turn, housekeeping and poll pools for (#101093). It is joined under the SAME
+    drain deadline, not left to interpreter exit.
+    """
+    global _LOOP_SWEEP_POOL
+    with _LOOP_SWEEP_POOL_LOCK:
+        pool = _LOOP_SWEEP_POOL
+        _LOOP_SWEEP_POOL = None
+    if pool is None:
+        return []
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        pool.shutdown(wait=False)
+    return list(getattr(pool, "_threads", None) or ())
+
+
 def _active_loops_in_home(profile_home) -> list:
     """One home's ACTIVE loops off the store the idle gate would open; ``[]`` when unreadable."""
     from hermes_cli.loops import list_active_loops_from
