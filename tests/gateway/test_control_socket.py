@@ -498,3 +498,41 @@ def test_status_payload_carries_the_live_state_db_handle_census(home: Path, monk
     row = next(row for row in census["detail"] if row["path"] == str(path.resolve()))
     assert row["handles"]
     assert set(row["handles"][0]) == {"site", "read_only"}
+
+
+def test_ws_egress_verb_answers_the_serving_process_counters(home: Path):
+    """The control socket's frame-size/send-cost mix is readable from OUTSIDE the served loop.
+
+    The counters exist in the process doing the serving (``tui_gateway.ws_egress``); without a verb
+    an operator can only approximate that mix from a pid sample, which is what PRA-6844 was opened
+    on. The answer is a plain read — it must reflect what the writer recorded and must not reset it,
+    or the next reader sees an empty histogram.
+    """
+    from tui_gateway import ws_egress
+
+    async def scenario():
+        server = GatewayControlServer(home)
+        assert await server.start()
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, lambda: query_gateway_control(home, "ws-egress"))
+        finally:
+            await server.stop()
+
+    ws_egress.reset()
+    try:
+        assert ws_egress.record_send(900, 0.0002) is False
+        assert ws_egress.record_send(ws_egress.LARGE_FRAME_BYTES + 8, 0.05) is True
+        payload = _run(scenario())
+    finally:
+        ws_egress.reset()
+
+    assert payload["protocol"] == CONTROL_PROTOCOL_VERSION
+    assert payload["frames"] == 2
+    assert payload["bytes"] == 900 + ws_egress.LARGE_FRAME_BYTES + 8
+    assert payload["oversized_frames"] == 1
+    assert payload["max_cost_seconds"] == pytest.approx(0.05)
+    assert sum(bucket["frames"] for bucket in payload["size_buckets"]) == 2
+    assert sum(bucket["frames"] for bucket in payload["cost_buckets"]) == 2
+

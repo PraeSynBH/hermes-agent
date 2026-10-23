@@ -199,6 +199,22 @@ def build_status_payload() -> dict[str, Any]:
     return payload
 
 
+def build_ws_egress_payload() -> dict[str, Any]:
+    """Default ``ws-egress`` answer — the control socket's frame-size and send-cost mix, live.
+
+    A read-only diagnostic (PRA-6844): every frame on ``/api/ws`` is written by websockets' frame
+    writer on the served loop, and its synchronous half (permessage-deflate zlib, then ``sock.send``)
+    cannot be preempted by the caller's send deadline — so which sizes dominate and what a send costs
+    at each size is the loop-cost question for that socket. The counters live in the process doing
+    the serving, which a pid sample or a log line can only approximate. Process-wide by design: a
+    multiplexed gateway's served profiles share one control socket loop. Reset at boot, never reset
+    by a read.
+    """
+    from tui_gateway import ws_egress
+    return {**ws_egress.snapshot(), "protocol": CONTROL_PROTOCOL_VERSION, "answered_at": time.time(),
+            "answering_pid": os.getpid()}
+
+
 class GatewayControlServer:
     """Gateway-owned control socket server (identify/status, v1): ``start()`` after the PID-file claim,
     ``stop()`` on shutdown. All failures are non-fatal — the gateway never refuses to serve messaging
@@ -230,7 +246,9 @@ class GatewayControlServer:
         self._control_slots = asyncio.Semaphore(_CONTROL_EXECUTOR_WORKERS)
         self._control_executor: Optional[DaemonThreadPoolExecutor] = None
         self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
-            "identify": build_identify_payload, "status": build_status_payload, **(verb_handlers or {})}
+            "identify": build_identify_payload, "status": build_status_payload,
+            # Read-only loop-cost diagnostic for the control socket's own egress (PRA-6844).
+            "ws-egress": build_ws_egress_payload, **(verb_handlers or {})}
 
     async def start(self) -> bool:
         """Bind and start serving. Returns True on success, False otherwise."""
