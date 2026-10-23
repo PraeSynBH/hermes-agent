@@ -405,6 +405,48 @@ def drop_unrestorable_receipts(authority):
     return sids
 
 
+def _unreconstructable_receipt_ids(authority):
+    """[sid] of local receipts whose stored policy ``restore_policy`` refuses.
+
+    A receipt with an unreconstructable policy is as unrestorable as one whose row is gone
+    (PRX-6122). The sessions row may still exist (an empty session), so only the receipt is
+    dropped: the row is not the receipt. One read parses every policy in the profile: this
+    pass already costs more than a query per receipt.
+    """
+    from gateway.session_policy import restore_policy
+    sids = []
+    with authority.db._read_ctx() as conn:
+        rows = conn.execute(
+            'SELECT key, value FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',)
+        ).fetchall()
+    for key, value in rows:
+        sid = key[len(POLICY_PREFIX):]
+        try:
+            data = json.loads(value)
+            restore_policy(data['policy'])
+        except (KeyError, TypeError, ValueError, RuntimeStoreError):
+            sids.append(sid)
+    return sids
+
+
+def drop_unreconstructable_receipts(authority):
+    """Drop the receipts :func:`_unreconstructable_receipt_ids` names: their stored policy cannot be
+    restored, so every boot refuses them. The sessions row is not the receipt and stays; only the
+    receipt key is dropped."""
+    sids = _unreconstructable_receipt_ids(authority)
+    if not sids:
+        return []
+
+    def write(conn):
+        conn.executemany('DELETE FROM state_meta WHERE key=?', [(POLICY_PREFIX + sid,) for sid in sids])
+
+    authority.db._execute_write(write)
+    logging.getLogger(__name__).warning(
+        'Dropped %d local receipt(s) whose stored policy could not be restored, so nothing could '
+        'restore them: %s', len(sids), ', '.join(sorted(sids)[:5]) + (', …' if len(sids) > 5 else ''))
+    return sids
+
+
 def _recover_local_store(authority, schedule):
     """Restore every local receipt and read its admissions; return what the owner loop must schedule.
 
@@ -415,6 +457,9 @@ def _recover_local_store(authority, schedule):
     # Before the restore loop: a receipt whose session row is gone can only be refused, and the
     # refusal is re-logged on every boot until it is reconciled (PRX-6097).
     drop_unrestorable_receipts(authority)
+    # A receipt whose stored policy cannot be restored is equally unrecoverable (PRX-6122):
+    # drop the receipt, keep its sessions row, and name the count once.
+    drop_unreconstructable_receipts(authority)
     refs = []
     for sid in local_receipt_ids(authority):
         try:
