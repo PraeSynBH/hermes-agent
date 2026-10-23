@@ -112,20 +112,26 @@ _RECEIPT_DAMAGE = {
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('damage, clause', [
-    ('foreign_origin', 'entry mismatch'),
-    ('lineage', 'validate_local_lineage'),
-    ('terminal_policy', 'ValueError: terminal policy mismatch'),
-    ('malformed', 'JSONDecodeError'),
+@pytest.mark.parametrize('damage, clause, dropped', [
+    ('foreign_origin', 'entry mismatch', False),
+    ('lineage', 'validate_local_lineage', False),
+    # A policy ``restore_policy`` itself refuses is unreconstructable (PRX-6122): boot drops the
+    # receipt and names the check in the same line, and the sessions row stays.
+    ('terminal_policy', 'ValueError: terminal policy mismatch', True),
+    ('malformed', 'JSONDecodeError', False),
 ])
-async def test_a_refused_receipt_names_its_failing_check_in_the_log(tmp_path, monkeypatch, caplog, damage, clause):
+async def test_a_refused_receipt_names_its_failing_check_in_the_log(tmp_path, monkeypatch, caplog, damage, clause, dropped):
     """#140099: the client only ever sees ``storage_unavailable``; gateway.log must name the check that
     refused the receipt (the wrapped cause, or where an inner check raised), on cold recovery and on
-    every later restore, so a field report pins the layer without offline replication."""
+    every later restore, so a field report pins the layer without offline replication.
+
+    PRX-6122 splits it: a receipt whose *policy* cannot be restored is dropped at boot (one line, the
+    cause included) and keeps its sessions row, while an entry-level refusal keeps refusing."""
     import logging
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     from gateway.session_local_recovery import restore_local_session
+    from hermes_state_local import POLICY_PREFIX
     from hermes_state_runtime import RuntimeStoreError
 
     served, db, secondary = await _served_authority(tmp_path, monkeypatch, 'first')
@@ -140,8 +146,15 @@ async def test_a_refused_receipt_names_its_failing_check_in_the_log(tmp_path, mo
         recovery = [r.getMessage() for r in caplog.records if ref.session_id in r.getMessage()]
         assert any(clause in message for message in recovery), recovery
         assert len(recovery) == 1, f'one boot warning per refused receipt: {recovery}'
+        with cold.db._read_ctx() as conn:
+            kept = conn.execute('SELECT 1 FROM state_meta WHERE key=?',
+                                (POLICY_PREFIX + ref.session_id,)).fetchone() is not None
+        assert kept is not dropped, f'receipt kept={kept} expected dropped={dropped}'
         caplog.clear()
         with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
             restore_local_session(cold, ref.session_id)
     resumed = [r.getMessage() for r in caplog.records if ref.session_id in r.getMessage()]
+    if dropped:
+        # Nothing to resume: the boot line above already named the check that dropped it.
+        return
     assert any(clause in message for message in resumed), resumed
