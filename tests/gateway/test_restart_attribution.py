@@ -55,7 +55,7 @@ def test_the_request_line_lands_in_the_gateway_home_with_the_run_that_asked(tmp_
     gateway_home = tmp_path / "host-gateway"
     monkeypatch.setattr(attribution, "process_home", lambda: caller_home)
     monkeypatch.setattr(host_rendezvous, "read_record", lambda *a, **k: type(
-        "Record", (), {"home": str(gateway_home)})())
+        "Record", (), {"home": str(gateway_home), "pid": 4321})())
     monkeypatch.setenv("PAPERCLIP_RUN_ID", RUN)
     monkeypatch.setenv("PAPERCLIP_AGENT_ID", AGENT)
     monkeypatch.setenv("PAPERCLIP_TASK_ID", ISSUE)
@@ -143,6 +143,22 @@ def test_a_stale_line_is_not_this_signals_requester(tmp_path):
     log.write_text(f"{stale} path=graceful_sigusr1 target_pid={os.getpid()} caller_pid=1", encoding="utf-8")
 
     assert attribution.latest_request_for(os.getpid(), home=tmp_path) is None
+
+
+def test_a_host_record_for_another_pid_does_not_capture_the_line(tmp_path, monkeypatch):
+    """The rendezvous record is host-wide; only a record naming OUR target may choose the home."""
+    from gateway import host_rendezvous
+    from hermes_cli import gateway as gw
+
+    caller_home = tmp_path / "profiles" / "cto"
+    monkeypatch.setattr(attribution, "process_home", lambda: caller_home)
+    monkeypatch.setattr(host_rendezvous, "read_record", lambda *a, **k: type(
+        "Record", (), {"home": str(tmp_path / "someone-elses-gateway"), "pid": 9999})())
+
+    gw._record_restart_request("graceful_sigusr1", 4321)
+
+    assert attribution.request_log_path(caller_home).exists()
+    assert not (tmp_path / "someone-elses-gateway").exists()
 
 
 def test_another_processes_request_does_not_attribute_ours(tmp_path):

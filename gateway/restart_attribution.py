@@ -79,21 +79,24 @@ def request_log_path(home: Optional[Path] = None) -> Path:
     return (process_home() if home is None else Path(home)) / "logs" / REQUEST_LOG_NAME
 
 
-def target_gateway_home() -> Path:
-    """The home of the gateway that owns this host, so the line lands where it will be READ.
+def target_gateway_home(target_pid: int) -> Path:
+    """The home of the gateway we are about to signal, so the line lands where it will be READ.
 
     A CLI started inside a profile writes from that profile's home; the host gateway reads its
-    own. The per-user rendezvous record publishes the owner's launch home, so a request made from
-    any profile is still found after the restart. Falls back to this process's home when the
-    record is unreadable (single-profile or unsupervised setups, where the two are equal).
+    own. The per-user rendezvous record publishes the owner's launch home — but only when it names
+    the pid being signalled: the record is host-wide, so accepting one for a different pid would
+    write the line into another gateway's log (the harness that proved this change dropped its
+    line into the production log exactly that way). Falls back to this process's home, which is
+    the target's too in every single-profile setup.
     """
     try:
         from gateway import host_rendezvous as hr
 
         record = hr.read_record(hr.ROLE_GATEWAY, include_stale=True)
-        home = getattr(record, "home", "")
-        if home:
-            return Path(home).expanduser()
+        if record is not None and getattr(record, "pid", None) == int(target_pid):
+            home = getattr(record, "home", "")
+            if home:
+                return Path(home).expanduser()
     except Exception:
         logger.debug("Host gateway home unavailable; using this process's home", exc_info=True)
     return process_home()
@@ -136,7 +139,7 @@ def record_request(path: str, target_pid: int, detail: str = "", *, home: Option
     if detail:
         parts.append(f"detail={detail}")
     try:
-        log_path = request_log_path(target_gateway_home() if home is None else home)
+        log_path = request_log_path(target_gateway_home(target_pid) if home is None else home)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(" ".join(parts) + "\n")
