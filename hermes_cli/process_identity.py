@@ -167,6 +167,10 @@ class LedgerEntry:
     # `serve --isolated`: opted out of the host singleton (Desktop's SSH backend for another
     # machine). Attach-first readers must never adopt it; argv is truncated, so this is canonical.
     isolated: bool = False
+    # Session ownership: the session ID this child was spawned for (if any) and its process group.
+    # The session teardown kills the whole group, so a restart wrapper's successor goes with it.
+    session_id: Optional[str] = None
+    pgid: Optional[int] = None
 
 
 def _ledger_path() -> Path:
@@ -308,19 +312,28 @@ def _pid_alive_matches(pid: int, create_time: Optional[float], *, strict: bool =
         return None
 
 
-def register_self(purpose: str, *, project_root: Optional[Path] = None, detail: Optional[dict] = None) -> bool:
+def register_self(purpose: str, *, project_root: Optional[Path] = None, detail: Optional[dict] = None,
+                  session_id: Optional[str] = None, pgid: Optional[int] = None) -> bool:
     """Record this process in the machine spawn ledger. Best-effort.
 
     Called at the top of every long-lived entry point; dead ``(pid, create_time)`` entries are
     pruned on every write. ``detail`` may carry ``host``/``port``/``profile`` so the update
     pipeline can relaunch a manually-started serve with its real bind address, and ``isolated``
     so attach-first discovery skips a backend that opted out of the host singleton.
+    ``session_id``/``pgid`` record the owning session and process group so a session teardown can
+    killpg the whole tree when the turn is killed.
     """
     from hermes_constants import hermes_home_key
 
     tag = parse_spawn_tag(os.environ.get(SPAWN_ENV_VAR))
     spawner_pid, spawner_create = (tag.spawner_pid, tag.spawner_create) if tag else _desktop_spawner_identity()
-    entry = _new_entry(os.getpid(), _process_create_time(), purpose, project_root, spawner_pid, spawner_create)
+    if pgid is None and not _IS_WINDOWS:
+        try:
+            pgid = os.getpgid(os.getpid())
+        except OSError:
+            pgid = None
+    entry = _new_entry(os.getpid(), _process_create_time(), purpose, project_root, spawner_pid, spawner_create,
+                       session_id=session_id, pgid=pgid)
     entry.hermes_home = hermes_home_key()
     if detail:
         try:
@@ -411,9 +424,11 @@ def _desktop_spawner_identity() -> tuple[Optional[int], Optional[float]]:
 def _new_entry(
     pid: int, create_time: Optional[float], purpose: str, project_root: Optional[Path],
     spawner_pid: Optional[int], spawner_create: Optional[float],
+    session_id: Optional[str] = None, pgid: Optional[int] = None,
 ) -> LedgerEntry:
     return LedgerEntry(
-        pid, create_time, purpose, install_id(project_root), spawner_pid, spawner_create, time.time(), argv=""
+        pid, create_time, purpose, install_id(project_root), spawner_pid, spawner_create, time.time(), argv="",
+        session_id=session_id, pgid=pgid,
     )
 
 
@@ -449,13 +464,16 @@ def _append_entry(entry: LedgerEntry) -> bool:
             return False
 
 
-def register_child(pid: int, purpose: str, *, project_root: Optional[Path] = None) -> bool:
+def register_child(pid: int, purpose: str, *, project_root: Optional[Path] = None,
+                   session_id: Optional[str] = None, pgid: Optional[int] = None) -> bool:
     """Record a CHILD process this process just spawned. Best-effort.
 
     Mirror of :func:`register_self` for children that cannot register themselves (stdio MCP
     helpers: arbitrary ``npx``/binary servers never import Hermes code). Records the child's
     ``(pid, create_time)`` with THIS process as spawner, so a helper whose spawner is provably gone
-    is a reapable orphan and one whose spawner is alive is never reaped.
+    is a reapable orphan and one whose spawner is alive is never reaped. ``session_id``/``pgid``
+    record the owning session and the group to kill on session teardown; ``pgid`` defaults to the
+    child's own group when it leads one (``start_new_session``), matching the reap contract.
     """
     try:
         pid = int(pid)
@@ -464,7 +482,13 @@ def register_child(pid: int, purpose: str, *, project_root: Optional[Path] = Non
     child_create = _process_create_time(pid) if pid > 0 else None
     if child_create is None:
         return False
-    entry = _new_entry(pid, child_create, purpose, project_root, os.getpid(), _process_create_time())
+    if pgid is None and not _IS_WINDOWS:
+        try:
+            pgid = os.getpgid(pid)
+        except OSError:
+            pgid = None
+    entry = _new_entry(pid, child_create, purpose, project_root, os.getpid(), _process_create_time(),
+                       session_id=session_id, pgid=pgid)
     try:
         import psutil
 
@@ -499,6 +523,24 @@ def ledger_entries(
         and (_pid_alive_matches(e["pid"], e.get("create_time"), strict=True) is True
              if verified_only else _pid_alive_matches(e["pid"], e.get("create_time")) is not False)
     ]
+
+
+def ledger_entries_for_sessions(session_ids: Sequence[str], *,
+                               project_root: Optional[Path] = None) -> list[dict]:
+    """Live ledger entries whose recorded ``session_id`` is in *session_ids*.
+
+    The session teardown calls this to find the process groups a turn spawned. An empty
+    ``session_ids`` returns nothing: never a sweep of "every entry without a session".
+    """
+    if not session_ids:
+        return []
+    wanted = set(session_ids)
+    try:
+        entries = ledger_entries(project_root=project_root)
+    except Exception:
+        logger.debug("could not read the spawn ledger for session reap", exc_info=True)
+        return []
+    return [e for e in entries if e.get("session_id") in wanted]
 
 
 def spawner_is_dead(entry: dict) -> Optional[bool]:

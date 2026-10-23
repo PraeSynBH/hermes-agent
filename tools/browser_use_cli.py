@@ -641,7 +641,7 @@ def _daemon_pid(pid_path: Optional[Path]) -> Optional[int]:
 
 
 def _register_started_daemon(env: dict, pid_path: Optional[Path], before_pid: Optional[int],
-                             started: float) -> None:
+                             started: float, session_id: Optional[str] = None) -> None:
     """Record a harness daemon THIS call caused to start in the machine spawn ledger.
 
     The daemon detaches into its own session (``ipc.spawn_kwargs``) and reparents to init when the
@@ -667,7 +667,7 @@ def _register_started_daemon(env: dict, pid_path: Optional[Path], before_pid: Op
         return  # pre-dates this call: a concurrent Hermes started it, not us
     from hermes_cli.process_identity import register_child
 
-    register_child(after, "browser-harness-daemon")
+    register_child(after, "browser-harness-daemon", session_id=session_id)
 
 
 def _route_exec(env: dict, session: str, task_id: Optional[str], local: bool, local_sidecar: bool,
@@ -792,7 +792,7 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         finally:
             # A daemon the CLI started detaches and outlives every call: record it so the startup
             # reconciler can prove and reap it if this Hermes dies before stop_harness_daemons runs.
-            _register_started_daemon(env, pid_path, before_pid, started)
+            _register_started_daemon(env, pid_path, before_pid, started, session_id=task_id)
 
     if bot_desktop_browser:
         from tools.browser_session import run_fenced

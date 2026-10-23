@@ -7,7 +7,9 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import threading
+import time
 from pathlib import Path
 
 from hermes_state_runtime import RuntimeStoreError
@@ -1168,6 +1170,7 @@ def release_session_workspaces(authority, session_ids):
                 roots.append(cwd)
             unbind_turn_workspace(sid)
     _release_lsp_workspaces(roots)
+    _release_session_process_groups(session_ids)
 
 
 def _release_lsp_workspaces(roots: list[str]) -> None:
@@ -1197,6 +1200,50 @@ def _release_lsp_workspaces(roots: list[str]) -> None:
         threading.Thread(target=_release, daemon=True, name='lsp-session-release').start()
     except RuntimeError:  # interpreter shutting down: a daemon thread is no longer startable
         _release()
+
+
+def _release_session_process_groups(session_ids: list[str]) -> None:
+    """Best-effort, off-loop kill of process groups recorded for *session_ids*.
+
+    A leaked process group is the same event as a leaked LSP client: both are children of a
+    session that is gone. ``killpg`` on the recorded PGID takes the whole group, so a restart
+    wrapper's successor or a daemon's browser goes with it (PRA-6601/PRA-6928). Skips our own
+    group so a bad ledger row can never take down the gateway.
+    """
+    if not session_ids:
+        return
+
+    def _kill() -> None:
+        from hermes_cli.process_identity import ledger_entries_for_sessions
+        try:
+            entries = ledger_entries_for_sessions(session_ids)
+        except Exception:
+            logger.debug('spawn-ledger read failed during session process-group teardown', exc_info=True)
+            return
+        for entry in entries:
+            pgid = entry.get('pgid')
+            if not isinstance(pgid, int) or pgid <= 0:
+                continue
+            try:
+                if pgid == os.getpgid(0):
+                    continue  # never kill our own group
+            except OSError:
+                pass
+            try:
+                os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX-only branch
+            except OSError:
+                pass
+            time.sleep(0.5)
+            try:
+                os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only branch
+            except OSError:
+                pass
+            logger.info('reaped process group %s for closed session', pgid)
+
+    try:
+        threading.Thread(target=_kill, daemon=True, name='session-process-group-release').start()
+    except RuntimeError:  # interpreter shutting down: a daemon thread is no longer startable
+        _kill()
 
 
 @contextmanager
