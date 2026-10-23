@@ -13,6 +13,11 @@ verb (``hermes_cli/profiles.py`` create/delete fire it through the control socke
 changed since its adapters were last built is re-scanned too: creators make the profile first and add the
 bot token afterwards, and without this an adapter-less profile would stay adapter-less forever.
 
+The watcher's FIRST pass is not a tick: ``prime_profile_reconcile`` runs the hook-consent sync and
+the first full diff during startup, where that cold fan-out over every served home is free
+(PRX-5989). Left in the tick it cost p95 49-113 s on a 17-profile boot and 40-2,800 ms on the very
+next passes; the tick still owns every pass after the first, unchanged.
+
 The same watcher tick (on every gateway, multiplexed or not) re-syncs a home's shell hooks when its
 ``shell-hooks-allowlist.json`` (or ``config.yaml``) changed: a non-TTY gateway skips unconsented hooks, so consent recorded
 afterwards must register them without a restart (#132993). That re-runs hook registration only, never
@@ -23,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any, Optional
@@ -147,6 +153,42 @@ class GatewayProfileReconcileMixin:
                 raise
             except Exception:
                 logger.warning("Served-profile reconcile failed; retrying next cycle", exc_info=True)
+
+    async def prime_profile_reconcile(self, *, reason: str = "boot") -> dict[str, Any]:
+        """The watcher's first pass, run during startup instead of inside its first tick.
+
+        On a multiplexed boot the first pass is a cold fan-out over every served home:
+        ``_sync_hooks_on_consent_change`` loads each home's ``config.yaml`` and re-registers its
+        shell hooks — measured on this 17-profile host at 427 ms of config loads plus 506 ms of
+        hook registration, with every ``sync_from_config`` loading the config a SECOND time, and
+        each of those loads much dearer while the rest of the boot competes for the interpreter —
+        and ``reconcile_served_profiles`` then walks ``profiles/`` and settles the served set.
+        The demand snapshot it refreshes is already warm (``run_bootstrap._start_gateway_early_demand_prewarm``,
+        SOU-3125); this pass is the remaining cold item. Inside the 30 s watcher tick that burst was
+        measured at p95 49-113 s while the very next ticks were 40-2,800 ms (PRX-5989): the work
+        is off-loop already, so what the tick paid was thread-pool hops queueing behind the rest
+        of the boot plus the GIL contention the burst caused its neighbours
+        (``loop_wakeup_scan`` and ``session_housekeeping`` spiked in the same minute). Startup is
+        where that latency is free — adapters are connected and ``_running`` is set — and the
+        watcher's own first tick is then a warm no-op.
+
+        Recorded under its own counter (``profile_reconcile_boot``), never the watcher's: this is
+        boot cost, and a regression here must stay visible AS boot cost instead of hiding in a
+        tick's ``boot_max``.
+        """
+        from gateway.loop_tick_timing import timed
+        start = time.monotonic()
+        with timed('profile_reconcile_boot'):
+            await self._sync_hooks_on_consent_change()
+            applied = (await self.reconcile_served_profiles(reason=reason)
+                       if self._multiplex_on() else {})
+        logger.info(
+            "Boot first pass: %d home(s) hook-synced, %d profile change(s) applied (%.0fms)",
+            len(self._hook_consent_signatures or {}),
+            sum(len(applied.get(key) or ()) for key in ("added", "removed", "rescanned")),
+            (time.monotonic() - start) * 1000.0,
+        )
+        return applied
 
     async def _sync_hooks_on_consent_change(self) -> None:
         """Re-sync the shell hooks of each home (launch + served) whose consent allowlist or config
