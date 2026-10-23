@@ -156,14 +156,20 @@ class GatewayProfileReconcileMixin:
             try:
                 # Wall time of the tick, summarised (~10 min) beside the dumps: this ticker is the
                 # entry point of five of PRX-5524's blocked-loop dumps, so its trend is the evidence.
+                # The two halves get their own counters beside the whole tick (PRA-6850): the work in
+                # them measures in single-digit milliseconds when warm, so a tick that is still a
+                # second while both halves are cheap is the shared executor's queue, not this code —
+                # and that is only readable from the three lines side by side.
                 from gateway.loop_tick_timing import timed
                 with timed('profile_reconcile'):
-                    await self._sync_hooks_on_consent_change()
+                    with timed('profile_reconcile_hooks'):
+                        await self._sync_hooks_on_consent_change()
                     # A standalone gateway never runs a profile reconcile from the watcher, unless it is
                     # the single-profile boot that starts multiplexing in place for a newly created
                     # profile.
                     if self._multiplex_on() or await self._multiplex_for_added_profile():
-                        await self.reconcile_served_profiles(reason="watcher")
+                        with timed('profile_reconcile_served'):
+                            await self.reconcile_served_profiles(reason="watcher")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -250,7 +256,6 @@ class GatewayProfileReconcileMixin:
         whose store is unusable is parked (logged, not served) and left for an explicit rescan.
         Returns ``{"added", "removed", "rescanned", "parked", "served_profiles"}``."""
         from gateway.run import MultiplexConfigError
-        from hermes_cli.profiles import profiles_to_serve
         result: dict[str, Any] = {"added": [], "removed": [], "rescanned": [], "parked": [], "reason": reason}
         if not self._multiplex_on() and not await self._multiplex_for_added_profile():
             return {**result, "multiplex": False, "served_profiles": self.served_profile_names()}
@@ -261,10 +266,16 @@ class GatewayProfileReconcileMixin:
             active = getattr(self, "_primary_profile_name", None) or "default"
             # Demand feeds the ranking the enumeration below applies, and reads every named
             # profile's cron store + .env: off the loop, once per tick, exactly like the served-set
-            # signature sweep further down (SOU-3075 §3.4).
-            await self._refresh_demand_offloop()
-            live = {str(name): Path(home) for name, home in
-                    await asyncio.to_thread(profiles_to_serve, True)}
+            # signature sweep (SOU-3075 §3.4).
+            # One off-loop pass for the three reads a cycle needs (PRA-6850). Each
+            # ``asyncio.to_thread`` is a hop onto the shared default executor, and on a busy host the
+            # hops — not the reads — are what a tick costs: the tick that named this card spent
+            # 1 138 ms with the loop idle in ``select`` the whole time, while the work below measures
+            # in tens of milliseconds warm. Sequential hops each pay that queue again, so they are
+            # one call, in the order the reads depend on each other (demand feeds the ranking the
+            # enumeration applies).
+            live, live_signatures = await asyncio.to_thread(self._live_profiles_snapshot)
+            live = {str(name): Path(home) for name, home in live.items()}
             listed = set(live)  # a probe skip below is not a deletion: it never clears a parked verdict
             known = dict(self._served_profile_homes or {})
             from gateway.status import live_gateway_pid_for_home
@@ -335,11 +346,10 @@ class GatewayProfileReconcileMixin:
                 removed = [n for n in removed if n not in held]
                 live.update({n: known[n] for n in held})
             # Signature compare off the loop too: it stats config.yaml + .env for every served
-            # profile, and this runs on the 30 s watcher while turns are executing.
+            # profile, and this runs on the 30 s watcher while turns are executing. The stats rode
+            # along with the enumeration above (same worker, one hop), so the compare is a dict read.
             candidates = [n for n in live if n in known and n != active and n not in added]
-            current_sigs = await asyncio.to_thread(
-                _serve_signatures, {n: live[n] for n in candidates})
-            changed = [n for n in candidates if current_sigs[n] != sigs.get(n)]
+            changed = [n for n in candidates if live_signatures.get(n) != sigs.get(n)]
             current = {n: h for n, h in live.items() if n in known or n == active}
             applied = await self._apply_profile_changes(
                 current, added, removed, changed, reason=reason, live=live, result=result,
@@ -356,19 +366,30 @@ class GatewayProfileReconcileMixin:
                 publish_serving_decision(self)
             return applied
 
-    async def _refresh_demand_offloop(self) -> None:
-        """Refresh the demand snapshot for this tick, off the event loop (§3.4).
+    def _live_profiles_snapshot(self) -> tuple[dict[str, Path], dict[str, tuple]]:
+        """The tick's off-loop half: demand refresh, served enumeration, per-home signatures.
 
-        A no-op (never a failure) when the host sets no ceiling: nothing is ranked, so nothing is
-        read. The read is authoritative rather than TTL-gated so a 30 s tick always sees a cron or
-        manifest change within the acceptance window; the snapshot's own 5 s TTL then makes the
-        per-route reads inside the tick zero-I/O.
+        Blocking, and one thread hop for all three (§3.4, PRA-6850). Each of these used to be its
+        own ``asyncio.to_thread`` — three queue waits on the shared default executor for work that
+        measures in tens of milliseconds warm, which is why a quiet tick could still cost a second
+        with the loop idle the whole time. Order matters and is the order of the dependencies:
+        ``demand.refresh`` fills the snapshot the ceiling's ranking reads, so it goes first.
+
+        The demand read is a no-op (never a failure) when the host sets no ceiling: nothing is
+        ranked, so nothing is read. It is authoritative rather than TTL-gated so a 30 s tick always
+        sees a cron or manifest change within the acceptance window; the snapshot's own 5 s TTL then
+        makes the per-route reads inside the tick zero-I/O.
+
+        ``profile_serve_signature`` is two ``os.stat`` calls per served profile; riding along here
+        keeps them off the loop without paying a hop of their own.
         """
         from hermes_cli import gateway_multiplex_capacity as capacity
-        if capacity.profile_ceiling() is None:
-            return
-        from hermes_cli import gateway_multiplex_demand as demand
-        await asyncio.to_thread(demand.refresh)
+        from hermes_cli.profiles import profiles_to_serve
+        if capacity.profile_ceiling() is not None:
+            from hermes_cli import gateway_multiplex_demand as demand
+            demand.refresh()
+        homes = {str(name): Path(home) for name, home in profiles_to_serve(True)}
+        return homes, _serve_signatures(homes)
 
     def _hold_busy_capacity_removals(self, removed, added, live, deferred_by_capacity):
         """Hold capacity deferrals that hold live work, and park the newcomers they displace.
