@@ -685,6 +685,12 @@ class LSPService:
                 return None
             return await self._attach_root(srv, client, root) if client is not None else None
         try:
+            # Charge the budget before a new tree is born, not only on the next sweep.  A spawn
+            # burst spends GiB in the seconds between two sweeps (tsserver reaches ~1 GiB inside a
+            # minute), so a sweep-only cap left observed peaks at ~2x the budget.  Our own key is
+            # in ``_spawning`` while this runs, so the trim never evicts the client we are about to
+            # create.
+            await self._enforce_rss_budget()
             client = await self._spawn_client(srv, root, trusted)
             if client is None:
                 self._mark_broken((srv.server_id, root))

@@ -179,3 +179,35 @@ def test_create_from_config_reads_the_budget(monkeypatch, value, expected):
     assert service is not None
     assert service._max_total_rss_mb == expected
     service.shutdown()
+
+
+def test_spawn_charges_the_budget_before_starting_a_new_tree(monkeypatch):
+    """The sweep alone leaves peaks at ~2x: tsserver reaches ~1 GiB between two 60s sweeps."""
+    from agent.lsp.servers import ServerDef
+
+    service = _service(2048.0)
+    fake_client = _FakeClient(71, "/w/new")
+    order: list[str] = []
+    srv = ServerDef(server_id="fake-ls", extensions=(".fake",), resolve_root=lambda fp, ws: ws,
+                    build_spawn=lambda root, ctx: None, seed_first_push=False)
+    monkeypatch.setattr(service, "_server_for", lambda fp: srv)
+    monkeypatch.setattr(manager_mod, "resolve_workspace_for_file", lambda fp: ("/w/new", True))
+    monkeypatch.setattr(service, "_trusted", lambda root: True)
+
+    async def _enforce():
+        order.append("budget")
+
+    async def _spawn(_srv, _root, _trusted):
+        order.append("spawn")
+        return fake_client
+
+    async def _attach(_srv, client, _root):
+        order.append("attach")
+        return client
+
+    monkeypatch.setattr(service, "_enforce_rss_budget", _enforce)
+    monkeypatch.setattr(service, "_spawn_client", _spawn)
+    monkeypatch.setattr(service, "_attach_root", _attach)
+
+    assert asyncio.run(service._get_or_spawn("/w/new/x.fake")) is fake_client
+    assert order == ["budget", "spawn", "attach"]
