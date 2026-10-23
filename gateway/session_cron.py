@@ -138,7 +138,11 @@ async def operation(authority, name, params, actor=None):
         request_id = cron_request_id(params['job_id'], params['request_id'])
         sid = local_identity(authority.profile_id, actor.subject, request_id)
         from hermes_state_runtime import list_session_admissions
-        rows = list_session_admissions(authority.db, session_id=sid, pending_only=False)
+        # Off the owner loop for the same reason ``_create``'s retry-exists read is: a read that
+        # misses the read pool degrades to the writer connection under ``SessionDB._lock``
+        # (``hermes_state._read_ctx``'s documented fallback), so a held writer would freeze every
+        # session, timer and socket this profile serves while a firer recovers a lost receipt.
+        rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=sid, pending_only=False)
         row = next((r for r in rows if r['request_id'] == request_id and r['principal_id'] == actor.subject), None)
         if row is None:
             return {'status': 'missing', 'result': None}
@@ -179,7 +183,13 @@ async def operation(authority, name, params, actor=None):
         raise RuntimeStoreError('invalid_params')
     ref = SessionRef(authority.profile_id, params['session_id'])
     authority.authorize(actor, ref, 'session:submit')
-    row = get_session_admission(authority.db, admission_id=params['admission_id'])
+    # The status/cancel read is the one a cron firer polls every 0.1-2 s for the whole run, so it is
+    # the most frequent loop-resident ``_read_ctx`` entry in the process: a pool miss takes the writer
+    # connection under ``SessionDB._lock`` and a held writer (transcript flush, housekeeping) turns
+    # that poll into a loop stall — the 2026-10-22 13:44:02 shutdown-watchdog stack
+    # (``cron.scheduler_authority.observe`` -> ``session_cron.operation`` -> ``get_session_admission``
+    # -> ``_read_ctx``) sits inside one. Same remedy as the creation path beside it: read in a worker.
+    row = await asyncio.to_thread(get_session_admission, authority.db, admission_id=params['admission_id'])
     if row is None or row['target_session_id'] != ref.session_id or row['principal_id'] != actor.subject:
         raise RuntimeStoreError('permission_denied')
     if name == 'cancel':
@@ -193,7 +203,9 @@ async def operation(authority, name, params, actor=None):
     result, flags = None, {}
     if row['status'] == 'terminal':
         from gateway.session_results import admission_result
-        saved = admission_result(authority.db, row['admission_id'])
+        # Same rule as the row read above: the saved result is another ``_read_ctx`` read, and a
+        # terminal poll happens on a loop that may already be behind a held writer.
+        saved = await asyncio.to_thread(admission_result, authority.db, row['admission_id'])
         result = saved['result'].get('cron_result') if saved else None
         flags = (saved['result'].get('cron_job_flags') or {}) if saved else {}
         if result is None:
