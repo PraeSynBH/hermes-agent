@@ -304,12 +304,13 @@ def clear_loop(session_id: str) -> None:
         save_loop(session_id, state)
 
 
-def list_active_loops() -> list[tuple[str, LoopState]]:
-    """``[(session_id, LoopState), ...]`` for every ACTIVE loop; ``[]`` on any DB error.
+def list_active_loops_from(db: Any) -> list[tuple[str, LoopState]]:
+    """``[(session_id, LoopState), ...]`` for every ACTIVE loop in *db*; ``[]`` on any DB error.
 
-    Used by the gateway's idle wakeup watcher, which scans for due loops on a coarse tick.
+    Takes the store explicitly so a sweep over many served homes reads each one off the handle the
+    idle gate already opened (``gateway.run_idle_gates.loop_sweep``), instead of re-resolving the
+    ambient home per read.
     """
-    db = _get_session_db()
     if db is None:
         return []
     out: list[tuple[str, LoopState]] = []
@@ -319,6 +320,14 @@ def list_active_loops() -> list[tuple[str, LoopState]]:
         if state is not None and state.status == "active":
             out.append((session_id, state))
     return out
+
+
+def list_active_loops() -> list[tuple[str, LoopState]]:
+    """``[(session_id, LoopState), ...]`` for every ACTIVE loop; ``[]`` on any DB error.
+
+    Used by the gateway's idle wakeup watcher, which scans for due loops on a coarse tick.
+    """
+    return list_active_loops_from(_get_session_db())
 
 
 def store_has_active_loop(db: Any) -> bool:

@@ -546,29 +546,16 @@ class GatewayGoalsMixin:
 
         Multiplex: one gateway-wide task, so ``list_active_loops`` alone reads only the launch home's
         store — a ``/loop`` set from a secondary profile's chat would never fire. Every served
-        profile's store is scanned under its own runtime scope (same shape as ``_handoff_watcher``),
-        and each hit is fired against that profile's adapters."""
-        from gateway.run_idle_gates import active_loop_in_store, offload_for_poll, poll_plan
+        profile's store is read under its own home (same shape as ``_handoff_watcher``), and each hit
+        is fired against that profile's adapters.
+        """
+        from gateway.loop_tick_timing import timed
+        from gateway.run_idle_gates import active_loop_in_store, loop_sweep, offload_for_poll, poll_plan
+
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
 
         _scope = _wakeup_scan_scope
-
-        async def _scan_one_store(profile_name: Optional[str]) -> None:
-            from hermes_cli.loops import list_active_loops
-
-            # Warm once per scan: the scan reads every persisted loop and a cold cache would
-            # run the state.db init on the loop thread before the first read. Both hops ride the
-            # poll lane: neither is agent work, and a turn-pool hop here was one fresh OS thread
-            # per scanned profile per tick (PRA-6660's class, PRA-6791's lane).
-            poll_offload = offload_for_poll(self)
-            await self._warm_goals_session_db("loop wakeup", offload=poll_offload)
-            # Off-loop too: the read is lock-free under WAL but convoys on the writer lock without it.
-            active_loops = await (poll_offload(list_active_loops) if poll_offload is not None
-                                  else asyncio.to_thread(list_active_loops))
-            now = time.time()
-            for sid, state in active_loops:
-                await self._loop_wakeup_fire_one(sid, state, now, warned_no_route, profile_name)
 
         while self._running:
             try:
@@ -577,13 +564,27 @@ class GatewayGoalsMixin:
                 # Idle gate (run_idle_gates.poll_plan): ONE sweep per scan for every served profile
                 # (PRA-6660), not one turn-pool hop each. The root scan (None) is unscoped and cheap.
                 scopes, busy = await poll_plan(self, active_loop_in_store)
-                for profile_name, profile_home in scopes:
-                    if profile_home is not None and profile_home not in busy:
-                        continue
-                    from gateway.loop_tick_timing import timed
+                targets = [(name, home) for name, home in scopes
+                           if home is None or home in busy]
+                # ONE hop for the whole scan (PRA-6806). Two hops per profile per tick queued 34 of
+                # them behind themselves on the 2-worker poll lane; the read itself is single-digit
+                # ms warm, so the queue WAS the tick (PRA-6794 p50 236-717 ms). The fan-out over
+                # homes is bounded inside the hop, and each read only installs the HERMES_HOME
+                # override — entering the full per-profile runtime scope (config + .env + terminal
+                # policy) to read a store was 4-708 ms per home per tick of pure overhead.
+                if targets:
+                    offload = offload_for_poll(self)
                     with timed('loop_wakeup_scan'):
+                        swept = await (offload(loop_sweep, targets) if offload is not None
+                                       else asyncio.to_thread(loop_sweep, targets))
+                    now = time.time()
+                    for profile_name, profile_home, hits in swept:
+                        # Firing writes (tick claim, delivery row) and injects a turn, so it keeps
+                        # the profile's own runtime scope; only the READ dropped it.
                         async with _scope(profile_home):
-                            await _scan_one_store(profile_name)
+                            for sid, state in hits:
+                                await self._loop_wakeup_fire_one(
+                                    sid, state, now, warned_no_route, profile_name)
             except Exception as exc:
                 logger.debug("loop wakeup watcher error: %s", exc)
             await asyncio.sleep(interval)
