@@ -488,7 +488,8 @@ class Venv(StatePackage):
             lock_and_sync(members, extras, root=target / "workspace",
                           seed_lock=seed, frozen=repair or not members, replay=replay,
                           source=project, environment=environment)
-            environment.check()
+            resolved_lock = target / "workspace" / "uv.lock"
+            environment.check(resolved_lock)
             if repair:
                 from pm.environments import venv_command
                 from pm.recovery import validate_environment
