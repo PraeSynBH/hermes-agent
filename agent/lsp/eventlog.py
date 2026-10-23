@@ -156,6 +156,16 @@ def log_reaped(keys: list[tuple[str, str]], idle_timeout: float) -> None:
     _emit("reaper", logging.INFO, f"reaped {len(keys)} idle client(s) after {idle_timeout:.0f}s: {summary}")
 
 
+def log_budget_evicted(keys: list[tuple[str, str]], budget_mb: float) -> None:
+    """Clients were shut down because their process trees pushed the service past its RSS budget.
+    INFO, one line per sweep; forgets the ``log_active`` announcement so a respawn re-announces."""
+    with _announce_lock:
+        _announced_active.difference_update(keys)
+    summary = ", ".join(f"{sid} ({root})" for sid, root in keys)
+    _emit("reaper", logging.INFO,
+          f"evicted {len(keys)} client(s) over the {budget_mb:.0f} MiB LSP budget: {summary}")
+
+
 def log_released(keys: list[tuple[str, str]], reason: str) -> None:
     """Clients were shut down because their workspace went away (worktree released or root deleted).
     INFO, one line per event; forgets the ``log_active`` announcement like :func:`log_reaped`."""
@@ -175,6 +185,7 @@ def reset_announce_caches() -> None:
 __all__ = [
     "event_log",
     "log_active",
+    "log_budget_evicted",
     "log_clean",
     "log_diagnostics",
     "log_disabled",
