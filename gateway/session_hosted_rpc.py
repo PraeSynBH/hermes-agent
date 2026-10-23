@@ -75,16 +75,26 @@ class HostedRoomAuthorityRPC:
             return None
         return await self._resume(params)
 
-    async def _create(self, params):
-        if self.authority.db.get_session(self.ref.session_id) is not None:
-            return await self._resume(params)
+    def _stage_create(self):
+        """The read that decides create-vs-resume and the staging that follows it, in one worker.
+
+        Returns None when the member's session already exists (the caller resumes it), else the
+        receipt (or an already-committed ref) ``_create`` commits.
+
+        ``get_session`` here and inside ``stage_local_session`` (``session_local:288``) is a read
+        that, missing the read pool, degrades to the WRITER connection under ``SessionDB._lock``
+        (``hermes_state._read_ctx``; ``acquire()`` refuses descriptor work on a loop thread), so on
+        the owner loop a held writer froze every session, timer and socket this profile serves for a
+        member create (PRX-6024, the same class as ``session_controls._stage_create`` and
+        ``session_bot._bot_chat_step``). One worker keeps them off the loop; the caller's lock keeps
+        read, staging and commit one owner step.
+        """
         from gateway.run import _load_gateway_config, _resolve_gateway_model
         from gateway.session_policy import build_policy
         from gateway.session_local import stage_local_session
-        from gateway.session_local_recovery import restore_local_session
-        from gateway.session_runtime_workers import tracked_write
-        from hermes_state_local import commit_local_session
         from agent.skill_utils import parse_config_string_list
+        if self.authority.db.get_session(self.ref.session_id) is not None:
+            return None
         private = {}
         config = _load_gateway_config()
         # A room has no clarification reply (group controls expose approvals only), so a member
@@ -97,13 +107,28 @@ class HostedRoomAuthorityRPC:
         policy = replace(policy, source='bot_room', platform='bot_room',
                          model=policy.model or _resolve_gateway_model(policy.config()),
                          toolsets=tuple(sorted(set(policy.toolsets) | {'bot_room'})))
-        staged = stage_local_session(self.authority, self.principal, {'request_id': self.creation_id},
-                                     trusted_policy=policy, trusted_secrets=private)
+        return stage_local_session(self.authority, self.principal, {'request_id': self.creation_id},
+                                   trusted_policy=policy, trusted_secrets=private)
+
+    async def _create(self, params):
+        from gateway.session_local_recovery import restore_local_session
+        from gateway.session_runtime_workers import tracked_write
+        from hermes_state_local import commit_local_session
+        # One owner step per authority (PRX-6024): the deciding read and the staging run in a worker
+        # (see ``_stage_create``), and this lock keeps the pair atomic the way the loop's single
+        # thread used to, so two member creates carrying one creation id still converge.
+        lock = getattr(self.authority, '_staged_create_lock', None)
+        if lock is None:
+            lock = self.authority._staged_create_lock = asyncio.Lock()
+        async with lock:
+            staged = await asyncio.to_thread(self._stage_create)
+        if staged is None:  # the member's session already exists: nothing minted here
+            return await self._resume(params)
         # Creation commit and label run off the owner loop (N90); a concurrent duplicate converges.
         if isinstance(staged, dict):
             await tracked_write(self.authority, partial(
                 commit_local_session, self.authority.db, epoch=self.authority.epoch, receipt=staged))
-            restore_local_session(self.authority, staged['session_id'])
+            await asyncio.to_thread(restore_local_session, self.authority, staged['session_id'])
         from hermes_state_runtime import _epoch
         def label(conn):
             _epoch(conn, self.authority.epoch)
