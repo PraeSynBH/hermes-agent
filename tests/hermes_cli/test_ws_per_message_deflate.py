@@ -66,7 +66,10 @@ async def _with_control_listener(home: str, scenario) -> None:
     from gateway.run_api import start_gateway_api, stop_gateway_api
     from gateway.runtime_bootstrap import TicketStore
 
+    accepted: list[dict] = []
+
     async def fake_handle_ws(ws, **kwargs):
+        accepted.append(kwargs)
         await ws.accept()
         await ws.close()
 
@@ -85,7 +88,7 @@ async def _with_control_listener(home: str, scenario) -> None:
         def _ticketed() -> tuple[str, ...]:
             return ("hermes-gateway-v1", "hermes-gateway-ticket." + tickets.mint(
                 profile_id=home, subject="human", purpose="interactive"))
-        await scenario(port, _ticketed)
+        await scenario(port, _ticketed, accepted)
     finally:
         await stop_gateway_api(handle)
         tui_gateway.ws.handle_ws = original
@@ -96,9 +99,15 @@ def test_control_socket_negotiates_no_permessage_deflate_on_loopback(tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
 
-    async def scenario(port: int, ticketed) -> None:
+    async def scenario(port: int, ticketed, accepted: list[dict]) -> None:
         code, headers = await _handshake(port, offer_extensions=True, subprotocols=ticketed())
         assert code == 101, f"the control socket must complete the upgrade, got {code}"
+        # The upgrade must land on the gateway's own session path (handle_ws), which is reached only
+        # by redeeming the ticket: an unticketed upgrade is answered by the dashboard gate with 403
+        # and never gets here. Asserting the accept keeps this test honest about WHICH surface
+        # negotiated the extension, instead of accepting a 101 from anywhere.
+        assert accepted and accepted[-1]["auth_identity"]["native_bootstrap"] is True, (
+            f"upgrade did not reach the gateway session path: accepts={accepted!r}")
         assert "sec-websocket-extensions" not in headers, (
             "the loopback control socket negotiated "
             f"{headers.get('sec-websocket-extensions')!r}: per-frame zlib then runs on the served "
