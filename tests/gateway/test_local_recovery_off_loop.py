@@ -50,6 +50,8 @@ def test_store_reads_do_not_block_the_loop(monkeypatch):
             return []
 
         monkeypatch.setattr(recovery, "local_receipt_ids", slow_receipt_ids)
+        # The reconciliation (PRX-6097) is a store read of its own, not what this test measures.
+        monkeypatch.setattr(recovery, "drop_unrestorable_receipts", lambda _authority: [])
         task = asyncio.create_task(recovery.recover_local_sessions_offloop(_authority([])))
         task.add_done_callback(lambda _t: started.set())
         await asyncio.wait_for(entered.wait(), timeout=2.0)
