@@ -1179,3 +1179,77 @@ def test_router_never_builds_a_child_handler_under_a_lock_logging_shutdown_takes
     assert shutdown_got_router_lock == [True], (
         "lock-order inversion: logging.shutdown (under logging._lock) could not take the router's "
         "lock while the router built a child handler (which needs logging._lock)")
+
+
+class _CollectingHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def test_record_factory_resolves_each_home_once_and_still_routes_per_profile(hermes_home, monkeypatch):
+    """PRA-6843: ``_session_record_factory`` called ``get_hermes_home().resolve()`` for EVERY
+    record in the process, so each line the gateway's own event loop logged paid a realpath(3)
+    walk — 16 of 2059 loop samples held realpath as the innermost frame and every one of them came
+    through this factory (11 inside a single 13.3 s profile_reconcile tick). The value is a pure
+    function of the home, so once a home has been resolved an unchanged home must cost no
+    filesystem call — while a profile scope change must still stamp the record with that profile's
+    home, which is what the QueueListener's multiplex routing reads (#97489)."""
+    import asyncio
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home_a = hermes_home / "profiles" / "pra6843-a"
+    home_b = hermes_home / "profiles" / "pra6843-b"
+    home_a.mkdir(parents=True, exist_ok=True)
+    home_b.mkdir(parents=True, exist_ok=True)
+    expect_a, expect_b = str(home_a.resolve()), str(home_b.resolve())
+
+    collector = _CollectingHandler()
+    logger = logging.getLogger("pra6843.record.factory")
+    logger.handlers = [collector]
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+
+    resolves = []
+    real_resolve = Path.resolve
+
+    def counting_resolve(self, *args, **kwargs):
+        resolves.append(str(self))
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", counting_resolve)
+
+    async def emit(count):
+        # The gateway logs from the loop thread, which is where the realpath walk was charged.
+        for i in range(count):
+            logger.debug("tick %d", i)
+
+    token = set_hermes_home_override(home_a)
+    try:
+        asyncio.run(emit(1))          # cold: this home has never been resolved
+        asyncio.run(emit(200))        # warm
+        warm_a_resolves = len(resolves)
+        assert warm_a_resolves == 1, (
+            f"{warm_a_resolves} Path.resolve() calls for 201 records on one unchanged home; "
+            "the record factory is resolving the home per record")
+    finally:
+        reset_hermes_home_override(token)
+
+    token = set_hermes_home_override(home_b)
+    try:
+        asyncio.run(emit(1))
+        asyncio.run(emit(50))
+        warm_b_resolves = len(resolves) - warm_a_resolves
+        assert warm_b_resolves == 1, (
+            f"{warm_b_resolves} Path.resolve() calls after the profile scope changed to a second "
+            "home; only that home's first record may resolve")
+    finally:
+        reset_hermes_home_override(token)
+
+    stamps = [record.hermes_home for record in collector.records]
+    assert stamps[:201] == [expect_a] * 201 and stamps[201:] == [expect_b] * 51, (
+        "record.hermes_home is not the home in scope when the record was made")

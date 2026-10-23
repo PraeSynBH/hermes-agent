@@ -260,6 +260,32 @@ def clear_session_context() -> None:
     _session_context.session_id = None
 
 
+# ``str(home)`` -> ``str(home.resolve())``. Path.resolve() is a realpath(3) walk and the record
+# factory runs for EVERY record in the process — including every line the gateway's own loop
+# logs, where it showed up as the innermost frame of the loop's slow ticks (PRA-6843: 16 of 2059
+# loop samples, 11 of them inside one 13.3 s profile_reconcile tick). The value is a pure function
+# of the home path, so resolve each distinct home once: a process serves a handful of homes at
+# most (launch profile + the routed profiles of a multiplex gateway).
+_RESOLVED_HOME_CACHE: dict[str, str] = {}
+
+
+def _resolved_home_for_record() -> str:
+    """``str(get_hermes_home().resolve())``, resolved once per distinct home value."""
+    home = get_hermes_home()
+    raw = str(home)
+    cached = _RESOLVED_HOME_CACHE.get(raw)
+    if cached is not None:
+        return cached
+    try:
+        resolved = str(home.resolve(strict=True))
+    except OSError:
+        # Not on disk yet: a component may turn out to be a symlink once it is created, so
+        # this answer is not rememberable (same rule as hermes_home_key()).
+        return str(home.resolve())
+    _RESOLVED_HOME_CACHE[raw] = resolved
+    return resolved
+
+
 def _install_session_record_factory() -> None:
     """Replace the global LogRecord factory with one that adds ``session_tag``.
 
@@ -279,7 +305,7 @@ def _install_session_record_factory() -> None:
         # ContextVar is gone; keep the resolved home on the record so a
         # multiplex desktop ticker can route to the job owner's files (#97489).
         try:
-            record.hermes_home = str(get_hermes_home().resolve())  # type: ignore[attr-defined]
+            record.hermes_home = _resolved_home_for_record()  # type: ignore[attr-defined]
         except Exception:
             record.hermes_home = ""  # type: ignore[attr-defined]
         return record
