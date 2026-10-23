@@ -228,6 +228,80 @@ async def test_boot_drops_only_the_receipts_whose_session_row_is_gone(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_boot_drops_only_the_receipts_whose_policy_cannot_be_restored(tmp_path, monkeypatch):
+    """PRX-6122: a receipt whose stored policy ``restore_policy`` refuses is as unrestorable as one
+    whose row is gone. Boot drops exactly those receipts and keeps their live sessions rows; a
+    restorable receipt still restores.
+    """
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_contract import Principal
+    from gateway.session_local import create_local_session
+    from gateway import run
+    from gateway import session_local_recovery as recovery
+    from hermes_state_local import POLICY_PREFIX
+
+    monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
+    store = SessionStore(tmp_path / 'sessions', GatewayConfig())
+    runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False)
+    authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='first')
+    actor = Principal('owner', 'fixture', frozenset({'session:create', 'session:read'}), 'socket')
+    params = {'request_id': 'good', 'source': 'gui', 'cwd': str(tmp_path), 'model': 'frozen', 'toolsets': []}
+    good = create_local_session(authority, actor, params)
+    bad = create_local_session(authority, actor, {**params, 'request_id': 'bad'})
+
+    # Simulate the writer class PRX-6122 found: an empty model frozen in the stored policy.
+    with authority.db._read_ctx() as conn:
+        raw = conn.execute('SELECT value FROM state_meta WHERE key=?',
+                           (POLICY_PREFIX + bad.session_id,)).fetchone()[0]
+    receipt = json.loads(raw)
+    receipt['policy']['model'] = ''
+    receipt['policy']['source'] = 'oneshot'
+    receipt['policy']['platform'] = 'cli'
+    authority.db._write_sql('UPDATE state_meta SET value=? WHERE key=?',
+                            (json.dumps(receipt), POLICY_PREFIX + bad.session_id))
+
+    await recovery.recover_local_sessions_offloop(authority, schedule=False)
+
+    with authority.db._read_ctx() as conn:
+        receipts = {k for (k,) in conn.execute(
+            "SELECT key FROM state_meta WHERE key LIKE 'gateway.local_policy.v1:%'")}
+        row = conn.execute('SELECT id FROM sessions WHERE id=?', (bad.session_id,)).fetchone()
+    assert POLICY_PREFIX + bad.session_id not in receipts
+    assert row is not None, 'the sessions row is not the receipt and must stay'
+    assert POLICY_PREFIX + good.session_id in receipts
+    assert recovery.restore_local_session(authority, good.session_id) == good
+
+
+@pytest.mark.asyncio
+async def test_create_without_a_model_is_refused_instead_of_minting_an_unrestorable_receipt(tmp_path, monkeypatch):
+    """PRX-6122: a profile with no model and no explicit ``-m`` used to freeze ``model=''`` in the
+    receipt, which ``restore_policy`` refuses forever. The create must be refused, not minted."""
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_contract import Principal
+    from gateway.session_local import create_local_session
+    from gateway import run
+    from hermes_state_runtime import RuntimeStoreError
+
+    monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
+    monkeypatch.setattr(run, '_resolve_gateway_model', lambda *a, **k: '')
+    store = SessionStore(tmp_path / 'sessions', GatewayConfig())
+    runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False)
+    authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='first')
+    actor = Principal('owner', 'fixture', frozenset({'session:create', 'session:read'}), 'socket')
+    with pytest.raises(RuntimeStoreError, match='invalid_params'):
+        create_local_session(authority, actor, {'request_id': 'no-model', 'source': 'oneshot',
+                                                'cwd': str(tmp_path), 'toolsets': []})
+    with authority.db._read_ctx() as conn:
+        receipts = conn.execute(
+            "SELECT count(*) FROM state_meta WHERE key LIKE 'gateway.local_policy.v1:%'").fetchone()[0]
+    assert receipts == 0, 'the refused create minted a receipt'
+
+
+@pytest.mark.asyncio
 async def test_delete_retires_owner_receipts_and_never_resurrects_the_id(tmp_path, monkeypatch):
     """The deletion fence takes the local policy receipt (a cron policy's ``request_json`` holds
     the job and raw prompt) and the API binding + declared conversation key with the transcript;

@@ -284,6 +284,12 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
         if marks:
             import json
             policy = replace(policy, config_json=json.dumps({**json.loads(policy.config_json), **marks}))
+    if not isinstance(policy.model, str) or not policy.model.strip():
+        # PRX-6122: an empty model freezes an unrestorable receipt (restore_policy refuses it),
+        # so the session can never be resumed. Refuse the create instead of minting one. This
+        # covers a trusted policy (hosted/kanban) as well as the CLI's own build.
+        raise RuntimeStoreError('invalid_params', field='model',
+                                detail='a local session needs a non-empty model: the profile has none to inherit and none was sent')
     request_id = params.get('request_id', uuid.uuid4().hex)
     if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
         raise RuntimeStoreError('invalid_params', field='request_id',
