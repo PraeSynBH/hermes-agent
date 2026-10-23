@@ -623,23 +623,6 @@ def _registry_tore_down(db) -> bool:
     return getattr(db, "_shared_registry_owned", True) is False
 
 
-def session_db_is_open(home: Optional[str] = None) -> bool:
-    """True when this process already holds the goals SessionDB for *home* (default: this home).
-
-    A sweep over many served homes uses this to spend a thread hop only on the homes that would pay
-    a COLD open (0.1-5.5 s on a loaded host) and keep the already-open ones on the calling thread
-    (a warm read is ~0.1-1.4 ms, less than the hop itself). Wrong in one direction only: a home
-    whose cache key is spelled differently reads False and takes the concurrent path.
-    """
-    try:
-        from hermes_constants import get_hermes_home
-
-        key = str(home) if home is not None else str(get_hermes_home())
-    except Exception:  # pragma: no cover - an unresolvable home is not "open"
-        return False
-    return _DB_CACHE.get(key) is not None
-
-
 def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
     """WARN on a dropped state write — the reply already told the user the state was set. One shared
     message keeps goal, loop and heartbeat logs greppable as one bug class."""

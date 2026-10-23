@@ -1,20 +1,21 @@
-"""PRA-6806: one loop-wakeup sweep is ONE poll hop, read serially inside it.
+"""PRA-6806: one loop-wakeup sweep is ONE poll hop, fanned out over the homes inside it.
 
 The watcher used to submit two hops per served profile per tick (warm + read) and await them in
 order. On the 17-profile host one tick queued 34 hops behind itself on the 2-worker poll lane, so
 ``loop_wakeup_scan`` still measured p50 236-717 ms / p95 6.2-7.0 s against ~2 ms of warm work per
 home (PRA-6794): the queue had moved off the housekeeping pool instead of going away.
 
-A bounded fan-out INSIDE the hop was the suggested shape. Measured here: warm, four workers cost
-p50 24.8-95 ms / p95 67-142 ms for the same 18 reads that serially cost p50 1.9-58 ms (a warm read
-is ~0.1-1.4 ms — cheaper than the hop); cold, the fan-out opened the whole served set in 0.78 s
-where serial opens cost up to 5.5 s for ONE store. So the shipped shape splits by coldness: open
-stores are read on the calling thread, not-yet-open ones on a bounded, process-lifetime pool.
+Inside the single hop the reads are independent, so they all go to ONE bounded, process-lifetime
+pool (cap 4). The first cut read open stores on the calling thread instead, on a load1~110
+measurement where a warm read was 1.4 ms; at load1 155-186 the same 18 warm reads serially cost
+p50 118.9 ms / p95 1640.8 ms against p50 20.0 ms / p95 101.0 ms on four workers, and the live
+summaries on the booted pid agreed (p50 112-182 ms). The serial sum, not the hop, is the tick.
 
 Contracts a future edit can break silently, in order of how much they cost:
 
 * a tick submits ONE sweep hop, whatever the profile count;
-* warm homes are read on the calling thread and cold homes concurrently, cap 4, on ONE pool;
+* every home of a multi-home sweep is read on the one bounded pool; a single-home sweep stays on
+  the calling thread and creates no pool (there is nothing to overlap);
 * a home with no loop, or an unreadable home, costs the sweep nothing but its own read;
 * the READ no longer enters the per-profile runtime scope (config + ``.env`` + terminal policy per
   home per tick), while FIRING still does — it writes and injects a turn.
@@ -39,7 +40,6 @@ def _homes(tmp_path, names):
 def test_the_sweep_reports_only_homes_that_hold_an_active_loop(tmp_path, monkeypatch):
     """A quiet home is one read and no entry; the fire path must not be handed empties."""
     scopes = _homes(tmp_path, ("alpha", "beta", "gamma"))
-    monkeypatch.setattr(run_idle_gates, "_home_store_open", lambda _home: True)
     monkeypatch.setattr(
         run_idle_gates, "_active_loops_in_home",
         lambda home: [("session-b", "state")] if str(home).endswith("beta") else [])
@@ -52,7 +52,6 @@ def test_the_sweep_reports_only_homes_that_hold_an_active_loop(tmp_path, monkeyp
 def test_an_unreadable_home_does_not_lose_the_other_homes(tmp_path, monkeypatch):
     """Best effort, same as the per-home scan before it: one bad store is a debug line."""
     scopes = _homes(tmp_path, ("alpha", "beta", "gamma"))
-    monkeypatch.setattr(run_idle_gates, "_home_store_open", lambda _home: True)
 
     def _read(home):
         if str(home).endswith("alpha"):
@@ -66,46 +65,48 @@ def test_an_unreadable_home_does_not_lose_the_other_homes(tmp_path, monkeypatch)
     assert [name for name, _home, _hits in swept] == ["beta", "gamma"]
 
 
-def test_warm_homes_are_read_on_the_calling_thread(tmp_path, monkeypatch):
-    """An open store's read is cheaper than a thread hop: the steady-state tick takes none."""
+def test_every_home_is_read_on_the_one_bounded_reused_pool(tmp_path, monkeypatch):
+    """The serial 18-home sum is the tick (p50 119 ms) — the reads overlap instead, cap 4."""
     scopes = _homes(tmp_path, ("alpha", "beta", "gamma", "delta"))
     caller = threading.get_ident()
     readers = []
-    monkeypatch.setattr(run_idle_gates, "_home_store_open", lambda _home: True)
+    monkeypatch.setattr(run_idle_gates, "_LOOP_SWEEP_POOL", None)
     monkeypatch.setattr(
         run_idle_gates, "_active_loops_in_home",
-        lambda home: readers.append(threading.get_ident()) or [])
-
-    run_idle_gates.loop_sweep(scopes)
-
-    assert len(readers) == len(scopes)
-    assert set(readers) == {caller}
-    assert run_idle_gates._LOOP_SWEEP_POOL is None, "no pool is created when nothing is cold"
-
-
-def test_cold_homes_are_opened_concurrently_on_a_bounded_reused_pool(tmp_path, monkeypatch):
-    """Cold opens are the one place concurrency pays (5.5 s/home serial vs 0.78 s for the fan-out)."""
-    scopes = _homes(tmp_path, ("alpha", "beta", "gamma", "delta"))
-    monkeypatch.setattr(run_idle_gates, "_LOOP_SWEEP_POOL", None)
-    monkeypatch.setattr(run_idle_gates, "_home_store_open", lambda home: str(home).endswith("alpha"))
-    monkeypatch.setattr(run_idle_gates, "_active_loops_in_home", lambda home: [("session", "state")])
+        lambda home: readers.append(threading.get_ident()) or [("session", "state")])
 
     swept = run_idle_gates.loop_sweep(scopes)
     pool = run_idle_gates._loop_sweep_pool()
     run_idle_gates.loop_sweep(scopes)
 
     assert sorted(name for name, _home, _hits in swept) == ["alpha", "beta", "delta", "gamma"]
-    assert len(swept) == len(scopes), "a cold home's hits are reported too"
+    assert len(readers) == 2 * len(scopes), "every home is read on every sweep"
+    assert caller not in readers, "a multi-home sweep does not read on the calling thread"
     assert pool._max_workers == run_idle_gates._LOOP_SWEEP_FAN_OUT
     assert run_idle_gates._loop_sweep_pool() is pool, "the pool is process-lifetime, not per tick"
     run_idle_gates._LOOP_SWEEP_POOL.shutdown(wait=False)
     monkeypatch.setattr(run_idle_gates, "_LOOP_SWEEP_POOL", None)
 
 
+def test_a_single_home_sweep_stays_on_the_calling_thread(tmp_path, monkeypatch):
+    """Nothing to overlap: one home costs its own read, never a pool thread plus a hop."""
+    scopes = _homes(tmp_path, ("alpha",))
+    caller = threading.get_ident()
+    readers = []
+    monkeypatch.setattr(run_idle_gates, "_LOOP_SWEEP_POOL", None)
+    monkeypatch.setattr(
+        run_idle_gates, "_active_loops_in_home",
+        lambda home: readers.append(threading.get_ident()) or [])
+
+    run_idle_gates.loop_sweep(scopes)
+
+    assert readers == [caller]
+    assert run_idle_gates._LOOP_SWEEP_POOL is None, "a one-home sweep creates no pool"
+
+
 def test_a_read_that_raises_is_not_re_raised_to_the_tick(tmp_path, monkeypatch):
     """A sweep failure must never take the watcher's ``while`` loop down with it."""
     scopes = _homes(tmp_path, ("alpha",))
-    monkeypatch.setattr(run_idle_gates, "_home_store_open", lambda _home: True)
 
     def _read(_home):
         raise RuntimeError("disk on fire")
@@ -113,6 +114,25 @@ def test_a_read_that_raises_is_not_re_raised_to_the_tick(tmp_path, monkeypatch):
     monkeypatch.setattr(run_idle_gates, "_active_loops_in_home", _read)
 
     assert run_idle_gates.loop_sweep(scopes) == []
+
+
+def test_a_raising_read_on_the_pool_does_not_lose_the_other_homes(tmp_path, monkeypatch):
+    """The fan-out arm swallows the same failure the serial arm does."""
+    scopes = _homes(tmp_path, ("alpha", "beta"))
+    monkeypatch.setattr(run_idle_gates, "_LOOP_SWEEP_POOL", None)
+
+    def _read(home):
+        if str(home).endswith("alpha"):
+            raise RuntimeError("database is locked")
+        return [("session", "state")]
+
+    monkeypatch.setattr(run_idle_gates, "_active_loops_in_home", _read)
+
+    swept = run_idle_gates.loop_sweep(scopes)
+
+    assert [name for name, _home, _hits in swept] == ["beta"]
+    run_idle_gates._LOOP_SWEEP_POOL.shutdown(wait=False)
+    monkeypatch.setattr(run_idle_gates, "_LOOP_SWEEP_POOL", None)
 
 
 def _watcher(swept):

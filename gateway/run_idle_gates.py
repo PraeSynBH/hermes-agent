@@ -87,16 +87,22 @@ def busy_homes(homes, store_has_work: Callable[[Any], bool]) -> set:
     return {home for home in homes if _gate(home, store_has_work)}
 
 
-# How the sweep is spread: only the stores that would pay a COLD open.
-# Measured on this host against the live 17-profile set (2026-10-23T02:0x-02:2xZ, load1 ~110):
-#   warm, serial inside the hop      p50 1.9-58 ms, per-home read p50 1.4 ms   <- steady state
-#   warm, 4 workers inside the hop   p50 24.8-95 ms, p95 67-142 ms             <- the hop IS the cost
-#   cold, serial                     one home up to 5.5 s; 18 homes ~18 s      <- a boot-minute stall
-#   cold, 4 workers                  whole fan-out 0.78 s                      <- where concurrency pays
-# So the split is by coldness, not by profile: an already-open store is read on the calling thread
-# (its read is cheaper than a thread hop), a not-yet-open one goes to a bounded pool. Steady state
-# therefore takes no hop beyond the single one the tick already made, and a boot or a brand-new
-# profile still opens concurrently instead of serialising seconds inside a tick.
+# How the sweep is spread: EVERY home, on a bounded pool, whatever its store's temperature.
+#
+# The first cut of this (3774b3bb41) split by coldness — warm reads on the calling thread, cold ones
+# on the pool — on a measurement at load1 ~110 where a warm read was 1.4 ms and the thread hop cost
+# more than the read. That held only at low load. The live summaries on the booted pid (41938,
+# 2026-10-23 03:12-03:23Z, load1 155-186, 229-236 threads) still read p50 112-182 ms, and the
+# in-process probe that explains it (pra6806_warm_shape.py, same host, same 18 already-open stores,
+# load1 162) is:
+#   warm, serial (the shipped shape)   p50 118.9 ms   p95 1640.8 ms
+#   warm, 4 workers                    p50  20.0 ms   p95  101.0 ms
+#   warm, 8 workers                    p50  29.0 ms   p95   83.6 ms
+# A warm per-home read under host load is ~6-10 ms, not 1.4 ms, so 18 of them add up to the whole
+# tick: the aggregate serial sum is the cost, not the hop. Cold opens previously justified the pool
+# on their own (one home up to 5.5 s); they now share it with the warm reads rather than owning it.
+# Four workers (not more) is the measured sweet spot — 8 lowers p95 slightly and raises p50, and the
+# lane the sweep rides is itself two workers.
 _LOOP_SWEEP_FAN_OUT = 4
 _LOOP_SWEEP_POOL = None
 _LOOP_SWEEP_POOL_LOCK = threading.Lock()
@@ -106,9 +112,8 @@ def _loop_sweep_pool():
     """The sweep's bounded worker set, created once per process — never per tick.
 
     Per-tick ``ThreadPoolExecutor()`` blocks would spawn and retire up to four OS threads every
-    tick: the churn PRA-6660 measured on the turn pool, just moved. It is only reached when a home
-    is cold, so a steady-state gateway creates it once (or never, when the boot warm covered the
-    served set).
+    tick: the churn PRA-6660 measured on the turn pool, just moved. Created on the first sweep that
+    has more than one home and reused for the life of the process.
     """
     global _LOOP_SWEEP_POOL
     if _LOOP_SWEEP_POOL is None:
@@ -128,13 +133,6 @@ def _active_loops_in_home(profile_home) -> list:
 
         return list_active_loops_from(_get_session_db())
     return list_active_loops_from(_profile_session_db_probe(profile_home))
-
-
-def _home_store_open(profile_home) -> bool:
-    """Would reading *profile_home* now be a warm read (already-open handle)?"""
-    from hermes_cli.goals import session_db_is_open
-
-    return session_db_is_open(None if profile_home is None else str(profile_home))
 
 
 def _read_homes(jobs) -> list:
@@ -162,26 +160,27 @@ def loop_sweep(scopes) -> list:
     Why one item: the watcher used to submit two hops per profile per tick (warm + read) and await
     them in order, so on a 17-profile host one tick queued 34 hops behind itself on the 2-worker
     poll lane — the queue moved off the housekeeping pool instead of going away (PRA-6794: p50
-    236-717 ms against ~2 ms of warm work per home). One hop is one lane slot, whatever N is, and
-    the only concurrency left is the cold opens that would otherwise serialise seconds (see above).
+    236-717 ms against ~2 ms of warm work per home). One hop is one lane slot, whatever N is.
+    Inside that hop every home goes to the bounded pool (see the fan-out note above): the reads are
+    independent, and their serial sum — not the hop — is what the tick pays at host load. A sweep of
+    one home (a single-profile host, or a lone served store) stays on the calling thread: there is
+    nothing to overlap and the hop would be its whole cost.
     """
     jobs = list(scopes)
-    warm = [job for job in jobs if _home_store_open(job[1])]
-    cold = [job for job in jobs if not _home_store_open(job[1])]
-    if not cold:
-        return _read_homes(warm)
-    if len(cold) == 1:  # one cold home does not need the pool (nothing to overlap with)
-        return _read_homes(warm + cold)
+    if len(jobs) <= 1:
+        return _read_homes(jobs)
     pool = _loop_sweep_pool()
-    pending = {pool.submit(_active_loops_in_home, home): (name, home) for name, home in cold}
-    cold_hits = {}
+    pending = {pool.submit(_active_loops_in_home, home): (name, home) for name, home in jobs}
+    out = []
     for future, (name, home) in pending.items():
         try:
-            cold_hits[home] = future.result()
+            hits = future.result()
         except Exception:
             logger.debug("loop sweep read failed for %s; next tick retries", home, exc_info=True)
-    return _read_homes(warm) + [(name, home, cold_hits[home]) for name, home in cold
-                                if cold_hits.get(home)]
+            continue
+        if hits:
+            out.append((name, home, hits))
+    return out
 
 
 def offload_for_poll(runner: object) -> Optional[Callable]:
