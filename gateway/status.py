@@ -29,6 +29,7 @@ from gateway.status_inline_source import (
 )
 from hermes_constants import _get_platform_default_hermes_home, get_hermes_home, get_process_hermes_home
 from hermes_cli._subprocess_compat import pid_exists_stdlib
+from gateway.status_home_identity import canonical_hermes_home as _canonical_hermes_home
 from gateway.status_lock_dir import unusable_lock_dir, unusable_lock_dir_recovered
 from gateway.status_json import _read_json_file, _unlink_quietly, _write_json_file
 
@@ -242,11 +243,6 @@ def _get_process_hermes_home() -> Path:
     ``get_hermes_home()`` honors the per-session ``_HERMES_HOME_OVERRIDE`` and would misroute
     them."""
     return get_process_hermes_home()
-
-
-def _canonical_hermes_home(path: Path | str) -> Path:
-    """Stable absolute HERMES_HOME path for persisted identity data."""
-    return Path(path).expanduser().resolve(strict=False)
 
 
 def _same_hermes_home(left: Path | str, right: Path | str) -> bool:

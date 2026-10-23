@@ -26,6 +26,9 @@ from hermes_cli.profiles_serve import (
     _parked_default_warned, parked_marker_path, profile_is_parked, profiles_to_serve,
     profiles_to_tick, standalone_profiles,
 )
+# Facade re-export: deriving the active profile's name from the home path — and remembering it, so
+# the gateway loop's per-tick runtime-status publish resolves nothing — lives in its own sibling.
+from hermes_cli.profiles_identity import get_active_profile_name
 from hermes_constants import (
     LOCAL_RUNTIME_ROOT_DIRS, PROFILE_ID_RE, clear_named_profile_deleted, mark_named_profile_deleted,
     named_profile_has_identity, named_profile_is_deleted, named_profile_is_live,
@@ -1998,23 +2001,6 @@ def _retarget_active_profile(old: str, new: str, message: str) -> None:
         if get_active_profile() == old:
             set_active_profile(new)
             print(message)
-
-
-def get_active_profile_name() -> str:
-    """Profile name inferred from HERMES_HOME: ``"default"`` when unset or ``~/.hermes``, the
-    name under ``~/.hermes/profiles/<name>``, ``"custom"`` for any other path."""
-    from hermes_constants import get_hermes_home
-    resolved = get_hermes_home().resolve()
-    if resolved == _get_default_hermes_home().resolve():
-        return "default"
-    profiles_root = _get_profiles_root().resolve()
-    try:
-        parts = resolved.relative_to(profiles_root).parts
-        if len(parts) == 1 and _PROFILE_ID_RE.match(parts[0]):
-            return parts[0]
-    except ValueError:
-        pass
-    return "custom"
 
 
 def current_profile_name(default: str | None = None) -> str | None:

@@ -1797,13 +1797,18 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         retry_interval = interval
         while True:
             await asyncio.sleep(retry_interval)
-            # Off-loop: ``get`` answers from memory in steady state, but a session that is no longer
-            # in either store (the tick that closes a finished watcher) falls back to the retained
-            # results — a directory scan plus a JSON read per file. On the loop that read is one of
-            # PRX-5524's blocked-loop dumps: _run_process_watcher -> process_registry.get.
+            # Steady state is a dict read, and it stays on the loop: the hop itself was the cost —
+            # ``to_thread`` pays a pool submit, a new OS thread when the pool is saturated, and the
+            # GIL hand-back per poll, which is where this watcher's slow ticks sat (PRA-6825: 50 of
+            # 268 sampled loop frames, 19 consecutive one-second shots). Only a miss — a session no
+            # longer in either store (the tick that closes a finished watcher) — needs the worker
+            # thread, because ``get`` then scans the retained results: a directory scan plus a JSON
+            # read per file, one of PRX-5524's blocked-loop dumps.
             from gateway.loop_tick_timing import timed
             with timed('process_watcher_registry_read'):
-                session = await asyncio.to_thread(process_registry.get, session_id)
+                session = process_registry.peek(session_id)
+                if session is None:
+                    session = await asyncio.to_thread(process_registry.get, session_id)
             if session is None:
                 break
             async with self._completion_event_scope(watcher):

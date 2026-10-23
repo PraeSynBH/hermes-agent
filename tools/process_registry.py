@@ -35,6 +35,7 @@ from hermes_cli.config import get_hermes_home
 from tools.process_registry_notifications import (
     format_process_notification, heartbeat_output_tail, is_child_process_notification, should_surface_notification)
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
+from tools.process_registry_lookup import ProcessLookupMixin
 from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
 from tools.process_registry_termination import ProcessTerminationMixin
 from tools.process_registry_results import load_completed_results, save_completed_result
@@ -671,7 +672,8 @@ _WSL_CHAIN_NOTE = (
 )
 
 
-class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOutputLogMixin):
+class ProcessRegistry(ProcessLookupMixin, ProcessTerminationMixin, ProcessCheckpointMixin,
+                      ProcessOutputLogMixin):
     """In-memory registry of running and finished background processes.
     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
@@ -1888,38 +1890,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         for evt in requeue:
             self.completion_queue.put(evt)
         return results
-
-    # Minimum suffix chars for prefix resolution; "p"/"proc_1" are too collision-prone.
-    _MIN_PREFIX_CHARS = 4
-
-    def get(self, session_id: str) -> Optional[ProcessSession]:
-        """Session by full ID or unique prefix (``proc_4dae`` / bare ``4dae``, like git
-        short hashes); ambiguous or too-short prefixes resolve to None, never a guess."""
-        if not isinstance(session_id, str) or not session_id:
-            return None
-        with self._lock:
-            session = self._running.get(session_id) or self._finished.get(session_id)
-        if session is None:
-            session = load_completed_results(session_id).get(session_id)
-        return self._refresh_detached_session(session if session is not None else self._resolve_prefix(session_id))
-
-    def _resolve_prefix(self, session_id: str) -> Optional[ProcessSession]:
-        """Resolve a unique session-ID prefix (a bare hex tail is normalized to
-        ``proc_<tail>``); :meth:`get` tries exact first."""
-        query = session_id.strip() if isinstance(session_id, str) else ""
-        if not query:
-            return None
-        if not query.startswith("proc_"):
-            query = f"proc_{query}"
-        if len(query) - len("proc_") < self._MIN_PREFIX_CHARS:
-            return None
-        matches = load_completed_results(query)
-        with self._lock:
-            matches.update({
-                sid: s for store in (self._running, self._finished)
-                for sid, s in store.items() if sid.startswith(query)
-            })
-        return next(iter(matches.values())) if len(matches) == 1 else None
 
     def _reconcile_local_exit(self, session: ProcessSession) -> None:
         """Reconcile ``session.exited`` against the real child state.

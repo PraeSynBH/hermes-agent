@@ -46,6 +46,10 @@ class _FakeRegistry:
             return self._sessions.pop(0)
         return None
 
+    def peek(self, session_id):
+        """The in-memory read the watcher polls with; same canned answer, no disk fallback."""
+        return self.get(session_id)
+
     def is_completion_consumed(self, session_id):
         return self._consumed
 
