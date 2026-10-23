@@ -278,10 +278,20 @@ class SessionProfileRepairMixin:
     def delete_moved_session(self, session_id: str) -> bool:
         """Remove a session this store no longer owns after the target confirmed it. Children left
         behind are detached (same FK rule as :meth:`delete_session`); topic bindings on the row
-        cascade with it."""
+        cascade with it.
+
+        Publishing the deletion fence first is what keeps the removed row's keys from outliving it:
+        a local conversation's private receipt (``gateway.local_policy.v1:<sid>``), its routing
+        entry and the api-settings/viewer-close keys are written beside the row and are not cascaded
+        by these DELETEs. Without the fence they stayed behind and every gateway boot re-refused the
+        receipt against the row the move had taken away — permanently, since nothing recreates a
+        moved row in this store (PRX-6097: 34 of them in one profile). The fence is a sweep's
+        (``expiring``), so an id that comes back to this store is not fenced forever."""
         def _do(conn) -> bool:
             if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is None:
                 return False
+            from hermes_state_mutation_retirement import retire_sessions
+            retire_sessions(conn, [session_id], expiring=[session_id])
             conn.execute("UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_model_usage WHERE session_id = ?", (session_id,))

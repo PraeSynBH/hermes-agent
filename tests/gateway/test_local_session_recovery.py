@@ -186,6 +186,48 @@ async def test_branch_and_local_entries_keep_the_routing_prune_sweep_running(tmp
 
 
 @pytest.mark.asyncio
+async def test_boot_drops_only_the_receipts_whose_session_row_is_gone(tmp_path, monkeypatch):
+    """PRX-6097: a receipt that names no session row can never be restored, yet every boot refused
+    the same ids again (34 of them in one live profile, unchanged across a code update). Boot now
+    reconciles exactly those — receipt, routing row and api-settings/viewer-close keys — and still
+    restores a receipt that names a live row: the class must not be silenced by dropping receipts
+    wholesale.
+    """
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_contract import Principal
+    from gateway.session_local import create_local_session
+    from gateway import run
+    from gateway import session_local_recovery as recovery
+
+    monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
+    store = SessionStore(tmp_path / 'sessions', GatewayConfig())
+    runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False)
+    authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='first')
+    actor = Principal('owner', 'fixture', frozenset({'session:create', 'session:read'}), 'socket')
+    params = {'request_id': 'stale', 'source': 'gui', 'cwd': str(tmp_path), 'model': 'frozen', 'toolsets': []}
+    stale = create_local_session(authority, actor, params)
+    live = create_local_session(authority, actor, {**params, 'request_id': 'live'})
+    # The residue a delete that bypassed the fence leaves: the row (and its messages) gone, the
+    # receipt and routing entry that name it still there.
+    assert authority.db.discard_unadmitted_session(stale.session_id) is True
+    authority.sessions.pop(stale.session_id, None)
+
+    await recovery.recover_local_sessions_offloop(authority, schedule=False)
+
+    with authority.db._read_ctx() as conn:
+        receipts = {k for (k,) in conn.execute(
+            "SELECT key FROM state_meta WHERE key LIKE 'gateway.local_policy.v1:%'")}
+        routed = [k for (k,) in conn.execute('SELECT session_key FROM gateway_routing WHERE entry_json LIKE ?',
+                                             ('%' + stale.session_id + '%',))]
+    assert 'gateway.local_policy.v1:' + stale.session_id not in receipts
+    assert routed == [], 'the routing row naming the gone session outlived its receipt'
+    assert 'gateway.local_policy.v1:' + live.session_id in receipts
+    assert recovery.restore_local_session(authority, live.session_id) == live
+
+
+@pytest.mark.asyncio
 async def test_delete_retires_owner_receipts_and_never_resurrects_the_id(tmp_path, monkeypatch):
     """The deletion fence takes the local policy receipt (a cron policy's ``request_json`` holds
     the job and raw prompt) and the API binding + declared conversation key with the transcript;

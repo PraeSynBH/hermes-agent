@@ -363,6 +363,48 @@ def local_receipt_ids(authority):
             'SELECT key FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',))]
 
 
+def _unrestorable_receipt_ids(authority):
+    """[sid] of local receipts no restore can serve: the ``sessions`` row the receipt's entry names
+    is gone.
+
+    A receipt is its route's truth only while that target exists. A delete path that bypassed the
+    fence, or a profile-repair move that took the row to another store, leaves the receipt (and its
+    routing row) behind: every boot then refused the same ids with a WARNING that reads like
+    corruption, and nothing could ever restore them (PRX-6097). One glob scan joined against
+    ``sessions`` answers the whole profile in a single read — this pass is already the profile's
+    most expensive boot step, so it cannot pay a query per receipt. ``json_extract`` raises on a
+    malformed value even behind ``json_valid``, so the read sits in a ``CASE``: a malformed receipt
+    names no target here and stays for its own reads to refuse.
+    """
+    target = "CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.entry.session_id') END"
+    with authority.db._read_ctx() as conn:
+        return [row[0] for row in conn.execute(
+            f'SELECT substr(m.key, ?) FROM state_meta m WHERE m.key GLOB ? AND {target} IS NOT NULL'
+            f' AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.id = {target})',
+            (len(POLICY_PREFIX) + 1, POLICY_PREFIX + '*'))]
+
+
+def drop_unrestorable_receipts(authority):
+    """Drop the receipts :func:`_unrestorable_receipt_ids` names, with the keys its retirement would
+    have taken: the receipt itself, the api-settings/viewer-close keys, and the routing row that
+    names the gone target. The marker is a sweep's (expiring), not a delete's: this reconciles state
+    that was lost, so a later create of the same deterministic id still may start there."""
+    sids = _unrestorable_receipt_ids(authority)
+    if not sids:
+        return []
+    from hermes_state_mutation_retirement import retire_routes
+
+    def write(conn):
+        conn.executemany('DELETE FROM state_meta WHERE key=?', [(POLICY_PREFIX + sid,) for sid in sids])
+        retire_routes(conn, sids, expiring=sids)
+
+    authority.db._execute_write(write)
+    logging.getLogger(__name__).warning(
+        'Dropped %d local receipt(s) whose session row is gone, so nothing could restore them: %s',
+        len(sids), ', '.join(sorted(sids)[:5]) + (', …' if len(sids) > 5 else ''))
+    return sids
+
+
 def _recover_local_store(authority, schedule):
     """Restore every local receipt and read its admissions; return what the owner loop must schedule.
 
@@ -370,6 +412,9 @@ def _recover_local_store(authority, schedule):
     closes of a hard-killed owner that need ``settle_viewer_close``. Pure store work — no task is
     created here, so this half can run on a worker thread.
     """
+    # Before the restore loop: a receipt whose session row is gone can only be refused, and the
+    # refusal is re-logged on every boot until it is reconciled (PRX-6097).
+    drop_unrestorable_receipts(authority)
     refs = []
     for sid in local_receipt_ids(authority):
         try:
