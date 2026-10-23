@@ -4850,16 +4850,15 @@ async def _wait_for_pid_exit(pid: int, attempts: int, delay: float) -> bool:
 
 
 def _start_gateway_make_restart_signal_handler(runner):
-    """Build the SIGUSR1 handler: log what the signal means, then the drain-aware service restart."""
-    def restart_signal_handler():
-        # systemd's `reload` verb (ExecReload=kill -USR1) lands here too; say so, because operators
-        # expect `reload` to mean an in-process config reload, not a drain-and-relaunch (#117267).
-        logger.info(
-            "SIGUSR1 received (systemctl reload / hermes gateway restart): performing a graceful "
-            "gateway restart — drain active turns, exit, supervisor relaunches. Not an in-process "
-            "config reload.")
-        runner.request_restart(detached=False, via_service=True)
-    return restart_signal_handler
+    """Build the SIGUSR1 handler: name the requester, then the drain-aware service restart.
+
+    A signal carries no payload and this process exits a drain later, so the requester is readable
+    only in the handler — the body (log the name, stamp the lifecycle file, request the restart)
+    lives in ``gateway/restart_attribution.py`` (PRX-5423).
+    """
+    from gateway.restart_attribution import sigusr1_restart_handler
+
+    return sigusr1_restart_handler(runner)
 
 
 def _claim_host_gateway_role(force: bool = False) -> None:
