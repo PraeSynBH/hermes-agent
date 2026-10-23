@@ -136,7 +136,7 @@ class GatewaySessionWatchersMixin:
         try:
             removed = await self.async_session_store.prune_old_entries(max_age_days)
         except Exception as e:
-            logger.warning("SessionStore prune failed: %s", e)
+            logger.warning("SessionStore prune failed: %s", e, exc_info=True)
             return
         logger.info("SessionStore prune: dropped %d entries older than %d days in %.1fs",
                     removed, max_age_days, time.monotonic() - started)

@@ -881,10 +881,9 @@ class SessionStore(
         except Exception as exc:
             logger.warning(
                 "active_session_keys_fn raised during %s; keeping every candidate alive: %s",
-                context, exc,
+                context, exc, exc_info=True,
             )
             return None
-
 
 
     def has_any_sessions(self) -> bool:

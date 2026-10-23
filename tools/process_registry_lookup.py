@@ -7,11 +7,13 @@ for that read (a pool submit, a new OS thread when the pool is saturated, and th
 the loop) is what starved the loop for 16-50 s at a time (PRA-6825/PRA-6826).
 
 ``ProcessLookupMixin`` needs the registry's ``self._lock``, ``self._running``, ``self._finished``
-and ``self._refresh_detached_session``.
+and ``self._refresh_detached_session``. It also owns the active-work queries — one key
+(:meth:`has_active_for_session`) and the whole set in one lock pass (:meth:`active_session_keys`).
 """
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Optional
 
 from tools.process_registry_results import load_completed_results
@@ -48,6 +50,37 @@ class ProcessLookupMixin:
         with self._lock:
             session = self._running.get(full_id) or self._finished.get(full_id)
         return self._refresh_detached_session(session)
+
+    def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:
+        """Active processes for a gateway session key. Processes older than
+        ``max_active_age`` seconds are ignored as stale so a forgotten ``http.server``
+        can't freeze session idle/daily reset forever; ``None`` keeps legacy behaviour
+        (any running process blocks)."""
+        now = time.time()
+        return self._any_running(
+            lambda s: s.session_key == session_key
+            and (max_active_age is None or (now - s.started_at) < max_active_age))
+
+    def active_session_keys(self, max_active_age: Optional[float] = None) -> set[str]:
+        """Session keys with a live process — the batch form of :meth:`has_active_for_session`.
+
+        A caller holding thousands of keys must not pay a lock round-trip *and* a scan per key: the
+        gateway's routing-index prune walks every session key it has ever routed (18 945 on the host
+        that filed PRX-6075) once an hour, and the per-key form made that tick one shared-lock
+        acquisition per entry — 39.0 s inside a single tick, while every other tick of the same
+        watcher ran in ~2.5 ms. One pass answers all of them.
+        """
+        now = time.time()
+        with self._lock:
+            sessions = list(self._running.values())
+        for session in sessions:
+            self._refresh_detached_session(session)
+        with self._lock:
+            return {
+                s.session_key for s in self._running.values()
+                if s.session_key and not s.exited
+                and (max_active_age is None or (now - s.started_at) < max_active_age)
+            }
 
     def _resolve_prefix(self, session_id: str) -> Optional[ProcessSession]:
         """Resolve a unique session-ID prefix (a bare hex tail is normalized to

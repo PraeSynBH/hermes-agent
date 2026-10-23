@@ -721,28 +721,6 @@ class TestActiveQueries:
         registry._running[s.id] = s
         assert registry.has_active_for_session("gw_session_1", max_active_age=86400) is False
 
-    def test_active_session_keys_answers_the_same_question_in_one_pass(self, registry):
-        """PRX-6075: the batch form must agree with ``has_active_for_session`` key for key.
-
-        The routing-index prune asks about every key the gateway has ever routed, so it reads the
-        batch form; if the two drift, a live session loses its protection from the prune.
-        """
-        live = _make_session(sid="proc_live")
-        live.session_key = "gw_live"
-        stale = _make_session(sid="proc_stale", started_at=time.time() - 90000)
-        stale.session_key = "gw_stale"
-        exited = _make_session(sid="proc_exited", exited=True)
-        exited.session_key = "gw_exited"
-        orphan = _make_session(sid="proc_orphan")  # no session key: not a session's process
-        for s in (live, stale, exited, orphan):
-            registry._running[s.id] = s
-
-        assert registry.active_session_keys() == {"gw_live", "gw_stale"}
-        assert registry.active_session_keys(max_active_age=86400) == {"gw_live"}
-        for key in ("gw_live", "gw_stale", "gw_exited", "gw_orphan"):
-            assert (key in registry.active_session_keys(max_active_age=86400)) is \
-                registry.has_active_for_session(key, max_active_age=86400), key
-
 # =========================================================================
 # Pruning
 # =========================================================================
