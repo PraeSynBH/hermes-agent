@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 from contextlib import closing
 from dataclasses import asdict, replace
+from functools import partial
 import threading
 import json
 from pathlib import Path
@@ -70,24 +71,24 @@ def build_kanban_policy(connection, params, config):
                    request_json=json.dumps(request, sort_keys=True), kanban_json=json.dumps(context)), private
 
 
-async def run_task(connection, params):
-    if not connection.native_owner or 'session:create' not in connection.actor.capabilities:
-        raise RuntimeStoreError('permission_denied')
+def _stage_task_session(authority, connection, params, request_id, sid):
+    """The receipt probe, the policy and the staging for ``run_task``, in one worker.
+
+    Returns ``(policy, saved_receipt_or_None, ref_or_staged_receipt)``.
+
+    Both the probe (``get_session``) and the staging (``stage_local_session`` ->
+    ``get_session``) are reads that, missing the read pool, degrade to the WRITER connection under
+    ``SessionDB._lock`` (``hermes_state._read_ctx``; ``acquire()`` refuses descriptor work on a loop
+    thread), so on the owner loop a held writer froze every session this profile serves (PRX-6024,
+    the same class as ``session_controls._stage_create``). The caller's create lock keeps this
+    worker and the creation commit one owner step. The claim-derived policy builds here too: it
+    reads the Kanban DB and the profile config, which are no cheaper in front of the loop.
+    """
     from gateway.run import _load_gateway_config
-    from gateway.session_local import create_local_session
-    from gateway.session_contract import Submission
-    from gateway.session_local_recovery import local_identity
+    from gateway.session_local import stage_local_session
+    from gateway.session_local_recovery import restore_local_session
     from hermes_state_local import local_receipt
     from gateway.session_policy import restore_policy
-    authority = connection.authority
-    # Resolved off-loop up front: no await separates the saved-claim check from session
-    # creation. The Kanban claim check and its marker share one off-loop transaction; a
-    # concurrent retry of the same attempt meets that marker (same session) or a stale claim.
-    owner_db = str(await asyncio.to_thread(Path(authority.db.db_path).resolve))
-    # The dispatcher attempt is the durable request identity, including after the
-    # task closes. Retry checks the saved claim, never reinterprets updated cards.
-    request_id = 'kanban:' + json.dumps([params.get('board'), params.get('task_id'), params.get('run_id')], separators=(',', ':'))
-    sid = local_identity(authority.profile_id, connection.actor.subject, request_id)
     saved = local_receipt(authority.db, sid) if authority.db.get_session(sid) is not None else None
     if saved:
         policy = restore_policy(saved['policy'])
@@ -95,12 +96,43 @@ async def run_task(connection, params):
         if (not connection.native_owner or set(params) not in ({'board', 'task_id', 'run_id', 'claim_lock'}, {'board', 'task_id', 'run_id', 'claim_lock', 'db'})
                 or any(params[k] != context.get(k) for k in params)):
             raise RuntimeStoreError('permission_denied')
-        from gateway.session_local_recovery import restore_local_session
-        ref = restore_local_session(authority, sid)
-    else:
-        policy, private = build_kanban_policy(connection, params, _load_gateway_config())
-        ref = create_local_session(authority, connection.actor, {'request_id': request_id},
-                                   trusted_policy=policy, trusted_secrets=private)
+        return policy, saved, restore_local_session(authority, sid)
+    policy, private = build_kanban_policy(connection, params, _load_gateway_config())
+    return policy, None, stage_local_session(authority, connection.actor, {'request_id': request_id},
+                                             trusted_policy=policy, trusted_secrets=private)
+
+
+async def run_task(connection, params):
+    if not connection.native_owner or 'session:create' not in connection.actor.capabilities:
+        raise RuntimeStoreError('permission_denied')
+    from gateway.session_contract import Submission
+    from gateway.session_local_recovery import local_identity, restore_local_session
+    from gateway.session_runtime_workers import tracked_write
+    from hermes_state_local import commit_local_session
+    authority = connection.authority
+    # Resolved off-loop up front, and the saved-claim check runs in the same worker call as the
+    # session creation, so no await separates them. The Kanban claim check and its marker share one
+    # off-loop transaction; a concurrent retry of the same attempt meets that marker (same session)
+    # or a stale claim.
+    owner_db = str(await asyncio.to_thread(Path(authority.db.db_path).resolve))
+    # The dispatcher attempt is the durable request identity, including after the
+    # task closes. Retry checks the saved claim, never reinterprets updated cards.
+    request_id = 'kanban:' + json.dumps([params.get('board'), params.get('task_id'), params.get('run_id')], separators=(',', ':'))
+    sid = local_identity(authority.profile_id, connection.actor.subject, request_id)
+    # The receipt probe, the claim-derived policy (or the saved one) and the staging are one owner
+    # step in a worker (see ``_stage_task_session``): on the owner loop a read missing the read pool
+    # degrades to the WRITER connection under ``SessionDB._lock`` and froze every session this
+    # profile serves. The create lock keeps them and the commit one step, as the loop's thread did.
+    lock = getattr(authority, '_staged_create_lock', None)
+    if lock is None:
+        lock = authority._staged_create_lock = asyncio.Lock()
+    async with lock:
+        policy, saved, ref = await asyncio.to_thread(
+            _stage_task_session, authority, connection, params, request_id, sid)
+        if isinstance(ref, dict):  # the creation commit runs off the owner loop (N90); a duplicate converges
+            await tracked_write(authority, partial(
+                commit_local_session, authority.db, epoch=authority.epoch, receipt=ref))
+            ref = await asyncio.to_thread(restore_local_session, authority, ref['session_id'])
     from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli import kanban_db as kb
     import os
@@ -128,7 +160,6 @@ async def run_task(connection, params):
                     {'db': owner_db, 'session_id': ref.session_id,
                      'request_id': request_id, 'pid': os.getpid(), 'birth': process_birth(psutil.Process())},
                     run_id=task.current_run_id)
-    from gateway.session_runtime_workers import tracked_write
     await tracked_write(authority, admit_claim)
     await connection.resume(ref, {})
     # Finite like the `chat -q` worker it replaced: nobody can answer an approval or clarify in a

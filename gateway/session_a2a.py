@@ -77,6 +77,54 @@ def storage_source(db, source, session_id, fallback):
     return fallback if label in STORED_AS_LOCAL else label
 
 
+def _stage_forward(authority, actor, params, identity, base):
+    """The reads that decide create-vs-resume, and the staging that follows them, in one worker.
+
+    Returns the resumed ``SessionRef``, or the staged receipt ``forward`` commits off the loop.
+
+    Every read here -- ``first_generation``, the receipt probe, ``get_session_by_title`` and
+    ``stage_local_session``'s own ``get_session`` -- degrades to the WRITER connection under
+    ``SessionDB._lock`` when the read pool offers nothing (``hermes_state._read_ctx``; ``acquire()``
+    refuses descriptor work on a loop thread), so on the owner loop a held writer froze every
+    session this profile serves (PRX-6024). The caller's create lock keeps this worker and the
+    commit one owner step, as the loop's single thread made them.
+    """
+    from gateway.session_local_recovery import local_identity, restore_local_session
+    from gateway.session_local import stage_local_session
+    from hermes_state_local import local_receipt
+    from hermes_state_mutation_retirement import first_generation
+    from hermes_state_terminal import identity_key
+    # A context whose session the user deleted continues on its next generation (the deleted id
+    # stays retired). An exact retry of an input the deleted session took stays on it and is
+    # refused there, never run again.
+    request_id = lambda n: base if n == 0 else f'{base}:{n}'
+    pinned = lambda conn, sid: conn.execute('SELECT 1 FROM state_meta WHERE key=?', (
+        identity_key(actor.subject, sid, params['input_id']),)).fetchone() is not None
+    generation, sid = first_generation(
+        authority.db, lambda n: local_identity(authority.profile_id, actor.subject, request_id(n)), pinned=pinned)
+    if authority.db.get_session(sid) is not None:
+        receipt = local_receipt(authority.db, sid)
+        if json.loads(receipt['policy']['request_json']).get('a2a_identity') != identity:
+            raise RuntimeStoreError('admission_conflict')
+        return restore_local_session(authority, sid)
+    # Historical `a2a-{agent}-{slug}` titles discarded peer/tenant identity and collapsed
+    # context characters, and those `hermes chat --source a2a` rows stored no origin, so a
+    # titled row never proves it belongs to this exact conversation. Never adopt or retitle
+    # it (that would hand one peer another's history), and never refuse every peer whose
+    # slug collides: start this identity's own canonical session and leave the old row be.
+    from plugins.platforms.a2a.adapter import _safe_context_slug
+    title = f'a2a-{params["agent"]}-{_safe_context_slug(params["context_id"])}'
+    legacy = authority.db.get_session_by_title(title)
+    if legacy is not None:
+        logger.warning('A2A: pre-authority session %s titled %r has no peer identity; '
+                       'forwarding into a new session instead of adopting it', legacy['id'], title)
+    token = _forward_identity.set(identity)
+    try:
+        return stage_local_session(authority, actor, {'source': 'a2a', 'request_id': request_id(generation)})
+    finally:
+        _forward_identity.reset(token)
+
+
 async def forward(connection, params):
     authority, actor = connection.authority, connection.actor
     if actor.profile_id != authority.profile_id:
@@ -91,48 +139,22 @@ async def forward(connection, params):
         raise RuntimeStoreError('invalid_params')
     identity = [params[k] for k in ('agent', 'tenant', 'peer', 'context_id')]
     key = 'a2a:' + hashlib.sha256(json.dumps(identity, separators=(',', ':')).encode()).hexdigest()
-    from gateway.session_local_recovery import local_identity, restore_local_session
-    from gateway.session_local import stage_local_session
+    from gateway.session_local_recovery import restore_local_session
     from gateway.session_runtime_workers import tracked_write
-    from hermes_state_local import commit_local_session, local_receipt
-    from hermes_state_mutation_retirement import first_generation
-    from hermes_state_terminal import identity_key
-    # A context whose session the user deleted continues on its next generation (the deleted id
-    # stays retired). An exact retry of an input the deleted session took stays on it and is
-    # refused there, never run again.
-    base = key
-    request_id = lambda n: base if n == 0 else f'{base}:{n}'
-    pinned = lambda conn, sid: conn.execute('SELECT 1 FROM state_meta WHERE key=?', (
-        identity_key(actor.subject, sid, params['input_id']),)).fetchone() is not None
-    generation, sid = first_generation(
-        authority.db, lambda n: local_identity(authority.profile_id, actor.subject, request_id(n)), pinned=pinned)
-    key = request_id(generation)
+    from hermes_state_local import commit_local_session
     authority._require_admission_open()
-    if authority.db.get_session(sid) is not None:
-        receipt = local_receipt(authority.db, sid)
-        if json.loads(receipt['policy']['request_json']).get('a2a_identity') != identity:
-            raise RuntimeStoreError('admission_conflict')
-        ref = restore_local_session(authority, sid)
-    else:
-        # Historical `a2a-{agent}-{slug}` titles discarded peer/tenant identity and collapsed
-        # context characters, and those `hermes chat --source a2a` rows stored no origin, so a
-        # titled row never proves it belongs to this exact conversation. Never adopt or retitle
-        # it (that would hand one peer another's history), and never refuse every peer whose
-        # slug collides: start this identity's own canonical session and leave the old row be.
-        from plugins.platforms.a2a.adapter import _safe_context_slug
-        title = f'a2a-{params["agent"]}-{_safe_context_slug(params["context_id"])}'
-        legacy = authority.db.get_session_by_title(title)
-        if legacy is not None:
-            logger.warning('A2A: pre-authority session %s titled %r has no peer identity; '
-                           'forwarding into a new session instead of adopting it', legacy['id'], title)
-        token = _forward_identity.set(identity)
-        try:
-            ref = stage_local_session(authority, actor, {'source': 'a2a', 'request_id': key})
-        finally:
-            _forward_identity.reset(token)
+    # The deciding reads (generation, the receipt probe, the legacy title) and the staging run in
+    # one worker under the authority's create lock (PRX-6024): on the owner loop a read missing the
+    # read pool degrades to the WRITER connection under ``SessionDB._lock`` and froze every session
+    # this profile serves. The commit and the publish that follows stay one owner step behind it.
+    lock = getattr(authority, '_staged_create_lock', None)
+    if lock is None:
+        lock = authority._staged_create_lock = asyncio.Lock()
+    async with lock:
+        ref = await asyncio.to_thread(_stage_forward, authority, actor, params, identity, key)
         if isinstance(ref, dict):  # the creation commit runs off the owner loop (N90); a duplicate converges
             await tracked_write(authority, partial(commit_local_session, authority.db, epoch=authority.epoch, receipt=ref))
-            ref = restore_local_session(authority, ref['session_id'])
+            ref = await asyncio.to_thread(restore_local_session, authority, ref['session_id'])
     if ref.session_id not in connection.subscriptions:
         await connection.resume(ref, {})
     receipt = await authority.submit(actor, Submission(params['input_id'], ref, {'text': params['text']}, 'queue'))
