@@ -140,6 +140,74 @@ class TestWakeClass:
         assert snapshot.rank_class("release") == 1  # assigned work
 
 
+class TestQueuedRunIsAWake:
+    """PRX-6000: a DISPATCHED-but-unstarted run is a waiting client, not assignment.
+
+    ``release`` was evicted 98 s after the 2026-10-22 boot while it held two queued runs. The
+    collector reported only ``running`` runs, so its facts read as "2 agents, nothing waiting"
+    (class 1) and a rival pinned by a live sighting (class 0) took the slot. The rank could not see
+    the client that was actually waiting for it.
+    """
+
+    def test_a_queued_run_ranks_with_a_blocked_admission(self, profile_env):
+        _profile("release")
+        _write_manifest(profile_env, {"release": {"agents": 2, "queued": 2}})
+
+        facts = demand.refresh().for_profile("release")
+
+        assert facts.queued_runs == 2
+        assert facts.has_pending_wake() is True
+        assert facts.rank_class() == 0
+        assert facts.work_signals() == ("wake", "agents")
+        assert "2 Paperclip runs queued for this profile" in demand.wake_signal(facts)
+
+    def test_the_incident_tie_goes_to_the_priority_list(self, profile_env):
+        """The 2026-10-22 13:28Z decision, replayed: both sides have a waiting client.
+
+        ``cmo`` was pinned by a live pending-admission sighting (class 0) and took the slot from
+        ``release``, whose two queued runs were invisible (class 1). With the queued count in the
+        rank both are class 0, so the operator's priority list decides — and it puts ``release``
+        ahead of ``cmo``. This is also the acceptance shape: a boot that served ``release`` cannot
+        lose it to a sighting pin as long as release holds a waiting run.
+        """
+        _profile("release")
+        _profile("cmo")
+        _write_manifest(profile_env, {
+            "release": {"agents": 2, "queued": 2},
+            "cmo": {"agents": 3},
+        })
+        snapshot = demand.refresh()
+        demand.note_wanted("cmo")  # a client is blocked on cmo right now (class 0)
+
+        assert snapshot.rank_class("release") == snapshot.rank_class("cmo") == 0
+        kept, deferred = capacity.apply_ceiling(
+            [("release", Path("/r")), ("cmo", Path("/c"))], 1, ("release", "cmo"), demand=snapshot)
+
+        assert [name for name, _home in kept] == ["release"]
+        assert "cmo" in deferred
+
+    def test_a_negative_queued_count_is_malformed(self, profile_env):
+        """A count is never a reason to rank a profile on a guess: refuse the read instead."""
+        _profile("release")
+        _write_manifest(profile_env, {"release": {"agents": 2, "queued": -1}})
+
+        snapshot = demand.refresh()
+
+        assert snapshot.manifest_state == demand.MANIFEST_MALFORMED
+        assert snapshot.for_profile("release").agents is None  # unknown, never a fabricated zero
+
+    def test_a_manifest_without_the_queued_field_still_reads(self, profile_env):
+        """Older collectors keep working: no ``queued`` is no dispatched queue, not malformed."""
+        _profile("release")
+        _write_manifest(profile_env, {"release": {"agents": 2, "busy": 1}})
+
+        facts = demand.refresh().for_profile("release")
+
+        assert facts.queued_runs == 0
+        assert facts.rank_class() == 0  # class 0 via ``busy``, unchanged from PRA-6796
+        assert demand.refresh().manifest_state == demand.MANIFEST_OK
+
+
 class TestPublishedWake:
     def test_the_record_carries_the_pending_run_count_and_signal(self, profile_env):
         _profile("release")
