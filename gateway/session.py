@@ -788,7 +788,7 @@ class SessionStore(
 ):
     """Session routing index + transcripts: SQLite (SessionDB), legacy JSONL fallback."""
 
-    def __init__(self, sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=None):
+    def __init__(self, sessions_dir: Path, config: GatewayConfig, active_session_keys_fn=None):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: dict[str, SessionEntry] = {}
@@ -818,7 +818,10 @@ class SessionStore(
         # Monotonic timestamp of the last FTS5 rebuild attempt, or None before any attempt; see
         # SessionTranscriptMixin._rebuild_fts_once for the cooldown this gates.
         self._fts_rebuild_last_attempt_at: Optional[float] = None
-        self._has_active_processes_fn = has_active_processes_fn
+        # ``() -> set[session_key]`` of keys with live background work. Batch, not per key: the
+        # prune asks about every routed key (tens of thousands), so a per-key query made one
+        # hourly tick O(keys) lock round-trips against the live process registry (PRX-6075).
+        self._active_session_keys_fn = active_session_keys_fn
         self._write_sessions_json = bool(getattr(config, "write_sessions_json", True))
 
         # SQLite handles are cached per path and resolved through ``_db`` per call, never bound
@@ -865,18 +868,22 @@ class SessionStore(
             setattr(self, name, value)
         return value
 
-    def _has_active_processes_safe(self, session_key: str, *, context: str) -> bool:
-        """Whether a session has active work, failing closed (True) on registry errors."""
-        if self._has_active_processes_fn is None:
-            return False
+    def _active_session_keys_safe(self, *, context: str) -> Optional[set[str]]:
+        """Session keys with live work in one registry pass; ``None`` on a registry error.
+
+        ``None`` means "cannot tell", which every caller must treat as "keep everything" — a
+        registry hiccup must never turn into a prune.
+        """
+        if self._active_session_keys_fn is None:
+            return set()
         try:
-            return bool(self._has_active_processes_fn(session_key))
+            return set(self._active_session_keys_fn())
         except Exception as exc:
             logger.warning(
-                "has_active_processes_fn raised during %s for %s; keeping session alive: %s",
-                context, session_key, exc,
+                "active_session_keys_fn raised during %s; keeping every candidate alive: %s",
+                context, exc,
             )
-            return True
+            return None
 
 
 

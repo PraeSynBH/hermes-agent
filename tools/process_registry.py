@@ -2406,6 +2406,26 @@ class ProcessRegistry(ProcessLookupMixin, ProcessTerminationMixin, ProcessCheckp
         with self._lock:
             return any(not s.exited and predicate(s) for s in self._running.values())
 
+    def active_session_keys(self, max_active_age: Optional[float] = None) -> set[str]:
+        """Session keys with a live process — the batch form of ``has_active_for_session``.
+
+        A caller holding thousands of keys must not pay a lock round-trip *and* a scan per key:
+        the gateway's routing-index prune walks every session key it has ever routed (tens of
+        thousands) once an hour, and the per-key form made that tick O(keys x processes) lock
+        acquisitions shared with the live loop (PRX-6075). One pass answers all of them.
+        """
+        now = time.time()
+        with self._lock:
+            sessions = list(self._running.values())
+        for session in sessions:
+            self._refresh_detached_session(session)
+        with self._lock:
+            return {
+                s.session_key for s in self._running.values()
+                if s.session_key and not s.exited
+                and (max_active_age is None or (now - s.started_at) < max_active_age)
+            }
+
     def has_active_processes(self, task_id: str) -> bool:
         """Whether any process for ``task_id`` is still running. Ownership is
         ``owner_task_id`` (the raw spawning id) like the other task-scoped queries:

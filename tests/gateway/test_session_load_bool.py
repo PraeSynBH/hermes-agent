@@ -34,7 +34,7 @@ class TestSessionLoadBoolCorruption:
         store._loaded = False
         store._lock = threading.RLock()
         store.config = FakeConfig()
-        store._has_active_processes_fn = None
+        store._active_session_keys_fn = None
         return store
 
     def _valid_entry(self, session_id: str = "20260101_120000_abc12345") -> dict:

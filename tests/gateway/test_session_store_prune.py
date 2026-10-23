@@ -44,7 +44,7 @@ def test_session_store_default_db_uses_runtime_hermes_home(tmp_path, monkeypatch
         if store._db is not None:
             store._db.close()
 
-def _make_store(tmp_path, max_age_days: int = 90, has_active_processes_fn=None):
+def _make_store(tmp_path, max_age_days: int = 90, active_session_keys_fn=None):
     """Build a SessionStore bypassing SQLite/disk-load side effects."""
     config = GatewayConfig(
 
@@ -54,7 +54,7 @@ def _make_store(tmp_path, max_age_days: int = 90, has_active_processes_fn=None):
         store = SessionStore(
             sessions_dir=tmp_path,
             config=config,
-            has_active_processes_fn=has_active_processes_fn,
+            active_session_keys_fn=active_session_keys_fn,
         )
     store._db = None
     store._loaded = True
@@ -97,20 +97,18 @@ class TestPruneBasics:
     def test_prune_skips_entries_with_active_processes(self, tmp_path):
         """Sessions with active bg processes aren't pruned even if old.
 
-        The callback is keyed by session_key — matching what
-        process_registry.has_active_for_session() actually consumes in
-        gateway/run.py.  Prior to the fix this test passed the callback a
-        session_id, which silently matched an implementation bug where
-        prune_old_entries was also passing session_id; real-world usage
-        (via process_registry) takes a session_key and never matched, so
-        active sessions were still being pruned.
+        The query answers in session_keys — matching what
+        process_registry.active_session_keys() returns.  Prior to the fix the
+        store was handed one call per entry and an implementation bug passed a
+        session_id; real-world usage (via process_registry) keys on the
+        session_key and never matched, so active sessions were still pruned.
         """
         active_session_keys = {"active"}
 
-        def _has_active(session_key: str) -> bool:
-            return session_key in active_session_keys
+        def _active() -> set[str]:
+            return active_session_keys
 
-        store = _make_store(tmp_path, has_active_processes_fn=_has_active)
+        store = _make_store(tmp_path, active_session_keys_fn=_active)
         store._entries["active"] = _entry(
             "active", age_days=1000, session_id="sid_active"
         )
@@ -125,14 +123,14 @@ class TestPruneBasics:
         assert "idle" not in store._entries
 
     def test_prune_active_check_uses_session_key_not_session_id(self, tmp_path):
-        """Regression guard: a callback that only recognises session_ids must
+        """Regression guard: a query that only recognises session_ids must
         NOT protect entries during prune.  This pins the fix so a future
-        refactor can't silently revert to passing session_id again.
+        refactor can't silently revert to matching session_id again.
         """
-        def _recognises_only_ids(identifier: str) -> bool:
-            return identifier.startswith("sid_")
+        def _recognises_only_ids() -> set[str]:
+            return {"sid_active"}
 
-        store = _make_store(tmp_path, has_active_processes_fn=_recognises_only_ids)
+        store = _make_store(tmp_path, active_session_keys_fn=_recognises_only_ids)
         store._entries["active"] = _entry(
             "active", age_days=1000, session_id="sid_active"
         )
@@ -175,6 +173,70 @@ class TestPruneBasics:
         for i in range(20):
             if i % 2 == 1:  # fresh
                 assert f"s{i}" in store._entries
+
+class TestPruneCostShape:
+    """PRX-6075: the hourly prune walked every routed key twice over the process registry.
+
+    The index holds every key the gateway has ever routed (15 762 rows on the host that filed the
+    card), and the prune asked the registry about each one *inside* `SessionStore._lock`. One
+    hourly tick therefore cost O(keys) lock round-trips against the live process registry while
+    holding the lock a turn needs to persist itself: 51 681 ms for a tick whose other arms are
+    milliseconds. These pin the shape, not the number.
+    """
+
+    def test_prune_queries_the_registry_once_for_the_whole_index(self, tmp_path):
+        calls = []
+
+        def _active() -> set[str]:
+            calls.append(1)
+            return set()
+
+        store = _make_store(tmp_path, active_session_keys_fn=_active)
+        for i in range(2000):
+            store._entries[f"s{i}"] = _entry(f"s{i}", age_days=1000)
+
+        assert store.prune_old_entries(max_age_days=90) == 2000
+        assert len(calls) == 1, 'one registry pass per prune, not one per routed key'
+
+    def test_prune_queries_the_registry_without_holding_the_store_lock(self, tmp_path):
+        """A turn persisting itself needs `_lock`; a registry scan must not hold it."""
+        held = []
+
+        def _active() -> set[str]:
+            held.append(store._lock.locked())
+            return set()
+
+        store = _make_store(tmp_path, active_session_keys_fn=_active)
+        store._entries["stale"] = _entry("stale", age_days=1000)
+
+        store.prune_old_entries(max_age_days=90)
+        assert held == [False]
+
+    def test_prune_keeps_an_entry_that_became_active_during_the_registry_scan(self, tmp_path):
+        """The scan happens outside the lock, so the decision is re-taken on the live entry."""
+        def _active() -> set[str]:
+            store._entries["stale"].updated_at = datetime.now()  # a turn just persisted
+            return set()
+
+        store = _make_store(tmp_path, active_session_keys_fn=_active)
+        store._entries["stale"] = _entry("stale", age_days=1000)
+        store._entries["old"] = _entry("old", age_days=1000)
+
+        assert store.prune_old_entries(max_age_days=90) == 1
+        assert "stale" in store._entries
+        assert "old" not in store._entries
+
+    def test_prune_drops_nothing_when_the_registry_cannot_answer(self, tmp_path):
+        """A registry error must fail closed: keeping every entry beats pruning live sessions."""
+        def _boom() -> set[str]:
+            raise RuntimeError("registry unavailable")
+
+        store = _make_store(tmp_path, active_session_keys_fn=_boom)
+        store._entries["stale"] = _entry("stale", age_days=1000)
+
+        assert store.prune_old_entries(max_age_days=90) == 0
+        assert "stale" in store._entries
+
 
 class TestPrunePersistsToDisk:
     def test_prune_rewrites_sessions_json(self, tmp_path):

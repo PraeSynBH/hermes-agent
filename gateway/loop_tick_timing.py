@@ -53,7 +53,8 @@ def _counter(name: str) -> dict:
     if rec is None:
         rec = _counters[name] = {'count': 0, 'total': 0.0, 'max': 0.0, 'last': 0.0,
                                  'window': [0.0] * WINDOW, 'at': 0,
-                                 'slow': 0, 'slow_total': 0, 'warned_at': None}
+                                 'slow': 0, 'slow_total': 0, 'warned_at': None,
+                                 'budget': 0.0, 'used': 0.0, 'over': 0, 'over_total': 0}
     return rec
 
 
@@ -87,6 +88,12 @@ def snapshot() -> dict[str, dict]:
             'max_window_s': max(window) if window else 0.0,
             'slow_since_summary': rec['slow'],
             'slow_total': rec['slow_total'],
+            # Per-tick ceiling the watcher enforces, and what the last tick spent against it:
+            # a watcher that slices its work reports here whether the slice held (PRX-6075).
+            'budget_s': rec['budget'],
+            'budget_used_s': rec['used'],
+            'over_budget_since_summary': rec['over'],
+            'over_budget_total': rec['over_total'],
         }
     return view
 
@@ -116,6 +123,11 @@ def _line(name: str, value: dict) -> str:
             f" boot_max={_ms(value['max_s'])}ms")
     if value['slow_since_summary']:
         line += f" slow={value['slow_since_summary']}/{value['slow_total']}"
+    if value['budget_s']:
+        # ``budget_used`` closes the loop the issue asked for: the ceiling is only real if a
+        # sweep can read what the tick spent against it, beside the slow= counter.
+        line += (f" budget_used={_ms(value['budget_used_s'])}ms/{_ms(value['budget_s'])}ms"
+                 f" over={value['over_budget_since_summary']}/{value['over_budget_total']}")
     return line
 
 
@@ -147,8 +159,14 @@ def log_summary(now: float | None = None) -> list[str] | None:
     return lines
 
 
-def record(name: str, seconds: float, *, now: float | None = None) -> None:
-    """Account one tick of *name* (its wall time) and log the periodic summary when it is due."""
+def record(name: str, seconds: float, *, budget_s: float | None = None,
+           now: float | None = None) -> None:
+    """Account one tick of *name* (its wall time) and log the periodic summary when it is due.
+
+    *budget_s* is the per-tick ceiling the watcher slices its work to. Recorded so the summary can
+    report ``budget_used`` and an over-budget count: without a number beside the ceiling, "the tick
+    is bounded" is a claim no sweep can check (PRX-6075).
+    """
     rec = _counter(name)
     rec['count'] += 1
     rec['total'] += seconds
@@ -156,6 +174,12 @@ def record(name: str, seconds: float, *, now: float | None = None) -> None:
     rec['max'] = max(rec['max'], seconds)
     rec['window'][rec['at'] % WINDOW] = seconds
     rec['at'] += 1
+    if budget_s is not None:
+        rec['budget'] = budget_s
+        rec['used'] = seconds
+        if seconds > budget_s:
+            rec['over'] += 1
+            rec['over_total'] += 1
     if seconds >= SLOW_TICK_S:
         rec['slow'] += 1
         rec['slow_total'] += 1
@@ -170,9 +194,11 @@ def record(name: str, seconds: float, *, now: float | None = None) -> None:
 
 
 @contextmanager
-def timed(name: str, *, per_tick_debug: bool = True):
+def timed(name: str, *, budget_s: float | None = None, per_tick_debug: bool = True):
     """Time one pass (or one unit of work) of watcher *name*; recorded even when it raises.
 
+    ``budget_s`` is the per-tick ceiling this watcher enforces; pass it so the summary reports
+    ``budget_used`` and the over-budget count.
     ``per_tick_debug=False`` for the fast watchers (the 1 s hosted-room worker): their per-tick line
     is 86 400 records a day at DEBUG, and the per-minute summary already carries count/p50/p95/max.
     """
@@ -181,6 +207,6 @@ def timed(name: str, *, per_tick_debug: bool = True):
         yield
     finally:
         elapsed = time.monotonic() - start
-        record(name, elapsed)
+        record(name, elapsed, budget_s=budget_s)
         if per_tick_debug:
             logger.debug("tick %s %.1fms", name, elapsed * 1000.0)
