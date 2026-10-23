@@ -15,7 +15,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from tui_gateway import server
+from tui_gateway import server, ws_egress
 from agent.message_sanitization import _sanitize_surrogates
 from tui_gateway.event_replay import replay_epoch
 from tui_gateway.transport import serialize_frame
@@ -252,9 +252,12 @@ class WSTransport:
                 if is_current is not None and index >= unguarded_prefix and not is_current():
                     return
                 payload = _sanitize_ws_text(line)
+                started = time.perf_counter()
                 try:
                     await asyncio.wait_for(self._ws.send_text(payload), timeout=_WS_SEND_DEADLINE_S)
                 except TimeoutError:
+                    # The frame got the whole deadline to drain; account it before the latch so a
+                    # stalled peer still shows up in the size/cost mix.
                     # The loop is responsive (the timer fired) but the socket never drained: unlike the
                     # loop-stall wait in write(), this is a dead peer. Latch under the writer lock so queued
                     # batches bail, and close the socket so handle_ws's read loop ends and its teardown
@@ -273,6 +276,12 @@ class WSTransport:
                     self._closed = True
                     _log.warning("ws send failed peer=%s error_type=%s error=%s", self._peer, type(exc).__name__, exc)
                     return
+                finally:
+                    # Size/cost of every frame the writer put on this socket: the synchronous
+                    # compress+send inside send_text is loop occupancy nobody can preempt, so it is
+                    # the mix that has to stay observable (PRA-6844). Characters, not bytes: that is
+                    # what zlib walks, and only non-ASCII tool output makes the two differ.
+                    ws_egress.record_send(len(payload), time.perf_counter() - started)
 
     def close(self) -> None:  # loop thread (handle_ws finally), so the TimerHandle is safe
         self._closed = True

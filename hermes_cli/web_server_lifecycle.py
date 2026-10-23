@@ -562,7 +562,8 @@ def build_listener_server(served_app, host: str, port: int, *, auth_required: bo
     """
     import uvicorn
     from hermes_cli.config import load_config
-    from hermes_cli.web_server_boundary import _DESKTOP_ATTACHMENT_WS_MAX_BYTES, _LOOPBACK_HOST_VALUES
+    from hermes_cli.web_server_boundary import (
+        _DESKTOP_ATTACHMENT_WS_MAX_BYTES, _LOOPBACK_HOST_VALUES, ws_per_message_deflate_for)
 
     try:
         dash_cfg = load_config().get("dashboard") or {}
@@ -591,6 +592,9 @@ def build_listener_server(served_app, host: str, port: int, *, auth_required: bo
         ws_ping_interval=ws_ping[0],
         ws_ping_timeout=ws_ping[1],
         ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
+        # zlib per message runs on THIS loop, un-preemptible by the send deadline; loopback buys
+        # nothing for it (PRA-6844). See ws_per_message_deflate_for.
+        ws_per_message_deflate=ws_per_message_deflate_for(host, dash_cfg),
         # Desktop sends a single SIGTERM and escalates to SIGKILL ~5s later;
         # uvicorn's default (None) waits on lingering ASGI tasks forever, so a
         # mid-turn request orphans the backend past that budget (#76244). 3s

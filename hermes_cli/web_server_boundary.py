@@ -26,6 +26,27 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
 _DESKTOP_ATTACHMENT_WS_MAX_BYTES = 384 * 1024 * 1024
 
 
+def ws_per_message_deflate_for(host: str, dashboard_config: Optional[dict] = None) -> bool:
+    """Whether uvicorn may negotiate permessage-deflate on this bind.
+
+    Compression is per-frame zlib on the event-loop thread: websockets' frame writer runs it inside
+    ``write_frame_sync``, which the caller's send deadline cannot preempt, so every frame on the
+    control socket is loop occupancy before ``sock.send`` ever runs (a live 1200 s sample of the
+    gateway loop put 184/2059 loop-thread shots inside ``permessage_deflate.encode`` — PRA-6844).
+    On loopback that CPU buys nothing: the peer is the same kernel, no bytes cross a network, and
+    the socket's own framing is the only wire cost. So loopback never offers the extension.
+
+    A non-loopback bind (Cloudflare/Tailscale tunnel) does trade CPU for wire bytes, so
+    ``dashboard.ws_per_message_deflate`` decides there and defaults to on.
+    """
+    if host in _LOOPBACK_HOST_VALUES or host in _LOOPBACK_HOSTS:
+        return False
+    raw = (dashboard_config or {}).get("ws_per_message_deflate", True)
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(raw)
+
+
 def _dashboard_public_hosts() -> frozenset[str]:
     """Return the exact hostname declared by ``dashboard.public_url``.
 
