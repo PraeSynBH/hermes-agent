@@ -104,6 +104,51 @@ def restart_externally_supervised_gateway(supervised_pid: int) -> None:
     sys.exit(1)
 
 
+def _requester_detail(request: dict) -> str:
+    """``by <who>`` for a restart record, naming the Paperclip run when the requester had one."""
+    parts = []
+    if request.get("requestedByRunId"):
+        parts.append(f"run {request['requestedByRunId']}")
+    if request.get("agentId"):
+        parts.append(f"agent {request['agentId']}")
+    if request.get("issueId"):
+        parts.append(f"issue {request['issueId']}")
+    if not parts:
+        parts.append(f"{request.get('path') or 'an unattributed caller'}"
+                     + (f" pid {request['caller_pid']}" if request.get("caller_pid") else ""))
+    return ", ".join(parts)
+
+
+def report_restart_already_underway(block: dict, pid: int) -> None:
+    """Answer a request the gateway does not need to serve twice, without signalling anything.
+
+    Both verdicts exit 0: the caller's intent (a gateway running what it just deployed) is already
+    satisfied or already in flight, and a non-zero status here would have agents retrying the verb
+    in a loop — the repeated requests are what PRA-6925 measured, not repeated *failures*.
+    """
+    from hermes_cli.gateway import _print_lines
+
+    request = block.get("request") or {}
+    minutes = float(block.get("aged_s") or 0.0) / 60.0
+    if block.get("verdict") == "in_progress":
+        print("✓ A restart is already in progress — this request joins it; no second drain is queued.")
+        _print_lines(
+            "",
+            f"  Requested {minutes:.1f} min ago by {_requester_detail(request)}.",
+            f"  Gateway PID {pid} drains its in-flight turns, then exits; its supervisor relaunches it.",
+            "  Nothing was signalled: a second SIGUSR1 would command the same drain.",
+        )
+        return
+    print("✓ Nothing signalled — this gateway already restarted, and it is serving your deploy.")
+    _print_lines(
+        "",
+        f"  Gateway PID {pid} started {minutes:.1f} min ago from the restart requested at "
+        f"{request.get('requested_at') or 'an unknown time'} by {_requester_detail(request)}.",
+        "  Re-request only if the running revision is not the one you need"
+        " (`hermes gateway status` shows code_sha).",
+    )
+
+
 def cmd_request_restart(args=None) -> None:
     """``hermes gateway request-restart``: the ONE restart a process inside the gateway may ask for.
 
@@ -128,6 +173,17 @@ def cmd_request_restart(args=None) -> None:
     if pid is None:
         print_error("No running gateway in this profile — nothing to hand a restart to.")
         sys.exit(1)
+    # PRA-6925: a request that cannot buy anything still costs the fleet up to the whole after-turn
+    # cap of cron silence, and the requester has no way to see that from here. The lifecycle
+    # sentinel already carries both facts — the request this process stamped at T=0, and the
+    # request that produced this life — so answer from it instead of signalling blind.
+    from gateway.lifecycle_ledger import restart_request_block
+    from gateway.restart_attribution import target_gateway_home
+
+    underway = restart_request_block(target_pid=pid, home=target_gateway_home(pid))
+    if underway is not None:
+        report_restart_already_underway(underway, pid)
+        return
     if not gateway_declares_external_supervisor(pid):
         print_error(
             f"Refusing: gateway PID {pid} declares no supervisor, so a drain-first exit would leave it down.\n"

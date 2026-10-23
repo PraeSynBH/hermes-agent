@@ -340,6 +340,90 @@ def _report_unclean_exit(evidence: dict[str, Any], home: Optional[Path], *, defe
     )
 
 
+# A managed restart that just completed already gave its requester a fresh process, and every
+# honoured request costs up to the whole after-turn cap of fleet-wide cron silence. The floor is
+# deliberately short: a legitimate second deploy (a module change landed after the first restart)
+# must not wait long, and the caller is told exactly which restart already served it.
+RESTART_REQUEST_FLOOR_SECONDS = 600.0
+
+# How far past the deferral cap a ``restart_request`` record may be and still describe a restart
+# that is in progress: the cap bounds the after-turn wait, then stop()/drain runs before the process
+# exits. Past this the process is either gone or wedged, and a new signal is the right move.
+RESTART_STOP_SLACK_SECONDS = 300.0
+
+
+def _instant_age_seconds(stamp: Any) -> Optional[float]:
+    """Age of an ISO-8601 stamp as the ledger writes it (tz-aware; ``Z`` accepted), or ``None``."""
+    if not isinstance(stamp, str) or not stamp.strip():
+        return None
+    text = stamp.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - parsed).total_seconds()
+
+
+def _deferral_cap_seconds() -> float:
+    """``agent.restart_after_turn_timeout`` — the deferral's own lifetime — or the default."""
+    try:
+        from cron.scheduler_drain_gate import _restart_deferral_cap
+
+        return float(_restart_deferral_cap())
+    except Exception:  # health: allow BLE001 -- an unreadable cap must answer like the default, never raise
+        return 1800.0
+
+
+def restart_request_block(*, target_pid: Optional[int] = None,
+                          home: Optional[Path] = None) -> Optional[dict[str, Any]]:
+    """Why a NEW restart request must not be signalled now, and the record that proves it.
+
+    Two verdicts, both read off the lifecycle sentinel instead of a new state file, because the
+    sentinel is already the one durable place a restart's identity survives:
+    :func:`stamp_restart_request` writes ``restart_request`` at T=0, and :func:`record_startup`
+    carries it onto the next life as ``prior_restart_request``.
+
+    * ``in_progress`` — THIS live gateway has stamped a ``restart_request`` whose deferral can still
+      be open, so a second signal buys nothing but makes the requester believe a fresh restart is
+      coming. Measured 2026-10-23 (PRA-6925): four agent-requested restarts in twelve hours, three
+      of them running the full 1800 s cap while cron had no work in flight.
+    * ``recently_completed`` — the process serving this request was itself born from a managed
+      restart inside :data:`RESTART_REQUEST_FLOOR_SECONDS`, so the deploy the requester wants is
+      already in the running process.
+
+    ``None`` means "no verdict": no sentinel, a sentinel for another pid, an unparseable stamp, or a
+    record old enough that the deferral it names cannot still be running. Every one of those lets
+    the restart through — a wrong refusal blocks a deploy, which is worse than a redundant restart.
+    """
+    sentinel = _read_json(get_lifecycle_sentinel_path(home))
+    if not sentinel or sentinel.get("phase") != "running":
+        return None
+    try:
+        pid = int(sentinel.get("pid"))
+    except (TypeError, ValueError):
+        return None
+    if target_pid is not None and pid != int(target_pid):
+        return None
+
+    in_progress = sentinel.get("restart_request")
+    if isinstance(in_progress, dict):
+        age = _instant_age_seconds(in_progress.get("requested_at"))
+        if age is not None and age <= _deferral_cap_seconds() + RESTART_STOP_SLACK_SECONDS:
+            return {"verdict": "in_progress", "pid": pid, "aged_s": round(age, 1),
+                    "request": dict(in_progress)}
+
+    prior = sentinel.get("prior_restart_request")
+    born = _instant_age_seconds(sentinel.get("started_at"))
+    if isinstance(prior, dict) and born is not None and born <= RESTART_REQUEST_FLOOR_SECONDS:
+        return {"verdict": "recently_completed", "pid": pid, "aged_s": round(born, 1),
+                "request": dict(prior), "started_at": sentinel.get("started_at")}
+    return None
+
+
 def record_startup(home: Optional[Path] = None, *, defer_integrity_check: bool = True) -> Optional[dict[str, Any]]:
     """Boot entry point: report any unclean previous exit (evidence dict, also persisted
     to ``gateway-exit-diag.log`` and logged at WARNING) then claim the sentinel.  Never raises.

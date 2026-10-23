@@ -42,7 +42,15 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   cycle, re-WARNed "drain opened" every minute per home and capped the observable pause at one tick
   interval — the ERROR could never fire on a multiplex host. The gateway side says the cost at T=0
   too: the restart deferral line names how many due cron slots across how many profiles the wait is
-  holding (`_cron_dispatch_hold_note`). The hold scans the store READ-ONLY (`get_due_jobs()`
+  holding (`_cron_dispatch_hold_note`). **That hold is bounded, not merely reported** (PRA-6925):
+  once a scan finds a due slot waiting, the deferral ends within one cron inactivity watchdog
+  (`hold_bound_seconds` — `HERMES_CRON_TIMEOUT`, default 600 s) instead of running out the
+  30 min `agent.restart_after_turn_timeout` cap, and the slot fires as a catch-up then. Measured
+  before it: four deferrals in 12 h, three holding 1–3 due slots for the full cap, every drain-done
+  line recording `cron_at_start=0`. Reopening cron dispatch *during* the wait was rejected — a run
+  started then is killed by the `stop()` the wait precedes (a permanent `jobs.json` failure), and
+  the restart-safe external worker does not exist outside a systemd user session. The hold scans
+  the store READ-ONLY (`get_due_jobs()`
   persists `last_dispatch` marks and the slot was not dispatched), and the ticker must not pre-empt
   the tick with its own quiet gate — the decision belongs inside the per-profile scope where the
   jobs and the marker live.

@@ -34,6 +34,11 @@ had to be fixed for (c) to be able to fire at all:
 The due scan here is READ-ONLY on purpose: ``get_due_jobs()`` persists a ``last_dispatch`` stamp and
 a ``pending_slot`` for everything it returns (cron/jobs.py::_evaluate_due_job), and a held slot must
 not be recorded as dispatched.
+
+One more correction after the 2026-10-23 cards (PRA-6925): the *cost* of the hold is now bounded,
+not just reported. A restart deferral may keep a waiting slot for one cron inactivity watchdog
+(:func:`hold_bound_seconds`) and no longer, so the ERROR above is a backstop for drain classes that
+are not cap-bounded rather than the only trace of a deferral that never had to last that long.
 """
 from __future__ import annotations
 
@@ -128,6 +133,30 @@ def drain_alert_seconds(restart_cap: Optional[float] = None) -> float:
     # rather than a "routine restart is minutes" false positive.
     margin = min(DEFERRAL_CAP_ALERT_MARGIN_SECONDS, cap / 2.0)
     return min(DETECTOR_TOLERANCE_SECONDS, cap - margin)
+
+
+def hold_bound_seconds() -> Optional[float]:
+    """How long a restart deferral may keep ONE due slot held, or ``None`` when there is no bound.
+
+    The watchdog is the yardstick, not a new policy: ``HERMES_CRON_TIMEOUT``
+    (``cron.scheduler._cron_inactivity_seconds``, default 600 s) is already the longest a healthy
+    run may go quiet before the scheduler cuts it off, so a *slot* held past it has waited longer
+    than the scheduler's own patience with a running job. Measured 2026-10-23 (PRA-6925): four
+    deferrals in twelve hours, three of them holding 1-3 due slots across 1-3 profiles for the full
+    1800 s cap, and every drain-done line recorded ``cron_at_start=0`` — the hold protected no
+    in-flight cron work at all while it closed admission fleet-wide.
+
+    ``0`` (unlimited) removes the yardstick, and an unreadable setting removes the bound rather
+    than inventing one: returning ``None`` keeps the deferral exactly as it was, which is the
+    fail-safe direction for a diagnostic that can only shorten a shutdown.
+    """
+    try:
+        from cron.scheduler import _cron_inactivity_seconds
+
+        bound = float(_cron_inactivity_seconds())
+    except (ImportError, OSError, ValueError, TypeError):
+        return None
+    return bound if bound > 0 else None
 
 
 def _drain_marker() -> Optional[dict[str, Any]]:

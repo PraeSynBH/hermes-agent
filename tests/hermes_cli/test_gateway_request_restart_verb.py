@@ -10,6 +10,7 @@ be taken: no gateway, no supervisor, or a caller that is not the gateway's desce
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 from pathlib import Path
@@ -117,6 +118,100 @@ def test_a_real_non_ancestor_pid_refuses_through_the_real_predicate(monkeypatch,
     assert code == 1
     assert "not a descendant" in captured.out
     assert sent == []
+
+
+def _sentinel(home: Path, **body) -> None:
+    """Write the lifecycle sentinel the request gate reads (the gateway's own durable record)."""
+    from gateway.lifecycle_ledger import get_lifecycle_sentinel_path
+
+    path = get_lifecycle_sentinel_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"phase": "running", "pid": GATEWAY_PID, "started_at": _iso(-3600), **body}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _iso(offset_s: float) -> str:
+    from datetime import UTC, datetime, timedelta
+
+    return (datetime.now(UTC) + timedelta(seconds=offset_s)).isoformat()
+
+
+@pytest.fixture
+def gateway_home(monkeypatch):
+    """The gate reads the TARGET gateway's home, which is not the caller's under ``-p``."""
+    from hermes_constants import get_hermes_home
+    from gateway import restart_attribution
+
+    home = Path(get_hermes_home())
+    monkeypatch.setattr(restart_attribution, "target_gateway_home", lambda pid: home)
+    return home
+
+
+def test_a_request_that_arrives_during_an_open_deferral_joins_it(ancestor_signal, gateway_home, capsys):
+    """PRA-6925: the requester cannot see a restart is already draining, so it asks again.
+
+    Measured: agent a1053376 asked twice for one issue (runs 226a6bd8 and a2efccb4), and both
+    requests were honoured with the full 30-minute fleet-wide cron hold. A second SIGUSR1 commands
+    the same drain, so the verb now answers from the sentinel and signals nothing.
+    """
+    _sentinel(gateway_home, restart_request={
+        "requested_at": _iso(-240), "source": "sigusr1",
+        "requestedByRunId": "226a6bd8-3589-421b-b400-900a8a7321f1",
+        "agentId": "a1053376-5764-483e-8d70-fff68b841589",
+        "issueId": "e1d697f2-619a-44ec-bd0e-770c3fe0d263",
+    })
+
+    code, captured = _run(capsys)
+
+    assert code == 0, "the caller's intent is already in flight — never a retryable failure"
+    assert "already in progress" in captured.out and "joins it" in captured.out
+    assert "226a6bd8-3589-421b-b400-900a8a7321f1" in captured.out, "name who is already draining"
+    assert "e1d697f2-619a-44ec-bd0e-770c3fe0d263" in captured.out
+    assert ancestor_signal == [], "joining must not queue a second drain"
+
+
+def test_a_request_right_after_a_completed_restart_is_answered_from_the_record(
+        ancestor_signal, gateway_home, capsys):
+    """The gateway this process is talking to was BORN from a managed restart minutes ago."""
+    _sentinel(gateway_home, started_at=_iso(-180), prior_restart_request={
+        "requested_at": _iso(-240), "source": "sigusr1",
+        "requestedByRunId": "48833a85-ce04-4078-8306-889adde2191d",
+        "issueId": "e10d8627-b591-403f-af95-3176fbd5c8a2",
+    })
+
+    code, captured = _run(capsys)
+
+    assert code == 0
+    assert "already restarted" in captured.out
+    assert "48833a85-ce04-4078-8306-889adde2191d" in captured.out
+    assert ancestor_signal == []
+
+
+def test_an_old_restart_record_never_blocks_a_new_request(ancestor_signal, gateway_home, capsys):
+    """A floor that outlives the record's meaning would block honest deploys — and the cap bounds it."""
+    _sentinel(gateway_home, started_at=_iso(-86400), prior_restart_request={
+        "requested_at": _iso(-86500), "source": "sigusr1",
+    })
+
+    code, captured = _run(capsys)
+
+    assert code == 0
+    assert "Service restart requested" in captured.out
+    assert ancestor_signal == [(GATEWAY_PID, signal.SIGUSR1)]
+
+
+def test_a_sentinel_for_another_pid_never_suppresses_this_gateways_restart(
+        ancestor_signal, gateway_home, capsys):
+    """One host, many gateways: a record about a different process must not answer for ours."""
+    _sentinel(gateway_home, restart_request={"requested_at": _iso(-60), "source": "sigusr1"})
+    _sentinel(gateway_home, pid=GATEWAY_PID + 1,
+              restart_request={"requested_at": _iso(-60), "source": "sigusr1"})
+
+    code, captured = _run(capsys)
+
+    assert code == 0
+    assert "Service restart requested" in captured.out
+    assert ancestor_signal == [(GATEWAY_PID, signal.SIGUSR1)]
 
 
 def test_the_verb_is_wired_with_no_flags():
