@@ -165,6 +165,7 @@ class LSPClient:
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
+        # NOTE: use the ``pid`` property below for the live process id; ``_proc`` is cleared on teardown.
         # Ring buffer of the most recent server stderr lines, surfaced when spawn/initialize fails.
         self._stderr_tail: list[str] = []
         self._exit_code: Optional[int] = None
@@ -206,6 +207,19 @@ class LSPClient:
     @property
     def is_running(self) -> bool:
         return self._state == "running" and self._connection_is_open()
+
+    @property
+    def pid(self) -> Optional[int]:
+        """Live server pid, or ``None`` once the process is gone.
+
+        The service measures a client's process tree (tsserver alone holds ~1 GiB) before evicting
+        the least-recently-used client under ``lsp.max_total_rss_mb``; a dead or clearing process
+        must read as 0 instead of raising.
+        """
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return None
+        return proc.pid
 
     def _connection_is_open(self) -> bool:
         proc, reader = self._proc, self._reader_task

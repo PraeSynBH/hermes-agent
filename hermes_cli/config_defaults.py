@@ -2434,6 +2434,12 @@ DEFAULT_CONFIG = {
         # processes don't accumulate stale children (hundreds of MB + pipe FDs each) across
         # worktrees. 0 = keep servers for process lifetime.
         "idle_timeout": 600.0,
+        # Total RSS (MB) every language-server process tree of this service may hold.  Idle reaping
+        # cannot bound a fleet: each agent run edits its own worktree, so its tsserver tree (~1 GiB)
+        # is live, not idle, and 20-30 concurrent runs are 20-30 live trees.  Past this budget the
+        # least-recently-used client is shut down (respawned transparently on its next edit).
+        # 0 = no cap.  Measured with one `ps` sweep per minute; not enforced on Windows.
+        "max_total_rss_mb": 2048.0,
         # Per-server overrides keyed by registry server_id (pyright, gopls...): disabled: true;
         # command: ["path/to/server", "--stdio"] (bypasses auto- install); env: {...};
         # initialization_options: {...} (merged into LSP initializationOptions).

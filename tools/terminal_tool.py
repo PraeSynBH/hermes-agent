@@ -271,6 +271,24 @@ def clear_session_cwd(session_key: str) -> None:
         _session_cwd.pop(_qualify_task_key(session_key), None)
 
 
+def session_cwd_in_use(cwd: str) -> bool:
+    """True when any live session still records *cwd* — as its cwd, or as its bound workspace.
+
+    Session teardown uses this before releasing the resources keyed by a workspace (the language
+    servers): two sessions may share one checkout, and the one still running needs its server.
+    Compared as normalized absolute paths, since a record may hold either a symlinked or a real path.
+    """
+    if not isinstance(cwd, str) or not cwd:
+        return False
+    target = os.path.normpath(cwd)
+    with _session_cwd_lock:
+        recorded = list(_session_cwd.values())
+    for value in recorded:
+        if isinstance(value, str) and value and os.path.normpath(value) == target:
+            return True
+    return False
+
+
 def _sanitize_cwd_for_live_env(env: Any, new_cwd: str) -> Optional[str]:
     """Cwd to write into a LIVE cached env, or None to leave it untouched.
 

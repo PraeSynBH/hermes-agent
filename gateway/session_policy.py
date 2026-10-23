@@ -6,6 +6,8 @@ from functools import cached_property
 import contextlib
 import json
 import logging
+import os
+import threading
 from pathlib import Path
 
 from hermes_state_runtime import RuntimeStoreError
@@ -1095,11 +1097,53 @@ def unbind_turn_workspace(task_id):
 
 def release_session_workspaces(authority, session_ids):
     """Session teardown: drop each session's workspace binding under its owning profile's scope (the
-    key the turn bound it under), so the override table does not grow with every closed session."""
+    key the turn bound it under), so the override table does not grow with every closed session —
+    and shut down the language servers that served it.
+
+    A language-server client is keyed by ``(server, workspace root)``, not by session, and it is
+    spawned by the long-lived gateway.  Nothing else in the process would ever free a tree whose run
+    is gone and whose worktree still exists, so a closed session's server would outlive it by the
+    whole idle timeout (and, on a persistent worktree, look idle to every later sweep too).
+    """
     from gateway.session_authorities import owner_scope
+    from tools.terminal_tool import get_session_cwd
+    roots: list[str] = []
     with owner_scope(authority):
         for sid in session_ids:
+            cwd = get_session_cwd(sid)  # read BEFORE the unbind clears it
+            if cwd:
+                roots.append(cwd)
             unbind_turn_workspace(sid)
+    _release_lsp_workspaces(roots)
+
+
+def _release_lsp_workspaces(roots: list[str]) -> None:
+    """Best-effort, off-loop release of the language servers serving *roots*.
+
+    Skips a root another live session still records: two sessions may share one checkout, and the
+    survivor needs its server.  Off-loop because a release can wait seconds for a server's exit
+    handshake, and session teardown must never stall the gateway loop.
+    """
+    if not roots:
+        return
+    from tools.terminal_tool import session_cwd_in_use
+    unique = [root for root in dict.fromkeys(os.path.abspath(r) for r in roots)
+              if not session_cwd_in_use(root)]
+    if not unique:
+        return
+
+    def _release() -> None:
+        from agent.lsp import release_workspace
+        for root in unique:
+            try:
+                release_workspace(root)
+            except Exception as e:
+                logger.debug('LSP release for closed session workspace %s failed: %s', root, e)
+
+    try:
+        threading.Thread(target=_release, daemon=True, name='lsp-session-release').start()
+    except RuntimeError:  # interpreter shutting down: a daemon thread is no longer startable
+        _release()
 
 
 @contextmanager

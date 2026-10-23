@@ -17,6 +17,7 @@ import fnmatch
 import logging
 import math
 import os
+import subprocess
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -32,6 +33,56 @@ from agent.lsp.workspace import clear_cache, is_trusted_workspace, operator_work
 logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
+# Total RSS (MiB) the language-server trees of ONE service may hold.  Lifetime reaping alone cannot
+# bound this: every agent run edits its own worktree, so its tsserver tree (~1 GiB) is *live*, and a
+# fleet of 20-30 concurrent runs is 20-30 live trees.  The budget is the deterministic cap; an evicted
+# client respawns on the next edit.  0 = no cap.
+DEFAULT_MAX_TOTAL_RSS_MB = 2048.0
+
+
+def _process_tree_rss_kb(root_pids: list[int]) -> dict[int, int]:
+    """RSS (KiB) of each pid's whole descendant tree, from ONE ``ps`` sweep.
+
+    A language server's cost lives in its children — ``typescript-language-server`` (~60 MiB) forks
+    ``tsserver.js`` (0.9-1.3 GiB) and ``typingsInstaller.js`` — so the root's own RSS understates the
+    tree by an order of magnitude.  Returns ``{}`` where no comparable sweep exists (Windows), which
+    leaves the budget off rather than guessing at numbers.
+    """
+    live = sorted({pid for pid in root_pids if pid})
+    if not live or os.name == "nt":
+        return {}
+    try:
+        out = subprocess.run(["ps", "-Ao", "pid=,ppid=,rss="], capture_output=True, text=True,
+                             timeout=10, check=False).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug("LSP RSS sweep failed: %s", e)
+        return {}
+    own: dict[int, int] = {}
+    children: dict[int, list[int]] = {}
+    for line in out.splitlines():
+        pid_s, ppid_s, rss_s = (line.split() + ["", "", ""])[:3]
+        try:
+            pid, ppid, rss = int(pid_s), int(ppid_s), int(rss_s)
+        except ValueError:
+            continue
+        own[pid] = rss
+        children.setdefault(ppid, []).append(pid)
+    totals: dict[int, int] = {}
+    for root in live:
+        if root not in own:  # died between spawn and sweep: nothing to charge it
+            continue
+        total, stack, seen = 0, [root], set()
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            total += own.get(pid, 0)
+            stack.extend(children.get(pid, ()))
+        totals[root] = total
+    return totals
+
+
 _DELTA_BASELINE_CAP = 256  # per-file pre-write snapshots; paths never written again would otherwise live forever (#62950)
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
 
@@ -157,6 +208,7 @@ class LSPService:
         init_overrides: Optional[dict[str, dict[str, Any]]] = None,
         disabled_servers: Optional[list[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        max_total_rss_mb: float = DEFAULT_MAX_TOTAL_RSS_MB,
         extra_servers: Optional[list[ServerDef]] = None,
         broken_retry_seconds: float = 0.0,
         warmup_timeout: float = 0.0,
@@ -172,6 +224,7 @@ class LSPService:
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
+        self._max_total_rss_mb = max(0.0, max_total_rss_mb)
         self._extra_servers: list[ServerDef] = list(extra_servers or [])
         self._broken_retry = max(0.0, broken_retry_seconds)
         self._warmup_timeout = max(0.0, warmup_timeout)
@@ -199,7 +252,7 @@ class LSPService:
         self._delta_baseline: dict[str, _Diags] = {}
         self._edit_checks = EditChecks()  # loop-thread state of start_edit_check
 
-        if self._enabled and self._idle_timeout > 0:
+        if self._enabled and (self._idle_timeout > 0 or self._max_total_rss_mb > 0):
             self._loop.run(self._start_idle_reaper(), timeout=2.0)
 
     @classmethod
@@ -236,6 +289,7 @@ class LSPService:
                             if isinstance(c.get("initialization_options"), dict)},
             disabled_servers=[n for n, c in servers.items() if c.get("disabled")],
             idle_timeout=idle_timeout,
+            max_total_rss_mb=_float_or(lsp_cfg.get("max_total_rss_mb"), DEFAULT_MAX_TOTAL_RSS_MB),
             extra_servers=custom_servers(servers),
             broken_retry_seconds=_float_or(lsp_cfg.get("broken_retry_seconds"), 0.0),
             warmup_timeout=_float_or(lsp_cfg.get("warmup_timeout"), 0.0),
@@ -718,7 +772,7 @@ class LSPService:
         self._idle_reaper_task = asyncio.create_task(self._idle_reaper_loop())
 
     async def _idle_reaper_loop(self) -> None:
-        interval = min(60.0, self._idle_timeout)
+        interval = min(60.0, self._idle_timeout) if self._idle_timeout > 0 else 60.0
         while True:
             await asyncio.sleep(interval)
             try:
@@ -732,7 +786,8 @@ class LSPService:
     async def _reap_idle_once(self) -> None:
         cutoff = time.time() - self._idle_timeout
         with self._state_lock:
-            idle_keys = [key for key in self._clients if self._last_used.get(key, 0) < cutoff]
+            idle_keys = ([key for key in self._clients if self._last_used.get(key, 0) < cutoff]
+                         if self._idle_timeout > 0 else [])
             clients = [self._clients.pop(key) for key in idle_keys]
             for key in idle_keys:
                 self._last_used.pop(key, None)
@@ -742,6 +797,48 @@ class LSPService:
         # Externally deleted project roots (rm -rf, a worktree removed by another process) never go
         # idle from the server's point of view — tsserver keeps its multi-GiB heap for a tree that is gone.
         await self._detach_roots(lambda folder: not os.path.isdir(folder), reason="workspace root deleted")
+        await self._enforce_rss_budget()
+
+    async def _enforce_rss_budget(self) -> None:
+        """Evict least-recently-used clients until the service's trees fit ``lsp.max_total_rss_mb``.
+
+        Idle and deleted-root reaping only touch clients nothing uses any more.  The population that
+        actually presses on the host is the opposite: one live tsserver tree (~1 GiB) per concurrent
+        run, each on its own worktree, 20-30 at a time.  Counting live runs is the fleet's business;
+        holding the RSS the fleet may spend is this service's.  Evicted clients respawn lazily on the
+        next edit (``_get_or_spawn``), so an agent never loses a tool — it re-acquires one.
+        """
+        if self._max_total_rss_mb <= 0:
+            return
+        with self._state_lock:
+            pending = set(self._spawning)
+            snapshot = [(key, c) for key, c in self._clients.items() if key not in pending]
+            last_used = {key: self._last_used.get(key, 0.0) for key, _ in snapshot}
+        pids = [(key, c) for key, c in snapshot if getattr(c, "pid", None)]
+        # A single client is never evicted: it is the one the current edit just used.
+        if len(pids) < 2:
+            return
+        rss_kb = _process_tree_rss_kb([pid for _, c in pids if (pid := c.pid) is not None])
+        budget_kb = self._max_total_rss_mb * 1024.0
+        total_kb = float(sum(rss_kb.values()))
+        if not rss_kb or total_kb <= budget_kb:
+            return
+        order = sorted(pids, key=lambda kc: last_used.get(kc[0], 0.0))  # oldest first
+        evicted: list[LSPClient] = []
+        for key, client in order[:-1]:  # keep the most recently used one
+            if total_kb <= budget_kb:
+                break
+            pid = client.pid
+            with self._state_lock:
+                if self._clients.pop(key, None) is None:
+                    continue
+                self._last_used.pop(key, None)
+            total_kb -= float(rss_kb.get(pid or -1, 0))
+            evicted.append(client)
+        if evicted:
+            eventlog.log_budget_evicted([(c.server_id, c.workspace_root) for c in evicted],
+                                        self._max_total_rss_mb)
+            await asyncio.gather(*(client.shutdown() for client in evicted), return_exceptions=True)
 
     def release_workspace(self, workspace_root: str) -> int:
         """Shut down the clients serving ``workspace_root`` or any root beneath it; returns how many.

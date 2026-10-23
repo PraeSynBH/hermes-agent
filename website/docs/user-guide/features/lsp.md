@@ -331,6 +331,14 @@ lsp:
   # clamped to 30 so a sweep can never reap a client mid-operation.
   idle_timeout: 600
 
+  # Total RSS (MB) all of this process's language-server trees may hold.
+  # A tsserver tree costs ~0.5-1.5 GiB, so a fleet running 20-30 agents,
+  # each in its own worktree, cannot be bounded by idleness alone: those
+  # servers are live, not idle. Past the budget the least-recently-used
+  # client is shut down and respawns on its next edit. 0 = no cap.
+  # Measured with one `ps` sweep per sweep interval; not enforced on Windows.
+  max_total_rss_mb: 2048
+
   # Per-server overrides (all optional).
   servers:
     pyright:
@@ -440,8 +448,19 @@ Servers are kept alive while they're being used and shut down after
 long-running gateway that touches many worktrees no longer accumulates
 one language-server process per workspace forever. A reaped server is
 respawned automatically on the next relevant file operation. Set
-`idle_timeout: 0` to disable reaping and hold every server's index warm
-for the life of the process.
+`idle_timeout: 0` to disable idle reaping and hold every server's index
+warm for the life of the process.
+
+Idleness is not the only leak, and on a busy host it is not the main
+one: every concurrent agent run edits its own worktree, so its server
+tree (~0.5-1.5 GiB for TypeScript, most of it `tsserver.js`) is in
+active use. `lsp.max_total_rss_mb` (default 2048) caps the total RSS of
+this process's language-server process trees; when a sweep finds the
+total above budget it shuts down the least-recently-used clients until
+it fits, keeping the busiest ones hot. An evicted server respawns on its
+next edit, so an agent never loses edit tooling — it re-acquires a
+server. The sweep charges each client its whole descendant tree, not
+just the ~60 MiB wrapper process. Set `0` for no cap.
 
 Servers are also released when their workspace goes away, even if they
 are not idle: removing a Hermes-managed worktree (`hermes -w` session
