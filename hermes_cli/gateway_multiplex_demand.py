@@ -24,6 +24,16 @@ asked for a profile and is waiting on its admission (``note_wanted``, PRX-5738).
 sighting the 2026-10-20 outage never produced — the busiest profile sat deferred while its runs
 failed admission. A sighting carries its own TTL and expires, so it cannot pin a slot forever.
 
+**A run that was dispatched but has not started is queued work, not assignment (PRX-6000).** The
+manifest's ``queued`` count (``heartbeat_runs.status='queued'`` for the profile's agents) ranks with
+``busy`` in class 0, because such a run cannot start while the profile is unserved: it is the same
+"somebody is waiting" claim as a blocked admission, and its TTL is the dispatcher's own queue expiry.
+The 2026-10-22 boot that evicted ``release`` for 19 minutes had exactly that shape — ``release``
+held two queued runs, the collector reported only ``running`` ones, so the profile ranked as merely
+assigned (class 1) and lost its slot to a profile pinned by a live sighting. With both sides in
+class 0 the operator's ``gateway.multiplex_serve_priority`` decides, which is the one input that can
+say "this profile ships production deploys" (see ``apply_ceiling``'s tiebreak).
+
 **A pending WAKE is its own rank class, above assigned work (PRA-6796).** ``agents`` counts cards a
 profile *holds*; it does not say anybody is trying to run one. So a profile whose Paperclip agent
 was woken a second ago ranked identically to one that merely owns two idle agents, and the tie
@@ -125,6 +135,12 @@ class DemandFacts:
     #: wake that has already been dispatched and is waiting for admission. Counted for the label
     #: only: one pending run claims the slot exactly as a thousand would (no weights).
     pending_runs: int = 0
+    #: Runs for this profile's agents that have been DISPATCHED but not started (manifest
+    #: ``queued``). A queued run cannot start while the profile is unserved, so it is the same
+    #: "somebody is waiting" claim as ``pending_runs`` — and the one a profile loses its slot
+    #: without ever showing: on 2026-10-22 ``release`` held two queued runs through the boot that
+    #: evicted it, and a collector reporting only ``running`` made them invisible (PRX-6000).
+    queued_runs: int = 0
     #: Seconds since ``profiles/<n>/state.db`` was last written, or ``None`` when the profile has no
     #: store. ``None`` is "no evidence of use", never "used long ago" — a profile created an hour
     #: ago and never opened must not outrank one whose store is a day old and also idle.
@@ -149,7 +165,7 @@ class DemandFacts:
         signals: list[str] = []
         if self.blocked_admission_15m:
             signals.append("admission")
-        if self.pending_runs:
+        if self.pending_runs or self.queued_runs:
             signals.append("wake")
         if self.agents:
             signals.append("agents")
@@ -163,13 +179,16 @@ class DemandFacts:
         return tuple(signals)
 
     def has_pending_wake(self) -> bool:
-        """Is a wake for this profile WAITING right now — blocked admission, or a queued run?
+        """Is a wake for this profile WAITING right now — blocked admission, or a dispatched run?
 
         The distinction this class exists for (PRA-6796): *assigned* work says a profile holds
         cards, while a pending wake says somebody dispatched one and it cannot be admitted. Only
-        the second one is a client that has already paid for a run and is being refused.
+        the second one is a client that has already paid for a run and is being refused. A run
+        sitting in the QUEUE is that client too (PRX-6000): it is dispatched, it cannot start while
+        the profile is unserved, and reporting only ``running`` runs made exactly that claim
+        invisible on the boot that evicted ``release``.
         """
-        return bool(self.blocked_admission_15m or self.pending_runs)
+        return bool(self.blocked_admission_15m or self.pending_runs or self.queued_runs)
 
     def has_queued_work(self) -> bool:
         """Work that exists whether or not anybody touched the profile: cron, agents, an admission.
@@ -221,6 +240,7 @@ class DemandFacts:
             "credentials": list(self.credentials),
             "blocked_admission_15m": self.blocked_admission_15m,
             "pending_runs": self.pending_runs,
+            "queued_runs": self.queued_runs,
             "state_age_seconds": (None if self.state_age_seconds is None
                                   else int(self.state_age_seconds)),
             "work": list(self.work_signals()),
@@ -322,7 +342,8 @@ def manifest_path(default_home: Optional[Path] = None) -> Path:
 
 
 def _read_manifest(path: Path):
-    """``(state, {name: (agents, blocked_admission_15m, busy)}, age_seconds, error)`` for the manifest.
+    """``(state, {name: (agents, blocked_admission_15m, busy, queued)}, age_seconds, error)`` for the
+    manifest.
 
     Absent is its own state (the host runs no collector). Anything read but unusable — torn JSON,
     wrong schema, a non-object entry, a bad ``written_at`` — is ``malformed`` with the reason, so
@@ -353,20 +374,23 @@ def _read_manifest(path: Path):
     if written.tzinfo is None:
         written = written.replace(tzinfo=UTC)
     age = max(0.0, (datetime.now(UTC) - written).total_seconds())
-    parsed: dict[str, tuple[int, int, int]] = {}
+    parsed: dict[str, tuple[int, int, int, int]] = {}
     for name, entry in profiles.items():
         if not isinstance(entry, dict):
             return MANIFEST_MALFORMED, {}, None, f"manifest entry {name!r} is not an object"
         try:
             agents = int(entry.get("agents") or 0)
             blocked = int(entry.get("blocked_admission_15m") or 0)
-            # Older collectors wrote no ``busy``: absent is 0 (no queue), never malformed.
+            # Older collectors wrote no ``busy`` and no ``queued``: absent is 0 (no dispatch), never
+            # malformed. Both are "a run was dispatched for this profile" — ``busy`` running,
+            # ``queued`` sitting in the queue unable to start (PRX-6000).
             busy = int(entry.get("busy") or 0)
+            queued = int(entry.get("queued") or 0)
         except (TypeError, ValueError):
             return MANIFEST_MALFORMED, {}, None, f"manifest entry {name!r} has non-numeric counts"
-        if agents < 0 or blocked < 0 or busy < 0:
+        if agents < 0 or blocked < 0 or busy < 0 or queued < 0:
             return MANIFEST_MALFORMED, {}, None, f"manifest entry {name!r} has negative counts"
-        parsed[str(name)] = (agents, blocked, busy)
+        parsed[str(name)] = (agents, blocked, busy, queued)
     ttl = data.get("ttl_seconds")
     if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or ttl <= 0:
         ttl = DEFAULT_TTL_SECONDS
@@ -474,15 +498,16 @@ def refresh() -> DemandSnapshot:
         else:
             credentials, env_bad = _credentials(home, keys)
         agents: Optional[int] = None
-        blocked = pending = 0
+        blocked = pending = queued = 0
         if manifest_known:
-            agents, blocked, pending = manifest.get(name, (0, 0, 0))
+            agents, blocked, pending, queued = manifest.get(name, (0, 0, 0, 0))
         facts[name] = DemandFacts(
             agents=agents,
             cron_jobs=cron_jobs,
             credentials=credentials,
             blocked_admission_15m=blocked,
             pending_runs=pending,
+            queued_runs=queued,
             state_age_seconds=_state_age(home),
             unreadable=cron_bad + env_bad,
         )
@@ -572,7 +597,7 @@ def wake_signal(facts: Any) -> str:
         refused = facts.blocked_admission_15m
         return (f"a Paperclip wake is blocked on this profile "
                 f"({refused} refused admission{'s' if refused != 1 else ''} in 15 min)")
-    runs = int(facts.pending_runs or 0)
+    runs = int(facts.pending_runs or 0) + int(getattr(facts, "queued_runs", 0) or 0)
     if runs:
         return f"{runs} Paperclip run{'s' if runs != 1 else ''} queued for this profile"
     return ""

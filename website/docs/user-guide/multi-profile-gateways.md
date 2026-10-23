@@ -836,11 +836,19 @@ database. Default location: `<default home>/gateway_demand.json`, written atomic
   "source": "paperclip",
   "ttl_seconds": 900,
   "profiles": {
-    "devops":  {"agents": 2, "busy": 1, "blocked_admission_15m": 6, "names": ["Post-Deployment Monitor"]},
-    "general": {"agents": 12, "busy": 0, "blocked_admission_15m": 0, "names": []}
+    "devops":  {"agents": 2, "busy": 1, "queued": 0, "blocked_admission_15m": 6, "names": ["Post-Deployment Monitor"]},
+    "general": {"agents": 12, "busy": 0, "queued": 3, "blocked_admission_15m": 0, "names": []}
   }
 }
 ```
+
+`busy` counts runs that are **running**, `queued` runs that were **dispatched and have not started**;
+both rank the profile in the `wake` class, because neither can proceed while the profile is unserved
+and both mean a client is already waiting. Two profiles that both have a waiting run are separated by
+`gateway.multiplex_serve_priority` and then by name — which is how `release` kept its slot through
+the 2026-10-22 boot instead of losing it for 19 minutes to a profile pinned by a request sighting
+(PRX-6000). A collector that predates `queued` still reads: the field is optional and absent means
+zero.
 
 An unreadable `.env` or a corrupt `cron/jobs.json` counts as **demand** for that profile and is
 reported as `demand=unreadable` — failing toward serving it, because "unreadable" must never be
