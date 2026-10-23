@@ -254,37 +254,30 @@ def _is_pid_ancestor_of_current_process(target_pid: int) -> bool:
 
 
 def _record_restart_request(path: str, target_pid: int, detail: str = "") -> None:
-    """Append one audit line for every restart request this CLI sends.
+    """Append the requester's line BEFORE the signal is sent.
 
-    The gateway's SIGUSR1 handler cannot see who signalled it, so a restart that
-    arrives with no line here came from outside this CLI (operator ``kill``, a
-    Desktop/updater path, a stale script). That gap is why the 2026-10-18T05:30:20Z
-    restart was unattributable while 267 runs were refused by the wait it started.
-    Never raise: an audit aid must not be able to abort a restart.
+    The gateway's SIGUSR1 handler reads this file the instant the signal lands — it cannot ask
+    later, it exits a drain afterwards — so the write has to precede ``os.kill`` and the line has
+    to land where the GATEWAY looks (its own home), not in the profile this CLI happens to run in.
+    Both halves live in :mod:`gateway.restart_attribution`; never raise, an audit aid must not be
+    able to abort a restart.
     """
-    try:
-        log_path = Path(get_hermes_home()) / "logs" / "gateway-restart-requests.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as fh:
-            fh.write(
-                f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} path={path} "
-                f"target_pid={target_pid} caller_pid={os.getpid()} ppid={os.getppid()} "
-                f"cwd={os.getcwd()} argv={' '.join(shlex.quote(a) for a in sys.argv)}"
-                f"{(' ' + detail) if detail else ''}\n"
-            )
-    except OSError:
-        return
+    from gateway.restart_attribution import record_request
+
+    record_request(path, target_pid, detail)
 
 
 def _request_gateway_self_restart(pid: int) -> bool:
     """Ask a running gateway ancestor to restart itself asynchronously."""
     if not hasattr(signal, "SIGUSR1") or not _is_pid_ancestor_of_current_process(pid):
         return False
+    # Record FIRST: the line is what the handler attributes the signal to, and the handler may run
+    # before this process gets another instruction after os.kill (PRX-5423).
+    _record_restart_request("self_restart_sigusr1", pid, "ancestor=self")
     try:
         os.kill(pid, signal.SIGUSR1)  # windows-footgun: ok — POSIX signal, guarded by hasattr(signal, 'SIGUSR1') above
     except (ProcessLookupError, PermissionError, OSError):
         return False
-    _record_restart_request("self_restart_sigusr1", pid, "ancestor=self")
     return True
 
 
@@ -298,13 +291,14 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float, *, on_progress
     """
     if not hasattr(signal, "SIGUSR1") or pid <= 0:
         return False
+    # Record BEFORE the signal: the gateway reads this line while handling it (PRX-5423).
+    _record_restart_request("graceful_sigusr1", pid, f"drain_timeout={drain_timeout:.0f}s")
     try:
         os.kill(pid, signal.SIGUSR1)  # windows-footgun: ok — POSIX signal, guarded by hasattr(signal, 'SIGUSR1') above
     except ProcessLookupError:
         return True
     except (PermissionError, OSError):
         return False
-    _record_restart_request("graceful_sigusr1", pid, f"drain_timeout={drain_timeout:.0f}s")
 
     return _wait_for_pid_exit(pid, max(drain_timeout, 1.0), on_progress=on_progress)
 

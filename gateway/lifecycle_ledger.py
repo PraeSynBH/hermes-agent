@@ -153,6 +153,38 @@ def _suspected_oom(mem: dict[str, Any]) -> bool:
     )
 
 
+def stamp_restart_request(requester: Optional[dict[str, Any]], *, source: str,
+                          home: Optional[Path] = None) -> None:
+    """Record WHO asked for the restart now in progress in the lifecycle sentinel.
+
+    The sentinel is the file a post-mortem reads, and the requester is knowable ONLY in the moment
+    the request lands: a SIGUSR1 carries no payload and the requesting process may be gone by the
+    time the drain ends (PRX-5423). :func:`mark_exited` carries this record through the exit and
+    :func:`record_startup` re-publishes it as ``prior_restart_request``, so "what put this process
+    here, and who asked?" survives the process that could answer it.
+
+    Ownership-guarded: a replacement that already claimed the sentinel is left alone. Best-effort,
+    never raises.
+    """
+    try:
+        sentinel = _read_json(get_lifecycle_sentinel_path(home))
+        if sentinel is None or sentinel.get("pid") != os.getpid():
+            return
+        request: dict[str, Any] = {"requested_at": _now_iso(), "source": source}
+        if requester:
+            for key in ("requestedByRunId", "agentId", "issueId", "path", "caller_pid", "ts",
+                        "age_s", "detail"):
+                if requester.get(key) not in (None, ""):
+                    request[key] = requester[key]
+        else:
+            # An unattributed restart is itself the finding: say so where the machine reads.
+            request["attributed"] = False
+        sentinel["restart_request"] = request
+        _write_sentinel(sentinel, home)
+    except Exception:
+        logger.debug("Failed to stamp the restart requester", exc_info=True)
+
+
 def detect_unclean_exit(home: Optional[Path] = None) -> Optional[dict[str, Any]]:
     """Evidence dict when the previous life died uncleanly, else ``None``. Read-only."""
     sentinel = _read_json(get_lifecycle_sentinel_path(home))
@@ -326,6 +358,9 @@ def record_startup(home: Optional[Path] = None, *, defer_integrity_check: bool =
     except Exception:
         logger.debug("Unclean-exit detection failed", exc_info=True)
     try:
+        # Read the previous life's record BEFORE claiming it: it is the only place the restart
+        # requester survives (stamped by the signal handler while that process was still alive).
+        prior = _read_json(get_lifecycle_sentinel_path(home)) or {}
         claim: dict[str, Any] = {"phase": "running", "pid": os.getpid(), "start_time": time.time(), "started_at": _now_iso()}
         # The WIRE CONTRACT this life serves, frozen at boot like sys.modules: the deploy check reads
         # it back to prove a contract change actually replaced the process (SOU-3318).
@@ -346,6 +381,12 @@ def record_startup(home: Optional[Path] = None, *, defer_integrity_check: bool =
             claim["prior_unclean_exit"] = True
             if evidence.get("suspected_oom"):
                 claim["prior_suspected_oom"] = True
+        # WHO asked for the restart that produced this life (PRX-5423): carried off the previous
+        # sentinel whether it exited cleanly or died mid-drain, because the requesting CLI and its
+        # environment are gone by now.
+        prior_request = prior.get("restart_request")
+        if isinstance(prior_request, dict):
+            claim["prior_restart_request"] = prior_request
         _write_sentinel(claim, home)
     except Exception:
         logger.debug("Failed to claim lifecycle sentinel", exc_info=True)
@@ -426,7 +467,7 @@ def mark_exited(exit_code: Optional[int] = None, reason: str = "graceful_shutdow
                                   "exited_at": _now_iso()}
         # Carry the incarnation identity: the Windows start attestation matches a clean exit by
         # PID *and* start time so a reused PID's exit cannot vouch for a different life (#110020).
-        for key in ("start_time", "create_time"):
+        for key in ("start_time", "create_time", "restart_request"):
             if sentinel is not None and sentinel.get(key) is not None:
                 exited[key] = sentinel[key]
         _write_sentinel(exited, home)
