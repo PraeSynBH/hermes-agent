@@ -2210,7 +2210,8 @@ from gateway.run_agent_cache import GatewayAgentCacheMixin
 from gateway.run_profile_reconcile import GatewayProfileReconcileMixin
 from gateway.run_plugin_rewire import GatewayPluginRewireMixin
 from gateway.run_housekeeping_chores import (
-    _housekeeping_channel_directory, _housekeeping_chore, _housekeeping_curator,
+    _housekeeping_channel_directory, _housekeeping_checkpoint_prune, _housekeeping_chore,
+    _housekeeping_curator, _housekeeping_deferred_fts_retry, _housekeeping_memory_trim,
     _housekeeping_misfire_catch_up, _housekeeping_paste_sweep, _housekeeping_plugin_update_check,
     _run_due_chores,
 )
@@ -4441,36 +4442,6 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
         release_or_close(_adb)
 
 
-def _housekeeping_deferred_fts_retry() -> None:
-    """A SessionDB opened while another process held the rebuild lock fails closed onto the LIKE fallback
-    and the gateway stays up for days. Non-blocking, rate-limited inside SessionDB; no-op when not stale."""
-    # Retry here, on the existing tick, against the shared instances this process already holds:
-    # non-blocking admission, no new thread, rate-limited inside SessionDB. No-op when nothing is stale (one
-    # attribute read per instance). See #100108.
-    from hermes_state_registry import borrow_live_shared_session_dbs
-    with borrow_live_shared_session_dbs() as _session_dbs:
-        for _sdb in _session_dbs:
-            _retry = getattr(_sdb, "retry_deferred_fts_recovery", None)
-            if callable(_retry) and _retry():
-                logger.info(
-                    "Deferred state.db FTS rebuild completed in-process for %s; full-text search restored.",
-                    getattr(_sdb, "db_path", "state.db"))
-
-
-def _housekeeping_memory_trim() -> None:
-    """Messaging-gateway counterpart to the TUI idle reaper; config-gated and rate-limited inside."""
-    from hermes_cli.mem_trim import trim_memory
-    trim_memory(reason="messaging gateway housekeeping")
-
-
-def _housekeeping_checkpoint_prune() -> None:
-    """Checkpoint store retention + size cap on a live timer; ``auto_prune_from_config`` gates on
-    ``checkpoints.auto_prune`` and the 24h ``.last_prune`` marker. Off the startup path because its
-    ``git gc`` can block for tens of seconds on a large store."""
-    from tools.checkpoint_maintenance import auto_prune_from_config
-    auto_prune_from_config()
-
-
 def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
     """Drain each profile's worker queue through its matching live adapters. A credential-less satellite
     profile (empty adapter map) drains through the primary's adapters routed by its own profile routes."""
@@ -4502,7 +4473,10 @@ def _start_gateway_housekeeping(
 ):
     """Background thread for gateway-only periodic chores (NOT cron). Separate from the cron trigger
     so chores run under any ``CronScheduler`` provider (external scale-to-zero has no 60s loop).
-    Cadences are ticks of ``interval``; inner gates own the real cadence."""
+    Cadences are ticks of ``interval``; inner gates own the real cadence. A tick that spends its
+    ceiling (``HOUSEKEEPING_TICK_BUDGET_S``) carries the rest of its chores to the next one instead of
+    running long, and ``carried_chores`` is what makes that a rotation: the most-starved chore goes
+    first next tick (PRX-6104)."""
     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
     from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
     from gateway.run_housekeeping_disk import housekeeping_media_caches, maybe_post_auto_prune_prompt
@@ -4571,9 +4545,10 @@ def _start_gateway_housekeeping(
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
+    carried_chores: dict[int, int] = {}
     while not stop_event.is_set():
         tick_count += 1
-        _run_due_chores(chores, tick_count)
+        _run_due_chores(chores, tick_count, carried_chores)
         wait_for_next_tick(stop_event, interval, queue_watch, _housekeeping_chore, tickers)
     logger.info("Gateway housekeeping stopped")
 
