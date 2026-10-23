@@ -434,11 +434,19 @@ slot: nothing is dispatched, `next_run_at` does not move, and the slot fires as 
 first allowed tick. A held slot is never silent (`cron/scheduler_drain_gate.py`): one WARNING per
 boundary names the due job ids and the drain's `principal`/`requested_at`, `last_fire_error` is
 stamped on each held job with the `gateway_draining` reason (`hermes cron list` and the liveness
-checks read it), and a drain still open after the tightest served detector's tolerance (40 min)
-logs one ERROR per episode — past that point the drain itself is the incident, because the
-detectors downstream can only report their own `last_run_at` aging. The hold scans the store
-read-only: `get_due_jobs()` persists a `last_dispatch` stamp, and a held slot must not be recorded
-as dispatched.
+checks read it), and a drain still open past its limit logs one ERROR per episode — past that
+point the drain itself is the incident, because the detectors downstream can only report their own
+`last_run_at` aging. The limit (`drain_alert_seconds()`) is the SMALLER of the tightest served
+detector's tolerance (40 min) and the restart deferral cap (`agent.restart_after_turn_timeout`,
+30 min) less a 5 min margin: a graceful restart's after-turn wait cannot outlive its cap — the
+process exits there — so a fixed 40 min threshold was unreachable for precisely the restarts that
+caused the 2026-10-22/23 fleet-wide claim holes (PRA-6833). Episodes are per profile home (one
+process ticks every served profile; a single global episode reset on each profile hop, which
+re-WARNed "drain opened" every minute per home and made the ERROR unreachable on any multiplex
+host), and a restart deferral announces the cron cost when it OPENS: the deferral line names how
+many due slots across how many profiles are being held. The hold scans the store read-only:
+`get_due_jobs()` persists a `last_dispatch` stamp, and a held slot must not be recorded as
+dispatched.
 
 ## CLI Interface
 

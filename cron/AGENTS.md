@@ -31,12 +31,21 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   gateway's `can_dispatch`) leaves every due slot in place and fires it as a catch-up once the
   drain releases — but it also names the held job ids in one WARNING per boundary, stamps
   `last_fire_error=<gateway_draining …>` on each held job (what `hermes cron list` and the liveness
-  checks read; a success clears it), and logs one ERROR per episode once the drain outlives the
-  tightest served detector (40 min) — a drain that long silences a page's worth of work while every
-  downstream detector can only report its own `last_run_at` aging (SOU-3252). The hold scans the
-  store READ-ONLY (`get_due_jobs()` persists `last_dispatch` marks and the slot was not
-  dispatched), and the ticker must not pre-empt the tick with its own quiet gate — the decision
-  belongs inside the per-profile scope where the jobs and the marker live.
+  checks read; a success clears it), and logs one ERROR per episode once the drain outlives its
+  limit — a drain that long silences a page's worth of work while every downstream detector can
+  only report its own `last_run_at` aging (SOU-3252). The limit is `drain_alert_seconds()`: the
+  SMALLER of the tightest served detector's tolerance (40 min) and a restart deferral's own cap
+  (`agent.restart_after_turn_timeout`, 30 min) less a 5 min margin — a graceful restart exits at
+  its cap, so a threshold above it is dead code for exactly the class that froze the fleet twice
+  (PRA-6833). Episodes are keyed PER PROFILE HOME: one process ticks every served profile, and a
+  single module-global episode was overwritten on each profile hop, which reset the clock once per
+  cycle, re-WARNed "drain opened" every minute per home and capped the observable pause at one tick
+  interval — the ERROR could never fire on a multiplex host. The gateway side says the cost at T=0
+  too: the restart deferral line names how many due cron slots across how many profiles the wait is
+  holding (`_cron_dispatch_hold_note`). The hold scans the store READ-ONLY (`get_due_jobs()`
+  persists `last_dispatch` marks and the slot was not dispatched), and the ticker must not pre-empt
+  the tick with its own quiet gate — the decision belongs inside the per-profile scope where the
+  jobs and the marker live.
 - Per-home tick lock `<home>/cron/.tick.lock` prevents duplicate ticks across processes for
   that profile's store; never a `~/.hermes/...` literal.
 - **Headless ticks refuse, never spawn.** `hermes cron tick` (system crontab / external scheduler)

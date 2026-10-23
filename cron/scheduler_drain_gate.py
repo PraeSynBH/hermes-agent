@@ -18,17 +18,34 @@ tolerance. The marker's own max-age bounds a LEAKED drain (900 s, gateway/drain_
 watchdog is for one that is legitimately kept alive — every second of it is pager silence, and past a
 detector's tolerance the drain itself is the incident, not the jobs it holds.
 
+Two corrections after the fleet-wide claim holes of 2026-10-22/23 (PRA-6830/PRA-6833), both of which
+had to be fixed for (c) to be able to fire at all:
+
+* **the episode clock is per profile home.** This process ticks every served profile, so one
+  module-global episode slot was overwritten on every profile hop: each home's ``first_seen``
+  reset once per cycle, "gateway drain opened" was re-WARNed every minute per home (visible in the
+  2026-10-22T19:39Z logs), and the observable pause was capped at one tick interval — the ERROR
+  was unreachable for EVERY drain class, not only the cap-bounded one.
+* **the threshold is derived from the deferral cap.** A graceful restart's after-turn wait is
+  capped by ``agent.restart_after_turn_timeout`` and the process EXITS at its cap, so a threshold
+  above that cap can never be reached: the ERROR was dead code for exactly the class that froze
+  the fleet twice (33–36 min deferrals, zero ERROR). See :func:`drain_alert_seconds`.
+
 The due scan here is READ-ONLY on purpose: ``get_due_jobs()`` persists a ``last_dispatch`` stamp and
 a ``pending_slot`` for everything it returns (cron/jobs.py::_evaluate_due_job), and a held slot must
 not be recorded as dispatched.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 from datetime import UTC, datetime
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Iterable, Optional
 
 from cron.scheduler_refused import stamp_fire_error
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger("cron.scheduler")
 
@@ -36,28 +53,81 @@ logger = logging.getLogger("cron.scheduler")
 # than pattern-matching a sentence.
 DRAIN_HOLD_REASON = "gateway_draining"
 
-# A drain open this long is itself the pageable condition. The tightest served detector tolerates
-# 40 min of silence (the lead sweep fires every 10 min and pages after 4 missed passes), so a drain
-# that outlives it is holding a page's worth of work. Deliberately the detector tolerance and not
-# lower: an ordinary update/restart drain is minutes and must never page.
-DRAIN_ALERT_SECONDS = 2400.0
+# The tightest served detector's tolerance: the lead sweep fires every 10 min and pages after 4
+# missed passes, so a drain that outlives it is holding a page's worth of work.
+DETECTOR_TOLERANCE_SECONDS = 2400.0
 
-# One episode = one uninterrupted stretch of held ticks in this home. It carries the first held
-# instant (the watchdog's clock: a keep-alive re-write moves the marker's ``requested_at`` forever,
-# so the marker's own age can never measure how long dispatch has been paused), the due set already
-# warned about (one WARNING per boundary), and whether the pageable ERROR has fired.
-_episode: Optional[dict[str, Any]] = None
+# ``agent.restart_after_turn_timeout``'s default (gateway/restart.py), used when the cap cannot be
+# read. The cap is the lifetime of a restart deferral, and therefore the hard ceiling on how long
+# this watchdog can ever observe a pause of that class.
+DEFAULT_RESTART_DEFERRAL_CAP_SECONDS = 1800.0
+
+# Headroom between the alert and the cap, so the alert is OBSERVABLE rather than merely reachable.
+# The episode clock starts at the first held TICK, which trails the drain's T=0 by up to one ticker
+# period (60 s), and the episode ends when the process exits — 300 s covers the tick offset (1 min)
+# plus four more ticks at the 60 s cadence, i.e. the ERROR is written minutes before the cap even
+# with heavy tick jitter. Capped at half a short cap: a deliberately tiny deferral budget shortens
+# the silence it can cause in the same proportion.
+DEFERRAL_CAP_ALERT_MARGIN_SECONDS = 300.0
+
+# One episode per PROFILE HOME (the key is the home path). It carries the first held instant (the
+# watchdog's clock: a keep-alive re-write moves the marker's ``requested_at`` forever, so the
+# marker's own age can never measure how long dispatch has been paused), the due set already warned
+# about (one WARNING per boundary), and whether the pageable ERROR has fired. Entries are dropped
+# when dispatch resumes for that home; one that leaves the tick set mid-episode keeps a single small
+# entry, bounded by the roster size.
+_episodes: dict[str, dict[str, Any]] = {}
 
 
-def note_dispatch_resumed() -> None:
+def note_dispatch_resumed(home: Optional[str] = None) -> None:
     """Close the current episode after a tick that was allowed to dispatch."""
-    global _episode
-    _episode = None
+    _episodes.pop(home or str(get_hermes_home()), None)
 
 
 def _now() -> datetime:
     """Episode clock. A seam, so a test can age an episode without sleeping through it."""
     return datetime.now(UTC)
+
+
+def _restart_deferral_cap() -> float:
+    """The configured cap (seconds) on a restart's after-turn wait — the deferral's own lifetime.
+
+    Behavioral read through the merged config, so a profile's ``agent.restart_after_turn_timeout``
+    is what this profile's gateway honored. Unreadable/garbage config falls back to the default
+    rather than removing the alert entirely.
+    """
+    try:
+        from gateway.restart import parse_restart_after_turn_timeout
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        raw = cfg_get(load_config_readonly(), "agent", "restart_after_turn_timeout", default=None)
+        return parse_restart_after_turn_timeout(raw)
+    except (ImportError, OSError, ValueError, TypeError):
+        return DEFAULT_RESTART_DEFERRAL_CAP_SECONDS
+
+
+def drain_alert_seconds(restart_cap: Optional[float] = None) -> float:
+    """Held-dispatch age at which the drain itself is the pageable incident — the smaller of two bounds.
+
+    * :data:`DETECTOR_TOLERANCE_SECONDS` — past it the drain holds a page's worth of work, whatever
+      keeps it open;
+    * the deferral cap less :data:`DEFERRAL_CAP_ALERT_MARGIN_SECONDS` — a graceful restart's
+      after-turn wait is capped and the process exits at the cap, so a restart deferral can never
+      be observed older than the cap (PRA-6833: 2400 s against an 1800 s cap made this ERROR dead
+      code for the class that froze the fleet twice).
+
+    ``cap <= 0`` (``restart_after_turn_timeout: 0`` enters ``stop()`` at once) means no cap-bounded
+    deferral class exists at all, so the detector's tolerance is the only bound left.
+    """
+    cap = _restart_deferral_cap() if restart_cap is None else restart_cap
+    if cap is None or cap <= 0:
+        return DETECTOR_TOLERANCE_SECONDS
+    # A cap-bounded deferral is a KNOWN-bounded silence whose end is the process exiting, not an
+    # idle drain: by `cap - margin` a */10 pager has missed two or three passes and the fleet's
+    # cron is down for the rest of this process's life, so the lower bound is already an incident
+    # rather than a "routine restart is minutes" false positive.
+    margin = min(DEFERRAL_CAP_ALERT_MARGIN_SECONDS, cap / 2.0)
+    return min(DETECTOR_TOLERANCE_SECONDS, cap - margin)
 
 
 def _drain_marker() -> Optional[dict[str, Any]]:
@@ -107,29 +177,63 @@ def drain_detail(marker: Optional[dict[str, Any]]) -> str:
     return detail + "; " + "".join(parts)
 
 
+def _is_due(job: dict[str, Any], now: datetime) -> bool:
+    """Whether *job* has a due slot at *now* — one rule for this home and for the whole fleet."""
+    if not job.get("enabled", True) or job.get("paused_at") or job.get("state") == "completed":
+        return False
+    raw = job.get("next_run_at")
+    if not raw:
+        return False
+    from cron.jobs import _ensure_aware
+
+    try:
+        due_at = _ensure_aware(datetime.fromisoformat(str(raw)))
+    except (TypeError, ValueError):
+        return False
+    return due_at <= now
+
+
 def due_job_ids_now() -> list[str]:
     """Ids of enabled jobs whose stored ``next_run_at`` has passed — a read-only scan.
 
     Deliberately NOT ``get_due_jobs()``: that one persists dispatch marks for what it returns, and
-    the tick this gate holds dispatches nothing. The list is for naming what is being held.
+    the tick dispatches nothing. The list is for naming what is being held.
     """
-    from cron.jobs import _ensure_aware, _hermes_now, load_jobs
+    from cron.jobs import _hermes_now, load_jobs
 
     now = _hermes_now()
-    held: list[str] = []
-    for job in load_jobs():
-        if not job.get("enabled", True) or job.get("paused_at") or job.get("state") == "completed":
-            continue
-        raw = job.get("next_run_at")
-        if not raw:
-            continue
+    return [str(job["id"]) for job in load_jobs() if _is_due(job, now)]
+
+
+def due_slot_summary(homes: Iterable[os.PathLike | str]) -> tuple[int, int]:
+    """``(due slots, homes holding them)`` across every one of *homes*, read straight off disk.
+
+    Fleet-wide on purpose: admission is closed process-wide, so a restart deferral holds every
+    ticked profile's cron, and the cost of the wait has to be nameable in ONE line on the gateway's
+    side (PRA-6833) rather than only per-profile in the ticker's own WARNINGs. ``load_jobs()`` reads
+    the ACTIVE home's store, so this reads each ``cron/jobs.json`` directly — no store open, no
+    scope switch, no lock, and nothing persisted. An unreadable or half-written store is skipped:
+    this is a diagnostic taken during a shutdown and must never abort the deferral it describes.
+    """
+    from cron.jobs import _hermes_now
+
+    now = _hermes_now()
+    due_total = 0
+    holding = 0
+    for home in homes:
         try:
-            due_at = _ensure_aware(datetime.fromisoformat(str(raw)))
-        except (TypeError, ValueError):
+            with open(Path(home) / "cron" / "jobs.json", encoding="utf-8") as fh:
+                stored = json.load(fh)
+        except (OSError, ValueError, TypeError):
             continue
-        if due_at <= now:
-            held.append(str(job["id"]))
-    return held
+        jobs = stored.get("jobs") if isinstance(stored, dict) else stored
+        if not isinstance(jobs, list):
+            continue
+        due = sum(1 for job in jobs if isinstance(job, dict) and _is_due(job, now))
+        if due:
+            due_total += due
+            holding += 1
+    return due_total, holding
 
 
 def hold_for_drain() -> int:
@@ -140,13 +244,11 @@ def hold_for_drain() -> int:
     an unwritable store here must not be booked as a failed tick (that would arm the EMFILE backoff
     and mislabel a healthy ticker as failing).
     """
-    global _episode
-    from hermes_constants import get_hermes_home
-
     home_tag = str(get_hermes_home())
     now = _now()
-    if _episode is None or _episode["home"] != home_tag:
-        _episode = {"home": home_tag, "first_seen": now, "held": (), "alerted": False}
+    episode = _episodes.get(home_tag)
+    if episode is None:
+        episode = _episodes[home_tag] = {"first_seen": now, "held": (), "alerted": False}
         logger.warning("Cron dispatch held for %s: gateway drain opened", home_tag)
     marker = _drain_marker()
     detail = drain_detail(marker)
@@ -163,8 +265,8 @@ def hold_for_drain() -> int:
         return 0
 
     boundary = tuple(sorted(held))
-    if _episode["held"] != boundary:
-        _episode["held"] = boundary
+    if episode["held"] != boundary:
+        episode["held"] = boundary
         logger.warning(
             "Cron dispatch held %d due job(s) (%s): %s",
             len(held), ", ".join(boundary), detail,
@@ -174,12 +276,17 @@ def hold_for_drain() -> int:
     except (OSError, ValueError, TypeError) as exc:  # the WARNING above already names the cause
         logger.warning("Cron dispatch held (%s); could not stamp last_fire_error: %s", detail, exc)
 
-    paused_for = (now - _episode["first_seen"]).total_seconds()
-    if paused_for >= DRAIN_ALERT_SECONDS and not _episode["alerted"]:
-        _episode["alerted"] = True
+    paused_for = (now - episode["first_seen"]).total_seconds()
+    cap = _restart_deferral_cap()
+    limit = drain_alert_seconds(cap)
+    if paused_for >= limit and not episode["alerted"]:
+        episode["alerted"] = True
         logger.error(
-            "Cron dispatch has been paused for %.0f min by a gateway drain (limit %.0f min) — the "
-            "drain itself is the incident, not the %d job(s) it holds (%s). %s",
-            paused_for / 60.0, DRAIN_ALERT_SECONDS / 60.0, len(held), ", ".join(boundary), detail,
+            "Cron dispatch has been paused for %.0f min by a gateway drain (limit %.0f min — the "
+            "shorter of the %.0f min detector tolerance and a deferral cap of %s) — the drain "
+            "itself is the incident, not the %d job(s) it holds for %s (%s). %s",
+            paused_for / 60.0, limit / 60.0, DETECTOR_TOLERANCE_SECONDS / 60.0,
+            f"{cap / 60.0:.0f} min" if cap > 0 else "0 (no after-turn wait)",
+            len(held), home_tag, ", ".join(boundary), detail,
         )
     return 0

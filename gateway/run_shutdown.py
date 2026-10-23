@@ -149,6 +149,34 @@ def _send_error(result: Any) -> str:
     return getattr(result, "error", "send returned success=False")
 
 
+def _cron_dispatch_hold_note() -> str:
+    """The cron cost of THIS deferral, as one clause: what the closed admission is holding.
+
+    Admission is process-wide (``can_dispatch``, cron/scheduler_drain_gate.py), so a restart's
+    after-turn wait holds every ticked profile's due slots for its whole duration — 33-36 min of
+    fleet-wide cron silence twice on 2026-10-22/23, and the deferral line never said so (PRA-6833).
+    Counting here rather than only in the ticker's per-profile WARNINGs is what makes the cost
+    nameable at T=0 in ONE place.
+
+    Reads each ticked home's store directly (no store open, no scope switch, no lock) and never
+    raises: this runs on the loop during a shutdown, and a diagnostic must not abort a wait that
+    exists to protect in-flight work.
+    """
+    try:
+        from cron.scheduler_drain_gate import due_slot_summary
+        from cron.scheduler_ownership import ticked_homes
+
+        due, holding = due_slot_summary(ticked_homes().values())
+    except Exception as exc:
+        logger.debug("Restart deferral: cron hold cost unavailable: %s", exc)
+        return "cron dispatch is held fleet-wide until the drain releases"
+    if due:
+        return (f"cron dispatch is held fleet-wide until the drain releases: {due} due cron slot(s)"
+                f" across {holding} profile(s) are waiting and fire as catch-up")
+    return ("cron dispatch is held fleet-wide until the drain releases (no cron slot is due yet; "
+            "any that comes due is held and fires as catch-up)")
+
+
 class GatewayShutdownMixin(GatewayDrainControlMixin, GatewaySessionEndMixin):
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
@@ -1578,6 +1606,13 @@ class GatewayShutdownMixin(GatewayDrainControlMixin, GatewaySessionEndMixin):
             "deferring stop() until they finish (cap=%.0fs) so in-flight "
             "turns are not amputated (#77184)", active, timeout,
         )
+        # Announce the cron cost at T=0 (PRA-6833): the wait closes admission for its whole
+        # duration, so every ticked profile's due slots are held from this instant. Saying it here,
+        # once, is what the 33-36 min holes were missing — the first per-profile WARNING a ticker
+        # wrote named one home and one boundary, never the fleet-wide cost of the wait.
+        logger.warning(
+            "Restart deferral (cap %.0fs): %s", timeout, _cron_dispatch_hold_note(),
+        )
         from gateway.drain_control import open_restart_wait
         # Admission stays closed for the whole wait: it closed at request time (``request_restart``)
         # and this wait only holds what was already in flight. Reopening it here would start turns
@@ -1600,10 +1635,10 @@ class GatewayShutdownMixin(GatewayDrainControlMixin, GatewaySessionEndMixin):
                 logger.info(
                     "Restart deferred: waiting on %d active work unit(s) "
                     "(%d wedged and excluded, %d restart-safe and excluded; "
-                    "%.0fs remaining before force drain, admission closed): %s",
+                    "%.0fs remaining before force drain, admission closed); %s: %s",
                     self._awaitable_work_count(), self._wedged_agent_count(),
                     self._restart_safe_cron_count(), deadline - now,
-                    self._describe_active_work(),
+                    _cron_dispatch_hold_note(), self._describe_active_work(),
                 )
                 self._scale_to_zero_status("draining", "restart wait: status mark failed")
                 last_status_at = now

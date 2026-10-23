@@ -1,6 +1,10 @@
 """Unit tests for in-band restart after-turn deferral helpers (#77184)."""
 
+import asyncio
+import logging
 import math
+from pathlib import Path
+from types import SimpleNamespace
 
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
@@ -9,6 +13,7 @@ from gateway.restart import (
     resolve_systemd_timeout_stop_sec,
 )
 from gateway.run import GatewayRunner
+from gateway.run_shutdown import GatewayShutdownMixin
 
 
 def test_parse_restart_after_turn_timeout_defaults_and_clamps():
@@ -58,3 +63,61 @@ def test_load_restart_after_turn_timeout_preserves_zero(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HERMES_RESTART_AFTER_TURN_TIMEOUT", "0")
     assert GatewayRunner._load_restart_after_turn_timeout() == 0.0
+
+
+def test_the_deferral_names_the_fleet_wide_cron_cost_at_t_zero(monkeypatch, caplog):
+    """PRA-6833: the wait closes admission process-wide, so it must say what it costs cron.
+
+    Both fleet-wide cron claim holes were 33-36 min restart deferrals; the only lines they produced
+    were the work-unit dump, which never mentioned that every ticked profile's due slots were held
+    for the whole wait. The deferral therefore announces the cron cost when it OPENS (not 40 min
+    later) and repeats the count in the 30 s status line.
+    """
+    from cron import scheduler_drain_gate, scheduler_ownership
+
+    monkeypatch.setattr(scheduler_ownership, "ticked_homes", lambda: {"/h/a": Path("/h/a")})
+    monkeypatch.setattr(scheduler_drain_gate, "due_slot_summary", lambda homes: (7, 3))
+
+    runner = SimpleNamespace(
+        _draining=True, _running=True, session_runtime_descriptor={},
+        _restart_after_turn_timeout=0.3,
+        _active_work_count=lambda: 1, _awaitable_work_count=lambda: 1,
+        _wedged_agent_count=lambda: 0, _restart_safe_cron_count=lambda: 0,
+        _describe_active_work=list, _scale_to_zero_status=lambda *a, **k: None,
+    )
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        assert asyncio.run(GatewayShutdownMixin._await_active_work_before_restart(runner)) is False
+
+    messages = [r.getMessage() for r in caplog.records]
+    opening = [m for m in messages if "Restart deferral (cap" in m]
+    assert len(opening) == 1, "the cron cost is named once, when the deferral opens"
+    assert "7 due cron slot(s)" in opening[0] and "3 profile(s)" in opening[0]
+    assert "held fleet-wide until the drain releases" in opening[0]
+
+    status = [m for m in messages if "Restart deferred: waiting on 1 active work unit(s)" in m]
+    assert status, "the 30 s status line still reports the wait"
+    assert "cron dispatch is held fleet-wide" in status[0], "the count rides the status line too"
+
+
+def test_an_unreadable_cron_count_still_names_the_hold_and_never_breaks_the_wait(monkeypatch, caplog):
+    """The announcement is a diagnostic inside a shutdown path: a broken count must not abort it."""
+    from cron import scheduler_drain_gate
+
+    def broken(homes):
+        raise OSError("store gone")
+
+    monkeypatch.setattr(scheduler_drain_gate, "due_slot_summary", broken)
+
+    runner = SimpleNamespace(
+        _draining=True, _running=True, session_runtime_descriptor={},
+        _restart_after_turn_timeout=0.2,
+        _active_work_count=lambda: 1, _awaitable_work_count=lambda: 1,
+        _wedged_agent_count=lambda: 0, _restart_safe_cron_count=lambda: 0,
+        _describe_active_work=list, _scale_to_zero_status=lambda *a, **k: None,
+    )
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        assert asyncio.run(GatewayShutdownMixin._await_active_work_before_restart(runner)) is False
+
+    opening = [r.getMessage() for r in caplog.records if "Restart deferral (cap" in r.getMessage()]
+    assert len(opening) == 1
+    assert "cron dispatch is held fleet-wide until the drain releases" in opening[0]

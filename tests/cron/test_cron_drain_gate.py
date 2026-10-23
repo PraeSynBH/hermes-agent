@@ -33,7 +33,7 @@ def cron_home(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "_hermes_home", home)
     monkeypatch.setattr(S, "_sweep_mcp_orphans", lambda: None)
     S._running_job_ids.clear()
-    G.note_dispatch_resumed()  # episode dedup state is module-global
+    G._episodes.clear()  # episode dedup state is per-home and module-global
     return home
 
 
@@ -151,7 +151,7 @@ def test_a_drain_past_the_detector_tolerance_is_an_error_once_per_episode(
     assert not [r for r in caplog.records if r.levelno == logging.ERROR]
 
     caplog.clear()
-    clock["now"] += timedelta(seconds=G.DRAIN_ALERT_SECONDS + 300)
+    clock["now"] += timedelta(seconds=G.drain_alert_seconds() + 300)
     with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
         S.tick(verbose=False, can_dispatch=lambda: not dc.drain_requested())
         S.tick(verbose=False, can_dispatch=lambda: not dc.drain_requested())
@@ -160,6 +160,123 @@ def test_a_drain_past_the_detector_tolerance_is_an_error_once_per_episode(
     assert len(errors) == 1, "one ERROR per drain episode, not one per tick"
     assert "principal=dashboard" in errors[0].getMessage()
     assert opened["requested_at"] in J.load_jobs()[0]["last_fire_error"]["detail"]
+
+
+def test_the_alert_threshold_is_reachable_inside_every_deferral_cap():
+    """PRA-6833: a threshold above the deferral cap is dead code for cap-bounded drains.
+
+    A graceful restart's after-turn wait cannot outlive ``agent.restart_after_turn_timeout`` — the
+    process exits at the cap — so the alert has to be reachable WITHIN it, for any cap a user may
+    configure, and never above the tightest served detector's tolerance either.
+    """
+    for cap in (600.0, 1200.0, 1800.0, 2400.0, 3600.0, 7200.0):
+        limit = G.drain_alert_seconds(cap)
+        assert limit < cap, f"a deferral capped at {cap}s could never reach the alert"
+        assert limit <= G.DETECTOR_TOLERANCE_SECONDS
+    # No after-turn wait at all: there is no cap-bounded deferral class left to make reachable.
+    assert G.drain_alert_seconds(0.0) == G.DETECTOR_TOLERANCE_SECONDS
+
+
+def test_a_deferral_that_runs_to_the_restart_cap_escalates(cron_home, monkeypatch, caplog):
+    """The assertion the 2026-10-22/23 holes were missing: threshold vs. cap, compared.
+
+    Both fleet-wide claim holes were restart deferrals that ran to the 1800 s cap with admission
+    closed — 33-36 min in which nothing escalated. Pin the invariant directly: for a deferral that
+    survives to ``restart_after_turn_timeout``, the ERROR has fired (and NOT for an ordinary
+    few-minute drain, which must stay quiet).
+    """
+    from gateway import drain_control as dc
+    from gateway.restart import DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
+
+    _record_dispatches(monkeypatch)
+    opened = dc.write_drain_request(principal="dashboard", home=cron_home)
+    assert dc.drain_requested(home=cron_home) is True
+    job = _due_job()
+    _make_due(job["id"])
+
+    # The cap this gateway honored; the gate must derive its limit from it, not from a constant.
+    monkeypatch.setattr(G, "_restart_deferral_cap",
+                        lambda: DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT)
+
+    clock = {"now": datetime.now(UTC)}
+    monkeypatch.setattr(G, "_now", lambda: clock["now"])
+    gated = lambda: not dc.drain_requested()
+
+    def tick() -> list[str]:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+            S.tick(verbose=False, can_dispatch=gated)
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+    assert tick() == [], "the deferral opening is not itself the incident"
+
+    # Minutes in, nothing pageable yet — a routine restart drain must never produce this ERROR.
+    clock["now"] += timedelta(minutes=5)
+    assert tick() == []
+
+    # ... and at the cap, where the process exits and the whole hole ends, it has fired.
+    clock["now"] += timedelta(seconds=DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT - 300)
+    errors = tick()
+    assert len(errors) == 1, "a deferral alive at its cap must have escalated before exiting"
+    assert "principal=dashboard" in errors[0]
+    assert opened["requested_at"] in J.load_jobs()[0]["last_fire_error"]["detail"]
+    # One escalation per episode, even at the boundary that follows.
+    clock["now"] += timedelta(minutes=1)
+    assert tick() == []
+
+
+def test_each_ticked_home_keeps_its_own_episode_clock(monkeypatch, caplog):
+    """One process ticks EVERY served profile: the episode must be per home, not one global slot.
+
+    The module-global episode was overwritten on every profile hop, which reset each home's clock
+    once per cycle, re-WARNed "gateway drain opened" every minute per home (2026-10-22T19:39Z logs)
+    and capped the observable pause at one tick interval — the escalation could never fire on a
+    multiplex host no matter what the threshold was.
+    """
+    monkeypatch.setattr(G, "due_job_ids_now", lambda: ["pager-job"])
+    monkeypatch.setattr(G, "_drain_marker", lambda: None)
+    monkeypatch.setattr(G, "stamp_fire_error", lambda *a, **k: None)
+    monkeypatch.setattr(G, "_restart_deferral_cap", lambda: 1800.0)
+
+    clock = {"now": datetime.now(UTC)}
+    monkeypatch.setattr(G, "_now", lambda: clock["now"])
+    homes = {"current": "/h/alpha"}
+    monkeypatch.setattr(G, "get_hermes_home", lambda: Path(homes["current"]))
+
+    def cycle() -> list[logging.LogRecord]:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+            for name in ("/h/alpha", "/h/beta"):
+                homes["current"] = name
+                G.hold_for_drain()
+        return list(caplog.records)
+
+    fire = int(G.drain_alert_seconds())
+
+    # The opening cycle says it ONCE per home — not once per profile hop.
+    records = cycle()
+    opened = [r for r in records if "gateway drain opened" in r.getMessage()]
+    assert len(opened) == 2, "one opening WARNING per home, not one per profile hop"
+    assert {r.getMessage().split(":")[0].rsplit(" ", 1)[-1] for r in opened} == {"/h/alpha", "/h/beta"}
+
+    # Later cycles of the same episode are silent: same due set, no new boundary (no 60-line spam).
+    for _ in range(2):
+        clock["now"] += timedelta(seconds=60)
+        assert cycle() == []
+
+    assert G._episodes["/h/alpha"]["first_seen"] == clock["now"] - timedelta(seconds=120)
+
+    # The clock keeps running for each home; at the limit both escalate, once each.
+    clock["now"] = G._episodes["/h/alpha"]["first_seen"] + timedelta(seconds=fire)
+    records = cycle()
+    errors = [r.getMessage() for r in records if r.levelno == logging.ERROR]
+    assert len(errors) == 2, "each held home escalates on its own clock"
+    assert all("/h/alpha" in e or "/h/beta" in e for e in errors)
+    assert all("drain" in e for e in errors)
+
+    # Dispatch resuming for one home closes only that home's episode.
+    G.note_dispatch_resumed("/h/alpha")
+    assert "/h/alpha" not in G._episodes and "/h/beta" in G._episodes
 
 
 def test_release_mid_window_fires_the_missed_slot_as_a_late_catch_up(cron_home, monkeypatch):
