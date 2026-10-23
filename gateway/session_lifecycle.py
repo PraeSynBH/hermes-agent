@@ -267,20 +267,40 @@ class SessionLifecycleMixin:
     def prune_old_entries(self, max_age_days: int) -> int:
         """Drop routing entries idle (by ``updated_at``) for more than max_age_days; suspended
         entries and entries with active background processes are kept. Only the key -> session_id
-        mapping is dropped (the transcript stays). ``max_age_days <= 0`` disables. Returns count."""
+        mapping is dropped (the transcript stays). ``max_age_days <= 0`` disables. Returns count.
+
+        The candidate scan and the active-work query happen OUTSIDE ``self._lock`` (PRX-6075): the
+        index holds every key the gateway has ever routed — 15 762 rows on this host — and asking
+        the process registry about each one under the lock serialised every turn's session write
+        behind a scan of the registry for the whole tick. ``_lock`` guards ``_entries``/``_loaded``
+        only; entries that moved while it was released are re-read before they are dropped.
+        """
         if max_age_days is None or max_age_days <= 0:
             return 0
         cutoff = _now() - timedelta(days=max_age_days)
         with self._lock:
             self._ensure_loaded_locked()
-            removed_keys = [
-                key for key, entry in list(self._entries.items())
-                if not entry.suspended
-                # The callback is keyed by session_key, NOT session_id.
-                and not self._has_active_processes_safe(entry.session_key, context="prune")
-                and entry.updated_at < cutoff
+            # Keyed by ``entry.session_key`` — the registry knows session keys, not session_ids.
+            candidate_keys = [
+                key for key, entry in self._entries.items()
+                if not entry.suspended and entry.updated_at < cutoff
             ]
-            for key in removed_keys:
+        if not candidate_keys:
+            return 0
+        active = self._active_session_keys_safe(context="prune")
+        if active is None:
+            return 0  # cannot tell which sessions are live: drop nothing this hour
+        with self._lock:
+            removed_keys = []
+            for key in candidate_keys:
+                entry = self._entries.get(key)
+                # Re-read under the lock: a turn that started while the registry was being
+                # scanned has to be able to save itself from this prune.
+                if entry is None or entry.suspended or entry.updated_at >= cutoff:
+                    continue
+                if entry.session_key in active:
+                    continue
+                removed_keys.append(key)
                 self._entries.pop(key, None)
         if removed_keys:
             self._save()

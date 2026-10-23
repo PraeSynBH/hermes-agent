@@ -24,6 +24,13 @@ from gateway.session_stall import (
 logger = logging.getLogger("gateway.run")
 
 _SESSION_STORE_PRUNE_INTERVAL = 3600.0  # once per hour
+# Per-tick ceiling for this watcher (PRX-6075). Steady-state ticks are single-digit milliseconds;
+# the hourly routing-index prune is the one arm whose cost is not a function of a small fixed input
+# (one atomic full-index rewrite + fsync: 4.3 s measured on a quiet host, 51.7 s on this one under
+# fleet load). The tick waits at most this long for that rewrite and then returns — so `over=1` on
+# an otherwise quiet hour is the prompt being paid, not a stall, while every other minute's
+# `budget_used` sitting at milliseconds says the ceiling holds.
+_SESSION_HOUSEKEEPING_TICK_BUDGET_S = 2.0
 
 
 async def _interruptible_sleep(runner, seconds: int) -> None:
@@ -43,16 +50,26 @@ class GatewaySessionWatchersMixin:
         await asyncio.sleep(60)
         while self._running:
             try:
-                # On the loop: the agent-cache sweeps and the hourly store prune are loop work
-                # (PRX-5790), so a tick that costs seconds here is loop occupancy, not a thread.
-                with timed('session_housekeeping'):
+                # The tick is bounded: each arm is either ms-scale or (the hourly store prune) runs
+                # as its own task under this ceiling. `budget_used` in the summary reports what the
+                # tick actually spent, so "cheaper" stays a per-hour claim (PRX-5790, PRX-6075).
+                with timed('session_housekeeping', budget_s=_SESSION_HOUSEKEEPING_TICK_BUDGET_S):
                     await self._session_housekeeping()
             except Exception as e:
                 logger.debug("Session housekeeping error: %s", e)
             await _interruptible_sleep(self, interval)
 
     async def _session_housekeeping(self) -> None:
-        """Idle/pressure agent-cache sweeps plus the hourly SessionStore prune."""
+        """Idle/pressure agent-cache sweeps plus the hourly SessionStore prune, phase-timed."""
+        started = mark = time.monotonic()
+        phases: dict[str, float] = {}
+
+        def _lap(name: str) -> None:
+            nonlocal mark
+            now = time.monotonic()
+            phases[name] = (now - mark) * 1000.0
+            mark = now
+
         try:
             if evicted := self._sweep_idle_cached_agents():
                 logger.info("Agent cache idle sweep: evicted %d agent(s)", evicted)
@@ -67,16 +84,62 @@ class GatewaySessionWatchersMixin:
             self._sweep_agent_cache_under_pressure()
         except Exception as e:
             logger.debug("Agent cache pressure sweep failed: %s", e)
+        _lap("cache")
         # Prune stale SessionStore entries: the dict + sessions.json otherwise grow unbounded.
         prune_ts = getattr(self, "_last_session_store_prune_ts", 0.0)  # tests may omit
         if time.time() - prune_ts > _SESSION_STORE_PRUNE_INTERVAL:
             try:
                 max_age = int(getattr(self.config, "session_store_max_age_days", 0) or 0)
-                if max_age > 0 and (n := await self.async_session_store.prune_old_entries(max_age)):
-                    logger.info("SessionStore prune: dropped %d stale entries", n)
+                if max_age > 0:
+                    await self._prune_session_store(max_age)
             except Exception as e:
                 logger.debug("SessionStore prune failed: %s", e)
             self._last_session_store_prune_ts = time.time()
+        _lap("prune")
+        elapsed = time.monotonic() - started
+        if elapsed > _SESSION_HOUSEKEEPING_TICK_BUDGET_S:
+            # The phase split is the answer to "what took it": the hourly prune is the only arm
+            # whose cost is not a function of a small, fixed input.
+            logger.warning(
+                "Session housekeeping over its %.0fms budget: %.0fms total "
+                "(agent-cache=%.0fms prune=%.0fms)",
+                _SESSION_HOUSEKEEPING_TICK_BUDGET_S * 1000.0, elapsed * 1000.0,
+                phases.get("cache", 0.0), phases.get("prune", 0.0),
+            )
+
+    async def _prune_session_store(self, max_age_days: int) -> None:
+        """Run the hourly routing-index prune without letting it become the tick (PRX-6075).
+
+        The prune is one atomic write — it cannot be sliced part-way — so it runs as its own task
+        and the tick waits at most the budget for it. Past that the tick returns (the loop is not
+        waiting on the executor queue either way) and the task finishes on its worker thread,
+        logging its own outcome. Nothing is lost by returning early: the prune is idempotent and a
+        later pass re-scans, so a second run can only find less to drop.
+        """
+        in_flight = getattr(self, "_store_prune_task", None)
+        if in_flight is not None and not in_flight.done():
+            return  # last hour's rewrite is still running; it reports for itself
+        task = asyncio.create_task(self._run_store_prune(max_age_days))
+        self._store_prune_task = task
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=_SESSION_HOUSEKEEPING_TICK_BUDGET_S)
+        except TimeoutError:
+            logger.warning(
+                "SessionStore prune still running after the %.0fms housekeeping budget; the tick "
+                "returns and the rewrite finishes on its worker thread",
+                _SESSION_HOUSEKEEPING_TICK_BUDGET_S * 1000.0,
+            )
+
+    async def _run_store_prune(self, max_age_days: int) -> None:
+        """The prune itself, off the loop (the async facade hops to a worker), its cost on its own line."""
+        started = time.monotonic()
+        try:
+            removed = await self.async_session_store.prune_old_entries(max_age_days)
+        except Exception as e:
+            logger.warning("SessionStore prune failed: %s", e, exc_info=True)
+            return
+        logger.info("SessionStore prune: dropped %d entries older than %d days in %.1fs",
+                    removed, max_age_days, time.monotonic() - started)
 
     def _session_stall_timeout_seconds(self) -> float:
         """Return configured stall timeout (seconds); 0 disables the watchdog."""

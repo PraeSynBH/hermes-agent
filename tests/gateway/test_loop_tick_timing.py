@@ -107,6 +107,32 @@ def test_slow_tick_warns_once_per_interval_and_is_counted(caplog):
     assert timing.snapshot()['hosted_room_worker']['slow_since_summary'] == 0
 
 
+def test_budget_used_reports_the_tick_against_its_ceiling():
+    """PRX-6075: a watcher with a per-tick ceiling must publish what it spent against it.
+
+    `slow=` says a tick crossed a second; it cannot say whether a watcher that slices its work
+    stayed inside its own bound. The summary carries the ceiling, the spend, and how often the
+    spend went over — the three numbers a sweep needs to call a fix a fix.
+    """
+    timing.record('session_housekeeping', 0.4, budget_s=2.0, now=100.0)
+    timing.record('session_housekeeping', 5.5, budget_s=2.0, now=100.0)
+    view = timing.snapshot()['session_housekeeping']
+    assert view['budget_s'] == pytest.approx(2.0)
+    assert view['budget_used_s'] == pytest.approx(5.5), 'the last tick, not the mean'
+    assert view['over_budget_since_summary'] == 1
+    assert view['over_budget_total'] == 1
+    lines = timing.log_summary(now=100.0 + timing.SUMMARY_INTERVAL_S + 1.0)
+    assert lines and 'budget_used=5500ms/2000ms over=1/1' in lines[0]
+
+
+def test_a_watcher_without_a_budget_reports_no_budget_fields():
+    """Existing watchers keep the line they had: a ceiling nothing enforces must not be printed."""
+    timing.record('profile_reconcile', 0.25, now=100.0)
+    lines = timing.log_summary(now=100.0 + timing.SUMMARY_INTERVAL_S + 1.0)
+    assert lines and 'budget' not in lines[0]
+    assert timing.snapshot()['profile_reconcile']['budget_s'] == 0.0
+
+
 def test_quiet_timed_skips_the_per_tick_debug_line(caplog):
     """The 1 s watcher reports through the summary only: per-tick DEBUG would be ~86k lines a day."""
     caplog.set_level(logging.DEBUG, logger='gateway.loop_tick_timing')

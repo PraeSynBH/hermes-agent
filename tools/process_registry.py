@@ -2444,16 +2444,6 @@ class ProcessRegistry(ProcessLookupMixin, ProcessTerminationMixin, ProcessCheckp
             session.handoff_note = note
             return session
 
-    def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:
-        """Active processes for a gateway session key. Processes older than
-        ``max_active_age`` seconds are ignored as stale so a forgotten ``http.server``
-        can't freeze session idle/daily reset forever; ``None`` keeps legacy behaviour
-        (any running process blocks)."""
-        now = time.time()
-        return self._any_running(
-            lambda s: s.session_key == session_key
-            and (max_active_age is None or (now - s.started_at) < max_active_age))
-
     def has_any_active(self) -> bool:
         """Whether ANY background process is running — scale-to-zero must not
         suspend a gateway with live background work or the process is lost."""

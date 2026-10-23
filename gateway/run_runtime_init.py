@@ -38,10 +38,11 @@ class GatewayRuntimeInitMixin:
         """Build the SessionStore (with process-registry reset guard), its async facade and the router."""
         from gateway.run import (AsyncSessionStore, DeliveryRouter, SessionStore)
         from tools.process_registry import process_registry
+        # One registry pass for the whole routing index, not one call per routed key: the hourly
+        # prune walks every key this gateway has ever routed (PRX-6075).
         self.session_store = SessionStore(
             self.config.sessions_dir, self.config,
-            has_active_processes_fn=lambda key: process_registry.has_active_for_session(
-                key))
+            active_session_keys_fn=process_registry.active_session_keys)
         # Loop-side boundary: sync helpers use ``session_store`` directly; async handlers await this facade.
         self._async_session_store = AsyncSessionStore(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
