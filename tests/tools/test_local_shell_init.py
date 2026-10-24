@@ -7,6 +7,7 @@ tests verify the config-driven prelude that fixes that.
 """
 
 import os
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -118,6 +119,73 @@ class TestPrependShellInit:
         # The path must survive as the shell receives it; embedded single
         # quote is escaped as '\'' rather than breaking the outer quoting.
         assert "o'\\''malley" in wrapped
+
+
+class TestInheritedPathOrder:
+    """An init file that re-prepends a directory must not demote an entry the parent
+    process already had earlier in PATH: a security shim placed first by the parent (a
+    ``docker`` wrapper that must shadow the real CLI) used to land behind the binary it
+    guards, because ``_prepend_shell_init`` re-sourced files the login shell had already
+    read and their ``PATH="…:$PATH"`` lines re-ran on top of it (PRX-6197)."""
+
+    def _run_prelude(self, tmp_path, inherited_path):
+        rc = tmp_path / "init.sh"
+        # Twice, like ~/.bash_profile + ~/.bashrc on a Homebrew host.
+        rc.write_text('export PATH="/opt/homebrew/bin:$PATH"\n'
+                      'export PATH="/opt/homebrew/bin:$PATH"\n')
+        script = _prepend_shell_init('printf "%s\\n" "$PATH"', [str(rc)])
+        done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False,
+                              env={"PATH": inherited_path, "HOME": str(tmp_path)})
+        assert done.returncode == 0, done.stderr
+        return done.stdout.strip().split(":")
+
+    def test_inherited_first_entry_stays_first_and_duplicates_collapse(self, tmp_path):
+        shim, brew = "/opt/hermes-test-shim/bin", "/opt/homebrew/bin"
+        entries = self._run_prelude(tmp_path, f"{shim}:{brew}:/usr/bin:/bin")
+
+        assert entries.index(shim) < entries.index(brew)
+        assert entries.count(brew) == 1, entries
+
+    def test_init_only_entries_keep_their_position(self, tmp_path):
+        """nvm/asdf/pyenv dirs the parent PATH never listed are what the snapshot exists
+        to collect — they must stay where the init file put them, ahead of the parent's."""
+        nvm_bin = str(tmp_path / "nvm" / "bin")
+        (tmp_path / "init.sh").parent.mkdir(parents=True, exist_ok=True)
+        rc = tmp_path / "init.sh"
+        rc.write_text(f'export PATH="{nvm_bin}:$PATH"\n')
+        script = _prepend_shell_init('printf "%s\\n" "$PATH"', [str(rc)])
+        done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False,
+                              env={"PATH": "/opt/homebrew/bin:/usr/bin:/bin", "HOME": str(tmp_path)})
+
+        entries = done.stdout.strip().split(":")
+        assert entries[0] == nvm_bin
+        assert entries.index(nvm_bin) < entries.index("/opt/homebrew/bin")
+
+    def test_snapshot_path_keeps_inherited_shim_dir_ahead(self, tmp_path, monkeypatch):
+        """End-to-end through the snapshot a terminal command actually runs in: the dir
+        the parent process put first still resolves first after the init files re-prepend."""
+        shim = tmp_path / "guard-bin"
+        brew = tmp_path / "brew-bin"
+        shim.mkdir()
+        brew.mkdir()
+        init_file = tmp_path / "demo-init.sh"
+        init_file.write_text(f'export PATH="{brew}:$PATH"\n')
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("PATH", f"{shim}:{brew}:/usr/bin:/bin")
+
+        with patch(
+            "tools.environments.local._read_terminal_shell_init_config",
+            return_value=([str(init_file)], False),
+        ):
+            env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+            try:
+                result = env.execute('echo "PATH=$PATH"')
+            finally:
+                env.cleanup()
+
+        line = next(row for row in result.get("output", "").splitlines() if row.startswith("PATH="))
+        entries = line[len("PATH="):].split(":")
+        assert entries.index(str(shim)) < entries.index(str(brew))
 
 
 @pytest.mark.skipif(
