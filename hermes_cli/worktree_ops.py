@@ -460,13 +460,10 @@ def _setup_worktree(repo_root: str | None = None, sync_base: bool = True,
     base_ref, base_label = added
     _copy_worktree_includes(repo_root, wt_path)
 
-    # Lock so other processes (and `git worktree remove`) see it is in use; fail-soft.
-    try:
-        reason = f"hermes pid={os.getpid()}" + (f" db={retain_db}" if retain_db is not None else "")
-        _git(["worktree", "lock", "--reason", reason, str(wt_path)], repo_root)
-        logger.debug("Worktree locked: %s (pid=%s)", wt_path, os.getpid())
-    except Exception as e:
-        logger.debug("git worktree lock failed (non-fatal): %s", e)
+    # Lock so other processes (and `git worktree remove`) see it is in use; released at exit so the
+    # lock never outlives the pid that took it (`_lock_worktree`).
+    _lock_worktree(repo_root, str(wt_path),
+                   f"hermes pid={os.getpid()}" + (f" db={retain_db}" if retain_db is not None else ""))
 
     from hermes_cli.worktree_registry import record_worktree_repo
     record_worktree_repo(repo_root)
@@ -807,6 +804,118 @@ def _worktree_branch_pushed_exact(
 _HERMES_LOCK_RE = re.compile(r"hermes (?:pid=(\d+)|session=\S+)(?: db=(.+))?", re.DOTALL)
 
 
+# Trees locked by THIS process, released at exit. git has no liveness check on a lock, and
+# `git worktree prune` will not even drop a registration whose directory is already deleted while
+# the entry is still locked (measured on git 2.5x), so a lock that outlives its pid makes the tree
+# un-reclaimable by every tool that is not this module's own GC -- including the documented
+# `rm -rf <dir> && git worktree prune` recovery. Holding the lock only while the owner runs keeps
+# the intent (a concurrent run is not evicted) without leaving a tombstone.
+_LOCKED_BY_THIS_PROCESS: list[tuple[str, str]] = []
+_LOCK_REGISTRY = threading.Lock()
+
+
+def _release_worktree_locks() -> None:
+    """Unlock every tree this process still holds (atexit net; idempotent, fail-soft)."""
+    with _LOCK_REGISTRY:
+        held, _LOCKED_BY_THIS_PROCESS[:] = list(_LOCKED_BY_THIS_PROCESS), []
+    for repo_root, path in held:
+        _git_quiet(["worktree", "unlock", path], repo_root, log=f"worktree unlock {path} failed")
+
+
+atexit.register(_release_worktree_locks)
+
+
+def _lock_worktree(repo_root: str, worktree_path: str, reason: str) -> bool:
+    """Lock *worktree_path* for *reason* and release it when this process exits. Fail-soft: a lock
+    that cannot be taken costs concurrency protection, never the run."""
+    try:
+        _git(["worktree", "lock", "--reason", reason, worktree_path], repo_root)
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug("git worktree lock failed (non-fatal): %s", e)
+        return False
+    with _LOCK_REGISTRY:
+        _LOCKED_BY_THIS_PROCESS.append((repo_root, worktree_path))
+    logger.debug("Worktree locked: %s (%s)", worktree_path, reason)
+    return True
+
+
+def _forget_worktree_lock(worktree_path: str) -> None:
+    """Hand a tree this process locked to a longer-lived owner (a retained session lock), so the
+    exit net does not unlock the lock that was just taken on its behalf."""
+    with _LOCK_REGISTRY:
+        _LOCKED_BY_THIS_PROCESS[:] = [held for held in _LOCKED_BY_THIS_PROCESS
+                                      if held[1] != worktree_path]
+
+
+def _dead_hermes_lock_pid(reason: Optional[str]) -> Optional[int]:
+    """The dead pid a Hermes lock reason names, else None (live, foreign, or a session lock).
+
+    Session locks (``hermes session=<id> db=<path>``) are deliberately outlived by their launcher
+    and are judged by the session store, not by a pid, so they are never returned here.
+    """
+    if not reason or not reason.startswith("hermes "):
+        return None
+    lock = _HERMES_LOCK_RE.fullmatch(reason)
+    if lock is None or lock.group(1) is None:
+        return None
+    try:
+        from gateway.status import _pid_exists
+        return None if _pid_exists(int(lock.group(1))) else int(lock.group(1))
+    except (ImportError, OSError, ValueError):
+        return None  # unverifiable: fail safe toward keeping the lock
+
+
+def _release_dead_worktree_locks(repo_root: str, timeout: int = 10) -> int:
+    """Unlock worktrees whose Hermes lock names a pid that no longer exists -> count cleared.
+
+    Runs on the startup maintenance path, before any age gate: a run killed with SIGKILL never
+    reaches its exit net, and until this clears the lock no other tool (the repo's own
+    ``scripts/worktree-gc.sh``, an operator's ``git worktree remove``) can touch the tree. A
+    cleared lock whose directory is already gone also gets its admin entry pruned here, which is
+    what makes that operator recovery work again.
+    """
+    try:
+        common = _git_out(["rev-parse", "--git-common-dir"], repo_root, timeout=timeout)
+        if not common:
+            return 0
+        admin_root = Path(repo_root) / common / "worktrees"
+        entries = sorted(p for p in admin_root.iterdir() if p.is_dir())
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug("dead worktree-lock sweep skipped: %s", e)
+        return 0
+
+    cleared = 0
+    prunable = False
+    for admin in entries:
+        try:
+            reason = (admin / "locked").read_text(encoding="utf-8-sig", errors="replace").strip(
+                " \t\n\v\f\r")
+        except OSError:  # unlocked, or the entry vanished under us
+            continue
+        if _dead_hermes_lock_pid(reason) is None:
+            continue
+        tree = admin / "gitdir"
+        try:
+            link = tree.read_text(encoding="utf-8-sig", errors="replace").strip()
+        except OSError:
+            link = ""
+        stem = link.replace("\\", "/")
+        worktree_path = stem[:-len("/.git")] if stem.endswith("/.git") else ""
+        if not worktree_path:  # an admin entry we cannot resolve: git has no path to unlock
+            continue
+        # `unlock` needs only the registration, so it works after the directory is deleted too.
+        _git_quiet(["worktree", "unlock", worktree_path], repo_root, timeout=timeout,
+                   log=f"unlock dead worktree {admin.name} failed")
+        cleared += 1
+        prunable = prunable or not Path(worktree_path).exists()
+    if prunable:
+        _git_quiet(["worktree", "prune"], repo_root, timeout=timeout,
+                   stdin=subprocess.DEVNULL, env=noninteractive_git_env())
+    if cleared:
+        logger.info("Released %d worktree lock(s) whose owning pid is gone", cleared)
+    return cleared
+
+
 def _retain_worktree_for_session(repo_root: str, worktree_path: str, session_id: str, db_path) -> bool:
     """Re-lock a ``--tui -w`` tree its exiting launcher retains, naming the session that uses it.
 
@@ -815,6 +924,7 @@ def _retain_worktree_for_session(repo_root: str, worktree_path: str, session_id:
     history in the same checkout.
     """
     _git_quiet(["worktree", "unlock", worktree_path], repo_root, log="worktree unlock before retain failed")
+    _forget_worktree_lock(worktree_path)  # this lock is meant to outlive the process
     try:
         result = _git(["worktree", "lock", "--reason", f"hermes session={session_id} db={db_path}",
                        worktree_path], repo_root)
@@ -1200,6 +1310,9 @@ def _reclaim_install_states(repo_root: str) -> None:
 
 
 def _prune_stale_worktree_trees(repo_root: str, max_age_hours: int) -> None:
+    # Before any age gate: a lock whose owner was SIGKILLed outlives it, and while it stands no
+    # other tool can remove the tree (or prune a registration whose directory is already gone).
+    _release_dead_worktree_locks(repo_root)
     worktrees_dir = Path(repo_root) / ".worktrees"
     if not worktrees_dir.exists():
         _prune_orphaned_branches(repo_root)
