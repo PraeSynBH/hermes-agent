@@ -426,7 +426,9 @@ def record_age_s(record) -> float | None:
     if not isinstance(stamp, str) or not stamp.strip():
         return None
     try:
-        moment = datetime.fromisoformat(stamp.strip())  # 3.11+ reads the writer's trailing "Z"
+        # ``status._utc_now_iso`` is ``datetime.now(UTC).isoformat()`` ("+00:00"); an older writer's
+        # "Z" parses too, and a zone-less stamp is read as UTC rather than discarded.
+        moment = datetime.fromisoformat(stamp.strip())
     except ValueError:
         return None
     if moment.tzinfo is None:
