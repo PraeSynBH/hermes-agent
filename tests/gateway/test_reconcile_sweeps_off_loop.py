@@ -101,9 +101,9 @@ async def test_reconcile_reads_demand_off_the_event_loop(tmp_path, monkeypatch):
     calls = []
     real_refresh = demand_mod.refresh
 
-    def spy_refresh():
+    def spy_refresh(*args, **kwargs):
         calls.append(threading.get_ident())
-        return real_refresh()
+        return real_refresh(*args, **kwargs)
 
     # The recency signal added one ``stat`` per profile per tick (PRX-5750). It runs INSIDE the
     # refresh that this tick hands to a thread, so the sweep rides along — pin that, because a

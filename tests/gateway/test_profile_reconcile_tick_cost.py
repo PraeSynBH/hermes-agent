@@ -138,15 +138,37 @@ async def test_the_read_half_rides_the_poll_lane_not_the_shared_default_executor
     assert shared == [], f"the tick went back to the shared default executor: {shared!r}"
 
 
+def test_the_tick_walks_the_profile_roster_once_per_read_pass(monkeypatch):
+    """The roster walk is ~130 syscalls of identity probes; demand and enumeration share one.
+
+    Measured on the live host (PRA-6850): one read pass made **566 syscalls, 557 of them `stat`**,
+    and each `stat` costs ~0.49 ms inside the gateway process (279 ms live p50 against 7 ms of the
+    same work in a quiet one). Walking `profiles/` twice — once for demand's roster, once for the
+    serving enumeration — was ~260 of those.
+    """
+    walks = []
+
+    def counting_iter(*args, **kwargs):
+        walks.append(1)
+        return []
+
+    monkeypatch.setattr(profiles_mod, "_iter_named_profile_dirs", counting_iter)
+    monkeypatch.setattr(capacity_mod, "profile_ceiling", lambda: 4)
+
+    reconcile_mod.GatewayProfileReconcileMixin()._live_profiles_snapshot()
+
+    assert len(walks) == 1, f"the read pass walked profiles/ {len(walks)} times, not once"
+
+
 def test_the_demand_read_still_precedes_the_served_enumeration(tmp_path, monkeypatch):
     """The ceiling ranks by the demand snapshot, so the same worker refreshes it FIRST."""
     order = []
     real_refresh = demand_mod.refresh
     real_serve = profiles_mod.profiles_to_serve
 
-    def spy_refresh():
+    def spy_refresh(*args, **kwargs):
         order.append("demand")
-        return real_refresh()
+        return real_refresh(*args, **kwargs)
 
     def spy_serve(*args, **kwargs):
         order.append("serve")

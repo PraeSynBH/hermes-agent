@@ -83,6 +83,7 @@ from __future__ import annotations
 
 import json
 import logging
+import stat
 import threading
 import time
 from dataclasses import dataclass, field
@@ -414,6 +415,15 @@ def _source_signature(path: Path) -> Optional[tuple[int, int]]:
     return (st.st_mtime_ns, st.st_size)
 
 
+def _regular_file_signature(path: Path) -> Optional[tuple[int, int]]:
+    """``_source_signature`` for a path that must also BE a regular file — one stat, not two."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size) if stat.S_ISREG(st.st_mode) else None
+
+
 def _memoised(path: Path, signature: Any, compute):
     """``compute()`` for *path*, re-used while *signature* is unchanged (the tick's whole point)."""
     hit = _SOURCE_MEMO.get(path)
@@ -454,9 +464,10 @@ def _credentials(home: Path, keys: Mapping[str, str]) -> tuple[tuple[str, ...], 
     open is *unreadable* — never "no channels".
     """
     path = Path(home) / ".env"
-    if not path.is_file():
-        return (), ()
-    signature = _source_signature(path)
+    # One stat for the regular-file test AND the memo signature (PRA-6850): `is_file()` plus
+    # `_source_signature()` was two stats per profile per tick, ×43 profiles, at ~0.5 ms a stat
+    # inside this process. A non-regular `.env` reads as "no credentials", exactly as is_file() did.
+    signature = _regular_file_signature(path)
     if signature is None:
         return (), ()
     return _memoised(path, (signature, len(keys)), lambda: _read_credentials(path, keys))
@@ -502,11 +513,13 @@ def _roster() -> list[tuple[str, Path]]:
         raise
 
 
-def refresh() -> DemandSnapshot:
+def refresh(roster: Optional[list[tuple[str, Path]]] = None) -> DemandSnapshot:
     """The authoritative read: manifest once, then S1 + S2 per profile. Never raises.
 
     Called off the event loop from the reconcile tick (``asyncio.to_thread``). A per-source failure
     is non-fatal and per-profile; only a failure that would mislabel a profile is recorded.
+    ``roster`` is the tick's single enumeration, shared with ``profiles_to_serve`` so one cycle
+    walks ``profiles/`` once instead of twice (PRA-6850: the walk is ~130 syscalls).
     """
     global _snapshot
     try:
@@ -525,10 +538,11 @@ def refresh() -> DemandSnapshot:
         keys_unreadable = True
     facts: dict[str, DemandFacts] = {}
     manifest_known = state in (MANIFEST_OK, MANIFEST_STALE)
-    try:
-        roster = _roster()
-    except OSError:
-        roster = []
+    if roster is None:
+        try:
+            roster = _roster()
+        except OSError:
+            roster = []
     for name, home in roster:
         cron_jobs, cron_bad = _cron_jobs(home)
         if keys_unreadable:

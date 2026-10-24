@@ -402,16 +402,24 @@ class GatewayProfileReconcileMixin:
         """
         from gateway.loop_tick_timing import timed
         from hermes_cli import gateway_multiplex_capacity as capacity
-        from hermes_cli.profiles import profiles_to_serve
+        from hermes_cli.profiles import _iter_named_profile_dirs, profiles_to_serve
         # Timed where it runs, not at the await: `profile_reconcile_served` is hop + this + the
         # loop-side tail, so the difference between the two lines is the executor queue — the
-        # number PRA-6850 could only infer from the 8/8 idle-in-`select` shots.
+        # number PRA-6850 could only infer from the 8/8 idle-in-`select` shots. The two phases are
+        # named separately because the whole cost of this pass is syscalls (566 of them, 557
+        # `stat`): 0.49 ms each inside this process (279 ms live p50 vs 7 ms in a quiet one).
         with timed('profile_reconcile_read'):
-            if capacity.profile_ceiling() is not None:
-                from hermes_cli import gateway_multiplex_demand as demand
-                demand.refresh()
-            homes = {str(name): Path(home) for name, home in profiles_to_serve(True)}
-            signatures = _serve_signatures(homes)
+            # ONE walk of profiles/ for the cycle: demand's roster and the serving enumeration used
+            # to each walk it (identity markers per profile), which was ~260 of the 566 syscalls.
+            named = list(_iter_named_profile_dirs())
+            with timed('profile_reconcile_read_demand'):
+                if capacity.profile_ceiling() is not None:
+                    from hermes_cli import gateway_multiplex_demand as demand
+                    demand.refresh(roster=[(entry.name, entry) for entry in named])
+            with timed('profile_reconcile_read_enum'):
+                homes = {str(name): Path(home)
+                         for name, home in profiles_to_serve(True, roster=named)}
+                signatures = _serve_signatures(homes)
         return homes, signatures
 
     def _hold_busy_capacity_removals(self, removed, added, live, deferred_by_capacity):

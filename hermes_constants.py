@@ -398,8 +398,20 @@ PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 def named_profile_has_identity(profile_home: str | Path) -> bool:
     # A dangling symlinked marker (clone/migration leftover) is still an identity claim:
     # ``is_file()`` follows links, so it alone would make such a profile unlistable.
+    #
+    # One ``lstat`` per marker, not ``is_file() or is_symlink()``: that pair is two syscalls per
+    # marker, and this runs for every profile dir on every 30 s reconcile tick (twice, before the
+    # roster is shared) — 220 syscalls of one tick's 566 measured (PRA-6850). ``S_ISLNK`` keeps the
+    # dangling-symlink claim, ``S_ISREG`` the file, and a link's TARGET is irrelevant either way.
     home = Path(profile_home)
-    return any((home / marker).is_file() or (home / marker).is_symlink() for marker in _PROFILE_IDENTITY_MARKERS)
+    for marker in _PROFILE_IDENTITY_MARKERS:
+        try:
+            mode = os.lstat(home / marker).st_mode
+        except OSError:
+            continue
+        if stat.S_ISLNK(mode) or stat.S_ISREG(mode):
+            return True
+    return False
 
 
 def named_profile_has_servable_identity(profile_home: str | Path) -> bool:

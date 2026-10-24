@@ -33,20 +33,28 @@ def _warn_if_default_parked(default: Path) -> None:
         _parked_default_warned.add(default)
 
 
-def _live_roster(*, include_standalone: bool, include_parked: bool) -> list[tuple[str, Path]]:
-    """``default`` plus every live named profile under ``profiles/``, before any capacity decision."""
+def _live_roster(*, include_standalone: bool, include_parked: bool,
+                 roster: Iterable[Path] | None = None) -> list[tuple[str, Path]]:
+    """``default`` plus every live named profile under ``profiles/``, before any capacity decision.
+
+    ``roster`` is an enumeration this cycle already walked (the reconcile tick's single pass,
+    PRA-6850); without it the walk is done here.
+    """
     from hermes_cli.profiles import _get_default_hermes_home, _iter_named_profile_dirs, profile_is_standalone
     default = _get_default_hermes_home()
     _warn_if_default_parked(default)
     serve: list[tuple[str, Path]] = [("default", default)]
-    serve.extend((entry.name, entry) for entry in _iter_named_profile_dirs()
+    if roster is None:
+        roster = _iter_named_profile_dirs()
+    serve.extend((entry.name, entry) for entry in roster
                  if (include_standalone or not profile_is_standalone(entry))
                  and (include_parked or not profile_is_parked(entry)))
     return serve
 
 
 def profiles_to_serve(multiplex: bool, *, include_standalone: bool = False,
-                      include_parked: bool = False) -> list[tuple[str, Path]]:
+                      include_parked: bool = False,
+                      roster: Iterable[Path] | None = None) -> list[tuple[str, Path]]:
     """``(profile_name, hermes_home)`` pairs a gateway should serve — the single chokepoint
     for "which profiles does the inbound gateway handle".
 
@@ -72,7 +80,8 @@ def profiles_to_serve(multiplex: bool, *, include_standalone: bool = False,
         from hermes_cli.profiles import _get_default_hermes_home
         _warn_if_default_parked(_get_default_hermes_home())
         return [(active, get_profile_dir(active))]
-    serve = _live_roster(include_standalone=include_standalone, include_parked=include_parked)
+    serve = _live_roster(include_standalone=include_standalone, include_parked=include_parked,
+                         roster=roster)
     if include_parked or include_standalone:
         return serve
     from hermes_cli import gateway_multiplex_capacity as capacity
