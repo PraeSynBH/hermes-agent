@@ -133,9 +133,19 @@ def _markers_root(markers: Optional[Sequence[str]], excludes: Sequence[str] = ()
 
 
 def _find_binary(ctx: ServerContext, server_id: str, which: Sequence[str], install_pkg: Optional[str]) -> Optional[str]:
-    """Config override → PATH → (optional) auto-install; ``None`` when nothing resolves."""
+    """Config override → the served profile's own staged binary → PATH → (optional) auto-install;
+    ``None`` when nothing resolves.
+
+    The staged dir comes BEFORE PATH because one gateway process serves many profile homes from a
+    single environment: a PATH search that finds an install staged under a different profile runs
+    this profile's sessions on another home's server, which makes per-profile attribution
+    meaningless even when it is populated (PRA-6980).
+    """
     override = ctx.binary_overrides.get(server_id)
-    bin_path = override[0] if override and override[0] and os.path.exists(override[0]) else _which(*which)
+    if override and override[0] and os.path.exists(override[0]):
+        return override[0]
+    from agent.lsp.install import staged_binary
+    bin_path = next((p for name in which if (p := staged_binary(name))), None) or _which(*which)
     if bin_path is None and install_pkg is not None:
         from agent.lsp.install import try_install
         bin_path = try_install(install_pkg, ctx.install_strategy)

@@ -459,9 +459,13 @@ class LSPService:
         snapshots, never whatever another session has written to the file since."""
         if not self.enabled_for(file_path):
             return None
-        from agent.lsp import edit_check
-        return edit_check.start(self, file_path, pre_text=pre_text, post_text=post_text, owner=owner,
-                                carry=carry)
+        from agent.lsp import deferred, edit_check
+        # The service boundary is where attribution is settled: a caller that bound no owner (a
+        # programmatic writer — ``execute_code``'s ``hermes_tools.write_file``, a skill script —
+        # never crosses ``tools/file_tools.py::_owned()``) is still running for a session, and an
+        # empty owner is an unmeasured census row, not a clean one (PRA-6980).
+        return edit_check.start(self, file_path, pre_text=pre_text, post_text=post_text,
+                                owner=owner or deferred.current_owner(), carry=carry)
 
     def _set_delta_baseline(self, abs_path: str, diags: _Diags) -> None:
         """Store a baseline, refreshing recency (pop + reinsert) so eviction tracks write order.

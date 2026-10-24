@@ -54,8 +54,23 @@ def bind_owner(owner: Optional[str]) -> Iterator[None]:
         _OWNER.reset(token)
 
 
+def _ambient_session() -> Optional[str]:
+    """The gateway session this thread is serving, when nothing was bound around the write.
+
+    A writer that re-enters the tool layer without a ``session_id`` still runs on a thread whose
+    session is bound (gateway session contextvars, inherited by the tool thread), and that id is the
+    one a census row can join to ``heartbeat_runs``.  Empty in a bare CLI/cron process: better no
+    owner than a process-global guess.
+    """
+    try:
+        from gateway.session_context import get_session_env
+        return (get_session_env("HERMES_SESSION_ID", "") or "").strip() or None
+    except Exception:  # an instrument must not fail the write it describes
+        return None
+
+
 def current_owner() -> Optional[str]:
-    return _OWNER.get()
+    return _OWNER.get() or _ambient_session()
 
 
 def post(owner: str, path: str, text: str, baseline_text: Optional[str]) -> None:

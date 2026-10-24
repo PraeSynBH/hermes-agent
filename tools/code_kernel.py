@@ -240,7 +240,12 @@ class CellAuthority:
 
     def __init__(self, task_id: str):
         import contextvars
+        from gateway.session_context import get_session_env
         self.task_id = task_id
+        # The session the cell belongs to, captured here with the rest of the authority.  Task ids
+        # isolate terminal sessions; they are not what the write path attributes an edit to, so a
+        # sandbox write that carried only the task id was owned by nobody a census could join.
+        self.session_id = (get_session_env("HERMES_SESSION_ID", "") or "").strip() or None
         self.ctx = contextvars.copy_context()
         self.active = True
         # ((getter, setter), captured value) per thread-local prompt callback (approval, sudo, vault unlock…)
@@ -274,7 +279,8 @@ class CellAuthority:
             except Exception:
                 previous = None
         try:
-            return handle_function_call(tool_name, tool_args, task_id=self.task_id)
+            return handle_function_call(tool_name, tool_args, task_id=self.task_id,
+                                        session_id=self.session_id)
         finally:
             if previous is not None:
                 try:
