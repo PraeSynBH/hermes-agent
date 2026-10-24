@@ -12,6 +12,12 @@ loop-thread shots inside ``permessage_deflate.encode`` and 137/2059 inside
 So the mix is what has to be observable: which frame sizes dominate, and what a send costs at each
 size. ``record_send`` is called once per frame from the writer; ``snapshot`` is the read side (an
 operator probe, or the rate-limited oversized-frame log line). Nothing here is on a request path.
+
+The same observation carries the *other* half of the write path (PRA-6873): uvicorn's sans-I/O
+websocket protocol writes the frame and returns without awaiting drain, so a peer that stops reading
+grows the process's write buffer per peer instead of being closed. ``WSTransport`` bounds that with a
+declared budget; the peak it reaches and how often a frame found the buffer already over the budget
+are recorded here next to the size/cost mix, so the budget is checkable from the serving process.
 """
 
 from __future__ import annotations
@@ -40,7 +46,10 @@ _lock = threading.Lock()
 _sizes = [0] * (len(SIZE_BUCKETS) + 1)
 _costs = [0] * (len(COST_BUCKETS) + 1)
 _totals = {"frames": 0, "bytes": 0, "oversized_frames": 0, "oversized_bytes": 0,
-           "max_frame_bytes": 0, "cost_seconds": 0.0, "max_cost_seconds": 0.0}
+           "max_frame_bytes": 0, "cost_seconds": 0.0, "max_cost_seconds": 0.0,
+           # Undelivered bytes the server transport was holding when the send returned, and how many
+           # sends found it already past the per-peer budget (PRA-6873).
+           "max_buffered_bytes": 0, "over_budget_frames": 0}
 _last_oversized_log_at = 0.0
 
 
@@ -51,12 +60,21 @@ def _bucket(value: float, bounds) -> int:
     return len(bounds)
 
 
-def record_send(nbytes: int, elapsed_s: float) -> bool:
-    """Account one frame the writer put on the control socket; True when it was oversized."""
+def record_send(nbytes: int, elapsed_s: float, *, buffered_bytes: int = 0,
+                budget_bytes: int | None = None) -> bool:
+    """Account one frame the writer put on the control socket; True when it was oversized.
+
+    *buffered_bytes* is what the server transport was still holding for that peer when the send
+    returned, and *budget_bytes* the ceiling it was measured against: together they are the peak
+    per-peer egress backlog and how often a send found it already past the budget.
+    """
     global _last_oversized_log_at
     oversized = nbytes >= LARGE_FRAME_BYTES
     size_bucket, cost_bucket = _bucket(nbytes, SIZE_BUCKETS), _bucket(elapsed_s, COST_BUCKETS)
     with _lock:
+        _totals["max_buffered_bytes"] = max(_totals["max_buffered_bytes"], buffered_bytes)
+        if budget_bytes is not None and buffered_bytes > budget_bytes:
+            _totals["over_budget_frames"] += 1
         _sizes[size_bucket] += 1
         _costs[cost_bucket] += 1
         _totals["frames"] += 1
@@ -73,10 +91,10 @@ def record_send(nbytes: int, elapsed_s: float) -> bool:
             _last_oversized_log_at = now
     if log_it:
         _log.warning(
-            "ws egress oversized frame bytes=%d send_cost_ms=%.1f oversized=%d/%d frames "
-            "oversized_bytes=%d (PRA-6844)",
-            nbytes, elapsed_s * 1000.0, _totals["oversized_frames"], _totals["frames"],
-            _totals["oversized_bytes"])
+            "ws egress oversized frame bytes=%d send_cost_ms=%.1f buffered_bytes=%d "
+            "oversized=%d/%d frames oversized_bytes=%d (PRA-6844)",
+            nbytes, elapsed_s * 1000.0, buffered_bytes, _totals["oversized_frames"],
+            _totals["frames"], _totals["oversized_bytes"])
     return oversized
 
 

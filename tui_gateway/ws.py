@@ -90,6 +90,24 @@ _WS_WRITE_TIMEOUT_S = 10.0
 # cannot drain ~48 KiB in 30s is gone, and closing here starts its reconnect instead of leaving every
 # later frame and RPC reply parked behind the writer lock (#106369).
 _WS_SEND_DEADLINE_S = 30.0
+# Per-peer ceiling on bytes the server transport is holding that the kernel has not taken yet. The
+# legacy ``websockets`` implementation got this for free: its frame write awaits ``drain``, which
+# parks until the transport's write buffer is back under its low-water mark, and the deadline above
+# then closes a peer that never gets there. uvicorn's sans-I/O protocol (which 0.54 resolves
+# ``ws="auto"`` to) writes the frame and returns without awaiting anything, so the frame the peer
+# cannot take is simply resident, the transport stays open, and the deadline is only armed if some
+# later send happens to find the socket paused — measured, one 24 MiB frame to a peer that never reads
+# returns in 5 ms with 24 MiB resident and no latch at all (PRA-6873). Over this budget the writer
+# stops feeding the socket and gives the peer one deadline to take what it already has; a peer that
+# cannot is latched exactly like the legacy stall. A single frame larger than the budget (the Desktop
+# ``file.attach`` producer puts hundreds of MiB in one) is not itself a verdict — the bound is on the
+# backlog that outlives the drain.
+_WS_EGRESS_BUFFER_BUDGET_BYTES = 8 * 1024 * 1024
+# How often the over-budget wait re-reads the transport's buffered byte count. The two uvicorn
+# implementations expose different ad-hoc drain hooks (``drain()`` / a ``writable`` event) and one of
+# them can be set while the buffer is still full, so the wait is driven by the measurement — the
+# thing the budget is about — not by the hook.
+_WS_EGRESS_BUDGET_POLL_S = 0.02
 _WS_LOG_PAYLOAD_PREVIEW = 240
 # Frames read ahead of a busy dispatcher. RPCs still dispatch one at a time in arrival order, but on a
 # per-connection task so the read loop keeps answering gateway.ping while a handler blocks (a lock held
@@ -127,6 +145,26 @@ try:
     from starlette.websockets import WebSocketDisconnect as _WebSocketDisconnect
 except ImportError:  # pragma: no cover - starlette is a required install path
     _WebSocketDisconnect = Exception  # type: ignore[assignment]
+
+
+def _write_buffer_bytes(ws: Any) -> int:
+    """Bytes the server transport still holds for this peer that the kernel has not taken.
+
+    Both uvicorn websocket protocols own the writing transport and are reachable as the bound ``self``
+    of the ASGI ``send`` Starlette wraps (``WebSocket._send``); the legacy one also keeps its
+    ``transport`` on itself. A protocol that cannot answer — wsproto, an older uvicorn, a test double
+    — reads as zero, which only means no budget is enforced on that path.
+    """
+    protocol = getattr(getattr(ws, "_send", None), "__self__", None)
+    transport = getattr(protocol, "transport", None)
+    if transport is None:
+        scope = getattr(ws, "scope", None) or {}
+        transport = (scope.get("extensions") or {}).get("transport") or getattr(ws, "transport", None)
+    getter = getattr(transport, "get_write_buffer_size", None)
+    if getter is None:
+        return 0
+    # asyncio and uvloop both answer from the transport's own bytearray, including while it closes.
+    return max(0, int(getter()))
 
 
 class WSTransport:
@@ -224,6 +262,27 @@ class WSTransport:
     def closed(self) -> bool:
         return self._closed
 
+    def buffered_bytes(self) -> int:
+        """Undelivered bytes the server transport is holding for this peer (PRA-6873)."""
+        return _write_buffer_bytes(self._ws)
+
+    async def _egress_within_budget(self) -> bool:
+        """Give an over-budget peer one send deadline to take what it already has.
+
+        True when the backlog is back under ``_WS_EGRESS_BUFFER_BUDGET_BYTES`` — the healthy case for
+        a legitimately huge frame, which needs no verdict, only time to leave. False means the peer is
+        not reading: the caller latches, which is what the legacy protocol's parked ``drain`` plus the
+        send deadline produced. Awaits throughout, so the loop keeps scheduling either way.
+        """
+        cutoff = time.monotonic() + _WS_SEND_DEADLINE_S
+        while True:
+            buffered = self.buffered_bytes()
+            if buffered <= _WS_EGRESS_BUFFER_BUDGET_BYTES:
+                return True
+            if time.monotonic() >= cutoff:
+                return False
+            await asyncio.sleep(_WS_EGRESS_BUDGET_POLL_S)
+
     async def write_async(self, obj: dict) -> bool:
         """Send from the owning loop; awaits until the frame is on the wire. Buffered tokens are flushed
         ahead of it in the SAME batch so nothing slips between."""
@@ -291,7 +350,21 @@ class WSTransport:
                     # compress+send inside send_text is loop occupancy nobody can preempt, so it is
                     # the mix that has to stay observable (PRA-6844). Characters, not bytes: that is
                     # what zlib walks, and only non-ASCII tool output makes the two differ.
-                    ws_egress.record_send(len(payload), time.perf_counter() - started)
+                    ws_egress.record_send(len(payload), time.perf_counter() - started,
+                                          buffered_bytes=self.buffered_bytes(),
+                                          budget_bytes=_WS_EGRESS_BUFFER_BUDGET_BYTES)
+                # A protocol that never awaits drain leaves the frame it just wrote resident in the
+                # transport: the peer is never told, and the deadline stays unarmed until some later
+                # send happens to find the socket paused (PRA-6873). Bound the backlog instead of the
+                # send: give the peer one deadline to take what it has, and latch with the same 1011
+                # the legacy park produces when it does not.
+                if not await self._egress_within_budget():
+                    self._closed = True
+                    _log.warning("ws egress over budget and not draining peer=%s budget=%sB "
+                                 "deadline=%ss — closing", self._peer,
+                                 _WS_EGRESS_BUFFER_BUDGET_BYTES, _WS_SEND_DEADLINE_S)
+                    self._loop.create_task(self._close_socket(1011, "egress over budget"))
+                    return
 
     def close(self) -> None:  # loop thread (handle_ws finally), so the TimerHandle is safe
         self._closed = True

@@ -226,6 +226,11 @@ def build_ws_egress_payload() -> dict[str, Any]:
     the serving, which a pid sample or a log line can only approximate. Process-wide by design: a
     multiplexed gateway's served profiles share one control socket loop. Reset at boot, never reset
     by a read.
+
+    ``max_buffered_bytes`` / ``over_budget_frames`` are the backlog half (PRA-6873): the most bytes
+    the server transport was holding for one peer when a send returned, and how many sends found that
+    backlog past ``ws._WS_EGRESS_BUFFER_BUDGET_BYTES`` (the ceiling that latches a non-draining peer
+    with 1011 instead of letting the write buffer grow).
     """
     from tui_gateway import ws_egress
     return {**ws_egress.snapshot(), "protocol": CONTROL_PROTOCOL_VERSION, "answered_at": time.time(),

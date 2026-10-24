@@ -17,16 +17,20 @@ Backpressure is NOT implementation-independent, so the two arms differ on purpos
   card sampled runs) parks in ``drain()`` once the window fills, so the deadline fires and the
   transport latches closed — the 1011 path that makes a dead peer reconnectable. Pinned explicitly.
 * uvicorn >= 0.54 resolves ``ws="auto"`` to ``websockets_sansio_impl``, whose ``asgi_send`` does
-  ``conn.send_text`` + ``transport.write`` and never awaits drain at all: no park, no deadline, no
-  latch — the frame is buffered in-process instead. Asserting the latch there would test the
-  implementation, not this invariant, so that arm asserts loop lateness and accounting only. The
-  missing backpressure on the modern implementation is a separate concern (a backed-up peer now
-  grows the process's write buffer instead of being closed).
+  ``conn.send_text`` + ``transport.write`` and never awaits drain for the frame it wrote: no park, no
+  deadline, no latch — the frame is buffered in-process instead, and the transport stays open with
+  the deadline unarmed until some *later* send happens to find the socket paused (measured on 0.54.0:
+  one frame to a non-reading peer returns in 5 ms with ``closed=False`` and 25 MiB resident, PRA-6873).
+  The writer now bounds the *backlog* instead of the send: over budget it lets the peer take what it
+  already has for one deadline and then latches with the same 1011. So both arms assert the latch and
+  that a peer which is not taking frames stops being fed them, and the reading-peer arm pins the other
+  side — a legitimately huge frame the peer does read is never a verdict.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import socket
@@ -45,6 +49,10 @@ _PAYLOAD_CHARS = 24 * 1024 * 1024
 _SEND_DEADLINE_S = 1.0
 # The implementation the sampled serving pid runs, and the only one that applies send backpressure.
 _LEGACY_WS_IMPL = "websockets"
+# The writer's per-peer backlog ceiling, and a deadline long enough that a peer which IS reading
+# drains a 24 MiB frame inside it even on a busy runner.
+_BUDGET_BYTES = 8 * 1024 * 1024
+_READING_PEER_DEADLINE_S = 10.0
 
 _UPGRADE = (
     b"GET /api/ws HTTP/1.1\r\n"
@@ -110,9 +118,13 @@ async def _start_listener(app, ws_impl: str | None = None):
     return server, listener, port, config.ws_protocol_class
 
 
-def _drive_one_oversized_frame(ws_impl: str | None) -> dict:
-    """Send one oversized frame to a peer that never reads; report what the loop and writer did."""
-    # One frame, pre-serialized: this test is about the write, not json.dumps. Hex of random bytes
+def _drive_oversized_frames(ws_impl: str | None, *, frames: int = 1, peer_reads: bool = False) -> dict:
+    """Send oversized frames to a peer; report what the loop and the writer did.
+
+    *peer_reads* False is the stalled-client case (completes the handshake, then never reads a byte).
+    True is the healthy case with a large frame: the peer keeps reading, so nothing may be closed.
+    """
+    # Frames are pre-serialized: this test is about the write, not json.dumps. Hex of random bytes
     # so the payload cannot be compressed away — 24 MiB stays 24 MiB on the socket either way, which
     # is what makes the two paths comparable: same bytes written, different loop cost.
     frame = json.dumps({"method": "event", "params": {
@@ -130,20 +142,25 @@ def _drive_one_oversized_frame(ws_impl: str | None) -> dict:
                 return
             ws = WebSocket(scope, receive, send)
             await ws.accept()
-            transport = WSTransport(ws, loop, peer="pra-6844")
+            transport = WSTransport(ws, loop, peer="pra-6873")
             sending["transport"] = transport
             send_started.set()
             started = loop.time()
             try:
-                await transport._safe_send_many([frame])
+                await transport._safe_send_many([frame] * frames)
             finally:
                 outcome["send_seconds"] = loop.time() - started
                 send_done.set()
 
+        async def _keep_reading(peer) -> None:
+            while await peer.read(1 << 16):
+                pass
+
         server, listener, port, protocol_class = await _start_listener(app, ws_impl)
+        reader_task = None
         try:
-            # Handshake, then never read: the receive window fills and, on an implementation with
-            # flow control, the writer parks.
+            # Handshake, then either keep reading or never read again: in the latter the receive
+            # window fills and the backlog the writer has to bound starts growing.
             reader, writer = await asyncio.open_connection("127.0.0.1", port)
             writer.write(_UPGRADE)
             await writer.drain()
@@ -152,6 +169,8 @@ def _drive_one_oversized_frame(ws_impl: str | None) -> dict:
             # The offer above is what a Desktop/CLI client sends; a loopback control socket must
             # answer without the extension, or this frame's zlib runs on the loop (PRA-6844).
             assert b"sec-websocket-extensions" not in head.lower(), head[:300]
+            if peer_reads:
+                reader_task = asyncio.create_task(_keep_reading(reader))
 
             await asyncio.wait_for(send_started.wait(), timeout=10)
             recorder.start()
@@ -162,6 +181,10 @@ def _drive_one_oversized_frame(ws_impl: str | None) -> dict:
             recorder.stop()
             writer.close()
         finally:
+            if reader_task is not None:
+                reader_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reader_task
             server.should_exit = True
             await server.shutdown(sockets=[listener])
             listener.close()
@@ -193,9 +216,12 @@ def _assert_loop_kept_running(outcome: dict) -> None:
 def test_oversized_frame_to_a_backed_up_peer_keeps_the_loop_running(monkeypatch):
     """Legacy implementation (the one the sampled serving pid runs): the deadline fires and latches."""
     monkeypatch.setattr(ws_module, "_WS_SEND_DEADLINE_S", _SEND_DEADLINE_S)
-    outcome = _drive_one_oversized_frame(_LEGACY_WS_IMPL)
+    outcome = _drive_oversized_frames(_LEGACY_WS_IMPL)
 
     _assert_loop_kept_running(outcome)
+    # Same backlog accounting on the implementation that has real flow control: the parked frame is
+    # resident, so the peak is checkable from the serving process here too.
+    assert outcome["stats"]["max_buffered_bytes"] > 0, outcome["stats"]
     # The deadline governs the wait AFTER the synchronous half, so a peer that never drains is
     # closed (1011) instead of leaving every later frame parked behind the writer lock.
     assert outcome["send_seconds"] >= _SEND_DEADLINE_S, outcome
@@ -208,15 +234,55 @@ def test_oversized_frame_to_a_backed_up_peer_keeps_the_loop_running(monkeypatch)
 
 
 def test_oversized_frame_keeps_the_loop_running_on_the_default_protocol(monkeypatch):
-    """Whatever uvicorn ships by default must also leave the loop free (and must not hang past it)."""
+    """Whatever uvicorn ships by default must give the frame a verdict, not just buffer it.
+
+    One frame is the case that had none: uvicorn 0.54's sans-I/O ``send`` writes and returns in
+    milliseconds, so a peer that never reads leaves 24 MiB sitting in the process's write buffer with
+    the transport open and the deadline unarmed — the socket only latches when some *later* frame
+    happens to be sent, and with per-event batches that may never come. Measured on 0.54.0: base
+    returns in 5 ms with ``closed=False``; with the budget the same send waits out the deadline and
+    latches 1011, leaving exactly one frame resident (the peer took none of it).
+    """
     monkeypatch.setattr(ws_module, "_WS_SEND_DEADLINE_S", _SEND_DEADLINE_S)
-    outcome = _drive_one_oversized_frame(None)
+    outcome = _drive_oversized_frames(None)
 
     _assert_loop_kept_running(outcome)
-    # No latch is asserted: an implementation with no send backpressure (uvicorn >= 0.54 buffers the
-    # frame in the transport instead of parking) has nothing to time out. What must never happen is
-    # the loop being held past the deadline without the socket being closed.
-    assert outcome["send_seconds"] < _SEND_DEADLINE_S or outcome["closed"] is True, outcome
+    assert outcome["closed"] is True, (
+        "a peer that never drains must latch so handle_ws's read loop ends and the client "
+        f"reconnects, protocol={outcome['protocol']} "
+        f"buffered={outcome['stats'].get('max_buffered_bytes')}")
+    assert outcome["send_seconds"] >= _SEND_DEADLINE_S, outcome
+    stats = outcome["stats"]
+    # One frame is resident — the one the peer took none of. The ceiling is the budget plus whatever
+    # that single frame is; it never becomes N frames of growth, because the next send never happens.
+    assert stats["frames"] == 1, stats
+    assert stats["over_budget_frames"] == 1, stats
+    assert _BUDGET_BYTES < stats["max_buffered_bytes"] <= _BUDGET_BYTES + outcome["frame_chars"], stats
+
+
+def test_a_second_frame_is_never_written_on_top_of_an_undrained_backlog(monkeypatch):
+    """The batch stops at the frame the peer could not take, instead of feeding the buffer further."""
+    monkeypatch.setattr(ws_module, "_WS_SEND_DEADLINE_S", _SEND_DEADLINE_S)
+    outcome = _drive_oversized_frames(None, frames=3)
+
+    assert outcome["closed"] is True, outcome
+    assert outcome["stats"]["frames"] == 1, outcome["stats"]
+    assert outcome["stats"]["max_buffered_bytes"] <= _BUDGET_BYTES + outcome["frame_chars"], outcome["stats"]
+
+
+def test_a_peer_that_reads_a_huge_frame_is_never_closed(monkeypatch):
+    """The budget bounds a backlog, it is not a per-frame verdict: a reading peer still gets 24 MiB.
+
+    The Desktop ``file.attach`` producer puts hundreds of MiB in one frame, so a budget that closed
+    every over-budget send on sight would break the one producer whose frames are that big.
+    """
+    monkeypatch.setattr(ws_module, "_WS_SEND_DEADLINE_S", _READING_PEER_DEADLINE_S)
+    outcome = _drive_oversized_frames(None, peer_reads=True)
+
+    _assert_loop_kept_running(outcome)
+    assert outcome["closed"] is False, (
+        "a peer that drains its frames must not be latched, protocol="
+        f"{outcome['protocol']} buffered={outcome['stats'].get('max_buffered_bytes')}")
 
 
 def test_egress_stats_record_the_frame_mix():
@@ -224,12 +290,18 @@ def test_egress_stats_record_the_frame_mix():
     ws_egress.reset()
     assert ws_egress.record_send(2048, 0.0001) is False
     assert ws_egress.record_send(ws_egress.LARGE_FRAME_BYTES + 1, 0.004) is True
+    # The backlog half of the same accounting (PRA-6873): the peak the transport was holding, and
+    # whether that send found it already past the budget.
+    assert ws_egress.record_send(4096, 0.0002, buffered_bytes=5_000_000, budget_bytes=8_388_608) is False
+    assert ws_egress.record_send(4096, 0.0002, buffered_bytes=9_000_000, budget_bytes=8_388_608) is False
 
     stats = ws_egress.snapshot()
-    assert stats["frames"] == 2
-    assert stats["bytes"] == 2048 + ws_egress.LARGE_FRAME_BYTES + 1
+    assert stats["frames"] == 4
+    assert stats["bytes"] == 2048 + ws_egress.LARGE_FRAME_BYTES + 1 + 4096 * 2
     assert stats["oversized_frames"] == 1
     assert stats["max_frame_bytes"] == ws_egress.LARGE_FRAME_BYTES + 1
-    assert sum(bucket["frames"] for bucket in stats["size_buckets"]) == 2
-    assert sum(bucket["frames"] for bucket in stats["cost_buckets"]) == 2
+    assert stats["max_buffered_bytes"] == 9_000_000
+    assert stats["over_budget_frames"] == 1
+    assert sum(bucket["frames"] for bucket in stats["size_buckets"]) == 4
+    assert sum(bucket["frames"] for bucket in stats["cost_buckets"]) == 4
     assert stats["size_buckets"][-1]["le_bytes"] is None  # open-ended tail bucket
