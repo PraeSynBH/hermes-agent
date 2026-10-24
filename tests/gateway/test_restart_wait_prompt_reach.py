@@ -306,6 +306,86 @@ async def test_restart_wait_cuts_sockets_opened_before_it(tmp_path, monkeypatch,
         assert received == [("disconnect", 1013)], received
 
 
+def _ticket_scope(ticket):
+    return {"type": "websocket", "path": "/api/ws", "scheme": "ws", "query_string": b"",
+            "client": ("127.0.0.1", 1234), "server": ("127.0.0.1", 9999),
+            "headers": [(b"sec-websocket-protocol", ("hermes-gateway-v1, hermes-gateway-ticket." + ticket).encode())],
+            "subprotocols": ["hermes-gateway-v1", "hermes-gateway-ticket." + ticket]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("in_flight", [True, False])
+async def test_restart_wait_spares_the_socket_whose_turn_it_is_waiting_for(tmp_path, monkeypatch, in_flight):
+    """A pre-wait socket holding a claimed turn survives the wait; one with no turn in flight is cut.
+
+    The wait still OWNS the turns it defers for: a client disconnect only detaches the session, the
+    turn keeps running and its result has nowhere to go — so cutting that socket converts work the
+    deferral protects into a run that exits 1 with "turn outcome is unknown" (PRX-6179, 8 turns on
+    2026-10-23). The gate reads the claim the session already carries (``event_stream.execution``,
+    stamped at admission claim and cleared once the outcome is published) for the sessions this
+    connection subscribed to, so a socket that merely polls a receipt still has no claim to show.
+    """
+    import json
+
+    from gateway.run_api import GatewayRuntimeAPI
+    from gateway.runtime_bootstrap import TicketStore
+    from hermes_cli import web_server as web
+    from hermes_cli import web_server_chat
+
+    tickets = TicketStore("owner", [str(tmp_path)])
+    ticket = tickets.mint(profile_id=str(tmp_path), subject="human", purpose="interactive")
+    live = SimpleNamespace(event_stream=SimpleNamespace(
+        execution={"admission_id": "a1"} if in_flight else {}))
+    authority = SimpleNamespace(db=SimpleNamespace(db_path=tmp_path / "state.db"), profile_id=str(tmp_path),
+                                runner=None, sessions={"s": live})
+    runner = SimpleNamespace(_draining=False, _running=True, session_runtime_descriptor={"state": "ready"},
+                             session_authority=authority, session_ticket_store=tickets)
+
+    def open_restart_wait():
+        runner._draining = True
+        runner.session_runtime_descriptor.update(state="draining", drain_reason="restart_wait")
+
+    received = []
+
+    async def handle(ws, **kwargs):
+        await ws.accept(subprotocol="hermes-gateway-v1")
+        ws.scope["hermes.gateway_session_subscriptions"] = {"s": "sub-1"}
+        open_restart_wait()  # the wait opens while this socket holds its turn
+        while True:
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                received.append(("disconnect", message.get("code")))
+                return
+            received.append(("text", message.get("text")))
+            # The turn settles: its message.complete is out, the claim is released.
+            live.event_stream.execution.clear()
+
+    async def fallback(*args):
+        pytest.fail("a ticketed native socket must not enter the legacy fallback")
+
+    monkeypatch.setattr("tui_gateway.ws.handle_ws", handle)
+    monkeypatch.setattr(web, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+    monkeypatch.setattr(web_server_chat, "_ws_request_is_allowed", lambda ws: True)
+    frames = [json.dumps({"id": 1, "method": "prompt.receipt"}), json.dumps({"id": 2, "method": "prompt.receipt"})]
+    incoming = iter([{"type": "websocket.connect"},
+                     {"type": "websocket.receive", "text": frames[0]},
+                     {"type": "websocket.receive", "text": frames[1]},
+                     {"type": "websocket.disconnect", "code": 1000}])
+
+    async def receive():
+        return next(incoming)
+
+    async def send(value):
+        pass
+
+    await GatewayRuntimeAPI(fallback, runner, web.app)(_ticket_scope(ticket), receive, send)
+    if in_flight:
+        # The completion frame reaches a live reader; the cut lands only after the claim settled.
+        assert received == [("text", frames[0]), ("disconnect", 1013)], received
+    else:
+        assert received == [("disconnect", 1013)], received
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("opened_in_wait", [False, True])
 async def test_the_cut_is_named_once_in_the_gateway_log(tmp_path, monkeypatch, caplog, opened_in_wait):

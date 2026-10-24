@@ -436,6 +436,7 @@ def _drive_authority_fallback(monkeypatch, *, capabilities, profile_id, method):
     class FakeConnection:
         def __init__(self, authority, transport, identity, operator=False):
             self.actor = type("Actor", (), {"capabilities": frozenset(capabilities), "profile_id": profile_id})()
+            self.subscriptions = {}  # serves no session: nothing is exempt from the restart-wait gate
 
         async def dispatch(self, req):
             return {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32601, "message": "unknown method"}}
@@ -475,6 +476,7 @@ def test_ready_frame_advertises_a_session_authority_only_when_one_is_bound(monke
     class FakeConnection:
         def __init__(self, authority, transport, identity, operator=False):
             self.actor = type("Actor", (), {"capabilities": frozenset(), "profile_id": "p"})()
+            self.subscriptions = {}
 
         async def close(self):
             pass
@@ -580,3 +582,51 @@ def test_legacy_fallback_never_writes_an_authority_owned_session(monkeypatch, tm
         row = db.get_session("owned")
         assert row is not None and not row.get("archived") and row["runtime_revision"] == revision
         assert "owned" in authority.sessions
+
+
+def test_ws_hands_the_served_sessions_to_the_restart_wait_gate(tmp_path, monkeypatch):
+    """PRX-6179: the restart-wait gate lives outside this package and knows the socket's ticket,
+    not its sessions. ``handle_ws`` therefore stamps the connection's LIVE subscription map on the
+    ASGI scope, which is what ``gateway/run_api.py`` reads to spare a connection serving a claimed
+    turn — and to keep cutting a socket that serves none (kanban/poll worker)."""
+    from types import SimpleNamespace
+    from gateway.session_authority import LiveSession, SessionAuthority
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch
+
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
+    with SessionDB(db_path=tmp_path / "state.db") as db:
+        db.create_session("owned", source="tui")
+        authority = SessionAuthority(SimpleNamespace(_draining=False), profile_id=str(tmp_path),
+                                     instance_id="current", db=db, epoch=begin_runtime_epoch(db, instance_id="current"))
+        authority.sessions["owned"] = LiveSession(None, "route")
+        monkeypatch.setattr(server, "_profile_db", lambda *_a, **_k: contextlib.nullcontext(db))
+        scope = {"hermes.session_authority": authority}
+        connections = []
+        real = ws_mod._authority_connection
+
+        def capture(*args, **kwargs):
+            connections.append(real(*args, **kwargs))
+            return connections[-1]
+
+        monkeypatch.setattr(ws_mod, "_authority_connection", capture)
+
+        class FakeWS:
+            def __init__(self):
+                self.scope = scope
+
+            async def accept(self, **_kw):
+                pass
+
+            async def send_text(self, line):
+                pass
+
+            async def receive_text(self):
+                raise ws_mod._WebSocketDisconnect()
+
+            async def close(self, **_kw):
+                pass
+
+        asyncio.run(ws_mod.handle_ws(FakeWS(), auth_identity={"user_id": "owner", "instance_id": "current"}))
+        assert connections, "a socket with a session authority must get an AuthorityConnection"
+        assert scope["hermes.gateway_session_subscriptions"] is connections[0].subscriptions
