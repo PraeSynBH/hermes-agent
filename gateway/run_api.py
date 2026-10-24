@@ -243,6 +243,35 @@ def _restart_wait_read(runner, scope) -> bool:
     return scope['type'] == 'http' and restart_wait_read(runner, scope.get('method'), scope.get('path'))
 
 
+def _serving_claimed_turn(scope) -> bool:
+    """True while this connection is attached to a session that holds a claimed, unsettled turn.
+
+    A restart's after-turn wait exists to let exactly those turns finish, so the socket serving one
+    must outlive the wait: the wait still owns the turn, and cutting the socket converts work the
+    deferral is protecting into a run that dies with "turn outcome is unknown" (PRX-6179; 8 in-flight
+    turns on 2026-10-23 18:54:37 PDT, 25 minutes before any ``stop()``).
+
+    The fact is READ, not counted: ``event_stream.execution`` is stamped when an admission is claimed
+    (``SessionAuthority._stamp_claim``) and cleared once its outcome is published
+    (``SessionAuthority._drain``'s settlement finally). That lifetime is the one this gate needs —
+    through execution AND settlement, so the completion frame cannot lose a race with the cut — and
+    it cannot drift, stick, or pin the wait with a counter a failed turn forgot to release.
+
+    A connection is spared only for the sessions it SUBSCRIBED to (``AuthorityConnection.
+    subscriptions``, stamped on the scope by ``tui_gateway.ws.handle_ws``). A kanban worker polling
+    a card's receipt never subscribes to the session it polls, so it is still cut — the arm
+    d710b2e346 had to restore after e1e6f304868 let a polling socket pin ``hermes update`` to the
+    full drain cap.
+    """
+    authority = scope.get('hermes.session_authority')
+    sessions = getattr(authority, 'sessions', None)
+    for session_id in tuple(scope.get('hermes.gateway_session_subscriptions') or ()):
+        live = (sessions or {}).get(session_id)
+        if getattr(getattr(live, 'event_stream', None), 'execution', None):
+            return True
+    return False
+
+
 class GatewayRuntimeAPI:
     """Redeem private local tickets at the existing WS subprotocol boundary.
 
@@ -310,11 +339,13 @@ class GatewayRuntimeAPI:
         async def receive_admitted():
             nonlocal cut_logged
             message = await original_receive()
-            # Only a socket admitted INTO the restart wait (to answer a parked prompt) outlives it. One
-            # opened before the wait is cut as before: its client reconnects to the next owner, and a
-            # held one (a kanban worker polling its card) would otherwise pin the drain to its cap.
+            # Only a socket admitted INTO the restart wait (to answer a parked prompt), or one serving a
+            # turn the wait is holding for, outlives it. One opened before the wait with no turn in
+            # flight is cut as before: its client reconnects to the next owner, and a held one (a
+            # kanban worker polling its card) would otherwise pin the drain to its cap.
             if ((descriptor['state'] != 'ready' or self.runner._draining) and not allow_draining
-                    and not (admitted_in_wait and restart_wait_open(self.runner))):
+                    and not (admitted_in_wait and restart_wait_open(self.runner))
+                    and not _serving_claimed_turn(scope)):
                 # Name the cut once per connection: the client's own log carries the close code, and a
                 # close inside a deferral that protects in-flight turns is otherwise indistinguishable
                 # from a transport that died on its own (PRX-6150).

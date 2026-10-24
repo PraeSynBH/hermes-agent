@@ -444,7 +444,14 @@ def _authority_connection(ws: Any, transport: WSTransport, auth_identity: dict |
     if authority is None:
         return None
     from gateway.session_controls import AuthorityConnection
-    return AuthorityConnection(authority, transport, auth_identity or {}, operator=operator)
+    connection = AuthorityConnection(authority, transport, auth_identity or {}, operator=operator)
+    scope = getattr(ws, "scope", None)
+    if isinstance(scope, dict):
+        # Which sessions this socket serves, for the ONE caller outside this package that has to
+        # answer it: gateway/run_api.py's restart-wait gate spares a connection holding a claimed
+        # turn (PRX-6179). A live reference: the connection mutates it on resume/detach/close.
+        scope["hermes.gateway_session_subscriptions"] = connection.subscriptions
+    return connection
 
 
 async def _dispatch_request(authority_connection: Any, req: Any, req_method: Any, transport: WSTransport) -> Any:
