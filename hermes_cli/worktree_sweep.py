@@ -29,7 +29,8 @@ from typing import Optional
 logger = logging.getLogger("cli")
 
 _DEFAULTS = {"archive_dirty": True, "archive_max_file_mb": 50, "archive_retention_days": 30, "max_total_gb": 0,
-             "max_linked": 0, "reclaim_before_admit": True}
+             "max_linked": 0, "max_linked_by_repo": {}, "ratchet": False, "ratchet_headroom": 20,
+             "reclaim_before_admit": True}
 _PROTECTED_BRANCHES = {"main", "master", "develop", "dev", "trunk"}
 _ARCHIVE_REASONS = {"dirty": "uncommitted changes", "unpushed": "unpushed commits"}
 
@@ -75,7 +76,29 @@ def sweep_settings() -> dict:
         settings["max_linked"] = max(0, int(float(settings["max_linked"] or 0)))
     except (TypeError, ValueError):
         settings["max_linked"] = 0
+    settings["max_linked_by_repo"] = _coerce_cap_table(settings.get("max_linked_by_repo"))
+    settings["ratchet"] = bool(settings["ratchet"])
+    try:
+        settings["ratchet_headroom"] = max(1, int(float(settings["ratchet_headroom"] or 0)))
+    except (TypeError, ValueError):
+        settings["ratchet_headroom"] = _DEFAULTS["ratchet_headroom"]
     return settings
+
+
+def _coerce_cap_table(value) -> dict:
+    """``{<repo basename or path>: N}`` with non-negative int values; malformed rows are dropped."""
+    if not isinstance(value, dict):
+        return {}
+    table: dict = {}
+    for key, raw in value.items():
+        name = str(key).strip()
+        if not name:
+            continue
+        try:
+            table[name] = max(0, int(float(raw or 0)))
+        except (TypeError, ValueError):
+            continue
+    return table
 
 
 def classic_mode(settings: dict) -> bool:
@@ -481,3 +504,9 @@ def run_sweep(repo_root: str, max_age_hours: int, settings: dict) -> None:
     if expired:
         logger.info("Deleted %d worktree archive(s) older than %g days", len(expired), settings["archive_retention_days"])
     ops._prune_orphaned_branches(repo_root, protect=kept_branches)
+    # PRX-6144: a cap set once is a snapshot. Measure the population the sweep just produced and
+    # lower this repo's admission cap toward it (``worktrees.ratchet``), so the bound follows the
+    # population down instead of re-freezing the cliff at the number it was first set to. This
+    # runs in the sweep only: recomputing on every creation would follow the population up.
+    from hermes_cli import worktree_pool
+    worktree_pool.ratchet_after_sweep(repo_root, None, settings)
