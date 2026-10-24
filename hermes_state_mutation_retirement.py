@@ -500,18 +500,27 @@ def prune_expired_receipts(db, *, min_interval_hours=1, older_than=RETRY_HORIZON
     tombstone accumulated forever. This is the entry point that arm calls unconditionally; the
     horizons are unchanged (SETTLED_RESULT_COMPACT_S, then RETRY_HORIZON_S) and nothing inside
     them is touched.
+
+    The interval is checked BEFORE any write transaction: the arm runs this every cadence (60 s per
+    served profile), and a WAL commit per store per minute just to read a marker is not free.
     """
-    def write(conn):
-        now = time.time()
+    def due(conn):
         saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (RECEIPT_REAP_MARKER,)).fetchone()
         try:
             last = float(json.loads(saved[0]).get('at') or 0) if saved else 0.0
         except (TypeError, ValueError, AttributeError):
             last = 0.0
-        if now - last < min_interval_hours * 3600:
+        return time.time() - last >= min_interval_hours * 3600
+
+    with db._read_ctx() as conn:
+        if not due(conn):
+            return 0
+
+    def write(conn):
+        if not due(conn):  # another profile's handle got here first: the marker is the lock
             return 0
         conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-                     (RECEIPT_REAP_MARKER, json.dumps({'at': now})))
+                     (RECEIPT_REAP_MARKER, json.dumps({'at': time.time()})))
         return prune_retired_tombstones(conn, older_than=older_than)
     return db._execute_write(write)
 
