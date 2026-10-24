@@ -15,7 +15,9 @@ The contracts pinned here:
   earns no grace at all;
 * an owner that never finishes coming up still fails, bounded by budget + ``RESTART_WAIT_GRACE_S``;
 * the death text names the restart, which is what the detector's ``restart_window`` class reads;
-* the readiness reader never invents a restart from a stale record or an absent owner.
+* the readiness reader credits exactly the two names a restart is published under (``starting`` while
+  the incoming owner boots, ``restarting`` for the outgoing owner's claim across the exit->boot gap,
+  SOU-3966) and never invents a restart from a stale record, a dead pid or an absent owner.
 
 Durations are SCALED (a 130 s outage is not a test): the admit test keeps the incident's ratio — the
 owner serves 12.5% past the budget (130 s vs 120 s) — and the others use sub-second budgets.
@@ -183,7 +185,15 @@ def test_the_reader_only_credits_a_live_owner_that_says_it_is_starting(tmp_path)
     _write_state(home, "starting")
     assert gateway_client.owner_serving_state([home]) == "starting"
 
+    # The outgoing owner's own claim across the exit -> boot gap (SOU-3966): the other half of the
+    # window, and the name that must be credited the moment a tree publishes it.
+    _write_state(home, "restarting")
+    assert gateway_client.owner_serving_state([home]) == "restarting"
+
     _write_state(home, "running")  # a live owner that says it is serving
+    assert gateway_client.owner_serving_state([home]) is None
+
+    _write_state(home, "draining")  # going away, no replacement promised: admit_owner's wait
     assert gateway_client.owner_serving_state([home]) is None
 
     _write_state(home, "starting", pid=DEAD_PID)

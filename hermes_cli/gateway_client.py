@@ -97,6 +97,13 @@ RESTART_POLL_INTERVAL_S = BOOT_POLL_INTERVAL_S
 # serves still fails, `budget + this` later, and one that is merely WEDGED (alive, publishing
 # ``running``, answering nothing) earns not a single second of it.
 RESTART_WAIT_GRACE_S = 300.0
+# The owner states in which a LIVE process on that home has not started serving this run yet and an
+# owner is coming up: ``starting`` (``run_startup``'s boot stamp, until every platform connects) and
+# ``restarting`` (the OUTGOING owner's own claim at ``stop()``, kept on disk through the exit->boot
+# gap — SOU-3966 adds the name; a tree that does not publish it simply never sees it). Both are
+# "wait", and neither is ``draining``: an owner that is going away with no replacement is
+# ``admit_owner``'s wait, not a restart this client may spend its grace on.
+OWNER_COMING_UP_STATES = frozenset({"starting", "restarting"})
 # A profile the multiplexer's ceiling has deferred (`profile_serving`) is re-observed this often.
 # Cheap — one control-socket ``identify`` — and well inside the reconcile interval the rank moves on.
 PROFILE_SERVE_POLL_INTERVAL_S = 5.0
@@ -368,14 +375,16 @@ def restart_watch_homes(endpoint, home) -> list[Path]:
 
 
 def owner_serving_state(homes) -> str | None:
-    """``"starting"`` while a LIVE owner on one of *homes* is still coming up, else ``None``.
+    """The owner's own word while a LIVE owner on one of *homes* is still coming up, else ``None``.
 
     The owner publishes its own readiness into ``<home>/gateway_state.json``: ``starting`` from the
     moment it claims the home until every enabled platform is connected (``run_startup`` stamps
-    ``running``/``degraded`` only after that). That is the one signal that separates a restart
-    window from a stalled loop without asking the owner a question it cannot answer yet — on this
-    host the control socket listens 83 s before the platforms are ready, so ``identify`` answers
-    "alive" for the whole window in which ``session.create`` cannot complete.
+    ``running``/``degraded`` only after that), and — once the outgoing life claims it at ``stop()``
+    — ``restarting`` across the exit -> boot gap (``OWNER_COMING_UP_STATES``). That is the one
+    signal that separates a restart window from a stalled loop without asking the owner a question
+    it cannot answer yet: on this host the control socket listens 83 s before the platforms are
+    ready, so ``identify`` answers "alive" for the whole window in which ``session.create`` cannot
+    complete.
 
     A home with no live record falls back to the lock reservation (``missing_owner_state``): a
     claimed-but-unpublished owner is the launch -> socket half of the same window. Nothing is ever
@@ -390,8 +399,9 @@ def owner_serving_state(homes) -> str | None:
         try:
             record = read_runtime_status(home / "gateway_state.json")
             if isinstance(record, dict) and runtime_status_pid_is_live(record):
-                if record.get("gateway_state") == "starting":
-                    return "starting"
+                state = record.get("gateway_state")
+                if state in OWNER_COMING_UP_STATES:
+                    return str(state)
                 continue  # a live owner that says it is serving: no credit from this home
             if missing_owner_state(home) == "starting":
                 return "starting"
@@ -406,7 +416,8 @@ class _RestartWatch:
     Started and stopped by ``GatewayClient._await_admission`` rather than run as a background
     ticker: the client's context outlives admission by a whole agent turn, and a per-second probe
     for that long is a cost this fix does not need. ``starting_s`` is how much of the wait the owner
-    spent saying it was not serving yet; the waiter hands exactly that back to the deadline.
+    spent saying it was not serving yet (its word is kept in ``seen`` for the death text); the
+    waiter hands exactly that back to the deadline.
     """
 
     def __init__(self, homes, *, interval=None):
@@ -424,9 +435,9 @@ class _RestartWatch:
             except (OSError, RuntimeError, ValueError):
                 state = None
             now = time.monotonic()
-            if state == "starting":
+            if state:  # `starting` or `restarting`: the owner is up, and not serving yet
                 self.starting_s += now - sampled_at
-                self.seen = "starting"
+                self.seen = state
             sampled_at = now
             await asyncio.sleep(self._interval)
 
