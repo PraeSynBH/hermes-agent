@@ -327,3 +327,93 @@ def test_an_unreadable_cron_scan_is_reported_not_recorded_as_zero(tmp_path, monk
     assert begin["due_slots"] is None and begin["profiles"] is None
     assert begin["cron_cost_readable"] is False
     assert begin["cap_s"] == 0.2, "the record still carries the bound the wait honoured"
+
+
+# --- PRX-6173: the cron bound must not release a drain that cannot finish the work --------------
+#
+# Measured on 2026-10-24T05:42:26Z: the deferral ended at the cron bound after 600 s with 14 units
+# active, the drain it released into got the launchd-clamped 60 s budget (``active_at_start=13``) and
+# interrupted 12 of them, and 6 runs admitted at the release instant waited 133.5 s for the
+# replacement to listen and settled ``interrupted``. The released slot was not served any sooner by
+# the bound firing: admission stays closed through stop(), exit and the next boot, so the slot fires
+# when the replacement listens either way.
+
+def _retiring_runner(cap: float, script):
+    """A runner whose awaitable population follows *script* ``[(seconds_after_arm, count), ...]``."""
+    started = []
+
+    def _awaitable() -> int:
+        if not started:
+            started.append(asyncio.get_running_loop().time())
+        elapsed = asyncio.get_running_loop().time() - started[0]
+        count = script[0][1]
+        for at, value in script:
+            if elapsed >= at:
+                count = value
+        return count
+
+    return SimpleNamespace(
+        _draining=True, _running=True, session_runtime_descriptor={},
+        _restart_after_turn_timeout=cap,
+        _active_work_count=_awaitable, _awaitable_work_count=_awaitable,
+        _wedged_agent_count=lambda: 0, _restart_safe_cron_count=lambda: 0,
+        _describe_active_work=list, _scale_to_zero_status=lambda *a, **k: None,
+    )
+
+
+def test_a_bound_that_is_still_retiring_work_extends_instead_of_releasing_the_drain(
+        tmp_path, monkeypatch, caplog):
+    """The ending the loss needs: work still finishing at the bound is not handed to stop()/drain.
+
+    Twelve of the thirteen units alive at the release were interrupted because a 60 s drain cannot
+    retire turns that have been running for minutes. Extending the hold while the population is
+    still falling lets those turns finish inside the wait the cap already allowed.
+    """
+    _cron_cost(monkeypatch, due=2, homes=2, bound=0.25)
+    path = _hold_ledger(tmp_path, monkeypatch)
+
+    runner = _retiring_runner(5.0, [(0, 3), (0.2, 2), (0.45, 1), (0.65, 0)])
+    elapsed, result = asyncio.run(_timed_wait(runner, caplog))
+
+    assert result is True, "the work drained inside the wait instead of being interrupted by stop()"
+    assert elapsed >= 0.6, "the wait outlived the first cron bound it hit"
+    assert elapsed < 3.0, "the cap still bounds it"
+    messages = [r.getMessage() for r in caplog.records]
+    assert [m for m in messages if "the cron bound elapsed with" in m and "re-armed" in m], \
+        "the extension names itself, or a post-mortem reads a 3x-bound hold as a cap timeout"
+    assert not [m for m in messages if "Restart deferral ends at the cron bound" in m], \
+        "this hold never handed the remainder to the drain"
+
+    _begin, end = _hold_records(path)
+    assert end["reason"] == "drained"
+    assert end["cron_bound_extensions"] >= 1
+
+
+def test_a_bound_that_retires_nothing_still_ends_the_wait(tmp_path, monkeypatch, caplog):
+    """PRA-6925 preserved: a hold protecting nothing is pure fleet-wide cron silence."""
+    _cron_cost(monkeypatch, due=2, homes=2, bound=0.25)
+    path = _hold_ledger(tmp_path, monkeypatch)
+    elapsed, result = asyncio.run(_timed_wait(_stuck_runner(5.0), caplog))
+
+    assert result is False and elapsed < 3.0
+    assert [m for m in caplog.records if "Restart deferral ends at the cron bound" in m.getMessage()]
+    assert not [m for m in caplog.records if "re-armed" in m.getMessage()]
+    _begin, end = _hold_records(path)
+    assert end["reason"] == "cron_bound"
+    assert "cron_bound_extensions" not in end, "an unextended hold keeps its record shape"
+
+
+def test_the_cap_still_ends_an_extended_wait(tmp_path, monkeypatch, caplog):
+    """The extension spends time the cap already allowed; it never outlives the cap."""
+    _cron_cost(monkeypatch, due=1, homes=1, bound=0.25)
+    path = _hold_ledger(tmp_path, monkeypatch)
+    # Always one fewer unit than the previous window: productive forever, so only the cap ends it.
+    script = [(i * 0.2, 100 - i) for i in range(40)]
+    elapsed, result = asyncio.run(_timed_wait(_retiring_runner(1.0, script), caplog))
+
+    assert result is False
+    assert 0.9 <= elapsed < 1.6, f"the 1 s cap ended the extended wait, not the 0.25 s bound ({elapsed:.2f}s)"
+    assert [m for m in caplog.records if "Restart after-turn wait timed out after" in m.getMessage()]
+    _begin, end = _hold_records(path)
+    assert end["reason"] == "cap"
+    assert end["cron_bound_extensions"] >= 1
