@@ -393,6 +393,19 @@ def _setup_tui_worktree() -> dict:
     except Exception as exc:
         print(f"✗ Failed to create TUI worktree: {exc}", file=sys.stderr)
     if not wt_info:
+        # A repo at its worktree cap is a capacity refusal, not a failed launch: EX_TEMPFAIL
+        # lets the dispatch re-offer the run instead of counting a failure against it.
+        try:
+            from hermes_cli import worktree_pool
+            from hermes_cli.worktree_ops import _git_repo_root
+            repo = _git_repo_root()
+            verdict = worktree_pool.last_refusal(repo) if repo else None
+        except Exception:
+            verdict = None
+        if verdict is not None:
+            from hermes_cli.turn_exit import TURN_NOT_ADMITTED_EXIT_CODE
+            print(f"✗ {worktree_pool.refusal_text(verdict)}", file=sys.stderr)
+            sys.exit(TURN_NOT_ADMITTED_EXIT_CODE)
         sys.exit(1)
     return wt_info
 
