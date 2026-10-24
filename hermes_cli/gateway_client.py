@@ -115,8 +115,9 @@ OWNER_COMING_UP_STATES = frozenset({"starting", "restarting"})
 # A dead pid alone proves nothing: a SIGKILLed gateway leaves the same file, so the claim is honoured
 # only while it is FRESH, and the bound is the admission budget — the window this class is already
 # measured in. A claim older than one budget cannot be covered by any run's remaining budget, so
-# crediting it past that point would only hold a dispatch for a restart that is not coming; a gateway
-# that died mid-claim costs a run no more than an absent owner already does (one budget, then death).
+# crediting it past that point would only hold a dispatch for a restart that is not coming. Worst case
+# is therefore exact rather than open-ended: a gateway that dies mid-claim holds a run one budget
+# longer than an absent owner would, and never past budget + ``RESTART_WAIT_GRACE_S``.
 RESTART_CLAIM_FRESH_S = GATEWAY_ADMISSION_BUDGET_S
 # A profile the multiplexer's ceiling has deferred (`profile_serving`) is re-observed this often.
 # Cheap — one control-socket ``identify`` — and well inside the reconcile interval the rank moves on.
