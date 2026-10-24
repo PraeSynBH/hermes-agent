@@ -53,7 +53,15 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   **That hold is bounded, not merely reported** (PRA-6925):
   once a scan finds a due slot waiting, the deferral ends within one cron inactivity watchdog
   (`hold_bound_seconds` — `HERMES_CRON_TIMEOUT`, default 600 s) instead of running out the
-  30 min `agent.restart_after_turn_timeout` cap, and the slot fires as a catch-up then. Measured
+  30 min `agent.restart_after_turn_timeout` cap, and the slot fires as a catch-up then. That
+  window re-arms while it is still productive (PRX-6173): an elapsed bound whose window RETIRED
+  work — the awaitable count fell across it — extends for another `hold_bound_seconds` instead of
+  handing the remainder to `stop()`/drain, because the release keeps admission closed and then
+  exits the process, so the slot is not served until the replacement listens (measured 127 s)
+  while the drain it releases into is launchd-clamped to 60 s and interrupted 12 of the 13 units
+  still running. A window that retires nothing still ends the wait where PRA-6925 put it, and the
+  after-turn cap bounds the total, so cron silence never exceeds the cap it already had;
+  `dispatch_hold_end` carries `cron_bound_extensions` when a hold was extended. Measured
   before it: four deferrals in 12 h, three holding 1–3 due slots for the full cap, every drain-done
   line recording `cron_at_start=0`. Reopening cron dispatch *during* the wait was rejected — a run
   started then is killed by the `stop()` the wait precedes (a permanent `jobs.json` failure), and
