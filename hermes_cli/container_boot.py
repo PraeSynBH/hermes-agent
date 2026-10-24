@@ -37,7 +37,9 @@ log = logging.getLogger(__name__)
 # stranded marker reads as the run-intent it actually represents. This mirrors gateway/run.py's #42675
 # handling, which persists `running` (not the mid-shutdown `draining`) when an unexpected signal tears the
 # gateway down — extended here to the case where the gateway died before it could persist anything at all.
-_TRANSIENT_RUNNING_STATES = frozenset({"draining", "degraded"})
+# `restarting` (SOU-3966) is the same class as `draining`: the outgoing owner's own claim that a
+# replacement is coming, so a gateway hard-killed mid-restart must not be read as an operator stop.
+_TRANSIENT_RUNNING_STATES = frozenset({"draining", "degraded", "restarting"})
 # Container-namespaced state is garbage post-restart (an equal PID is a different process).
 _STALE_RUNTIME_FILES = ("gateway.pid", "processes.json")
 
