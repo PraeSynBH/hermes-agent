@@ -16,6 +16,21 @@ GATEWAY_SERVICE_RESTART_EXIT_CODE = 75
 # See #51228.
 GATEWAY_FATAL_CONFIG_EXIT_CODE = 78
 
+# How long ``stop()`` may block waiting for the restart claim's durable write. One small JSON file
+# on the status writer's thread; past this bound it stays queued (and is then coalesced by the next
+# snapshot), so the stop proceeds either way.
+RESTART_CLAIM_WRITE_TIMEOUT_S = 2.0
+
+# The outgoing owner's claim for a restart window: published at ``stop()`` before the drain names
+# anything else, and kept on disk until a replacement publishes ``running`` (SOU-3966). It exists
+# because the window is otherwise unreadable — ``run_startup`` stamps ``gateway_state: starting``
+# with ``reload_existing=True``, so the inherited ``served_profiles``/``platforms``/
+# ``serving_decision`` survive into a process that is not serving yet, with a fresh ``updated_at``
+# and a new pid. Deliberately neither serving nor drainable (``status._DRAINABLE_GATEWAY_STATES``):
+# every reader already refuses anything that is not ``running``/``degraded``, so this lands with no
+# coordinated consumer change.
+RESTARTING_GATEWAY_STATE = "restarting"
+
 
 def map_fatal_config_exit_for_launchd(returncode: int) -> int:
     """Translate gateway EX_CONFIG so launchd can park the job.

@@ -26,6 +26,7 @@ import time
 from contextlib import suppress
 from typing import Any, Optional
 
+from gateway.restart import RESTART_CLAIM_WRITE_TIMEOUT_S
 from gateway.run_runtime import managed_turn_count
 
 # Log-record parity with the origin module.
@@ -123,6 +124,46 @@ class GatewayRestartWaitMixin:
 
     Bound onto ``GatewayShutdownMixin`` (and so onto ``GatewayRunner``) via the MRO.
     """
+
+    def _claim_restart_window(self) -> None:
+        """Publish ``gateway_state: restarting`` to DISK before the drain names anything else.
+
+        The window this names is the one between the after-turn hold releasing and the replacement
+        publishing ``running`` — measured 4m19s on 2026-10-24T05:44:36Z with no attributable owner.
+        Until this claim existed a reader of ``gateway_state.json`` had to infer the answer from
+        timestamps, and it cannot: the inherited record is re-stamped by the incoming boot
+        (``reload_existing=True``), so ``served_profiles``, ``platforms`` and ``serving_decision``
+        survive into a process that is not serving yet with a fresh ``updated_at`` and a new pid.
+        One name makes it one predicate (SOU-3966).
+
+        Called after ``_running``/``_draining`` flip, so the drain-control watcher's release path
+        (``_exit_external_drain`` reverts to ``_serving_state()`` unless ``_draining or not
+        _running``) cannot write ``running`` over the claim in between.
+
+        Durable on purpose, and awaited: every later write in the stop goes through the same single
+        status writer, so a merely-queued claim is coalesced away by the next snapshot and the drain
+        becomes the first thing on disk. A status write must never abort a shutdown, so a failure is
+        logged and the stop continues.
+        """
+        if getattr(self, "_startup_cleanup_only", False):
+            return  # a start that never ran keeps its startup verdict; it has no window to claim
+        try:
+            from gateway.restart import RESTARTING_GATEWAY_STATE
+            from gateway.status import write_runtime_status
+
+            landed = write_runtime_status(
+                gateway_state=RESTARTING_GATEWAY_STATE, restart_requested=True,
+                wait_timeout=RESTART_CLAIM_WRITE_TIMEOUT_S,
+            )
+        except Exception:  # health: allow BLE001 -- status is diagnostic; a stop must not raise here
+            logger.warning("Could not publish the restarting claim before the drain", exc_info=True)
+            return
+        if not landed:
+            logger.warning(
+                "The restarting claim did not reach disk within %.1fs of stop(); it stays queued and "
+                "the window may still read as the previous life's state",
+                RESTART_CLAIM_WRITE_TIMEOUT_S,
+            )
 
     def _wedged_agent_count(self) -> int:
         """Work units the restart wait may skip: chat agents idle past ``agent.gateway_timeout`` and
