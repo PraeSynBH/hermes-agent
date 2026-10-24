@@ -351,11 +351,27 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
     # because the pages it returns were usually freed by something else (an orphan GC) and deleting
     # session history stays opt-in. Both VACUUM paths share their admission inside SessionDB, and the
     # second call is throttled out by the ``last_vacuum`` the first one just wrote.
-    if not (_sess_cfg.get("auto_archive", False) or _sess_cfg.get("auto_prune", False)
-            or _sess_cfg.get("auto_vacuum", False)):
-        return
     _adb = acquire()
     try:
+        # Retention, not history deletion: reclaim gateway receipts past their exact-retry horizon
+        # (a settled admission result whose session was never retired, a retired tombstone, an
+        # orphan result). Deliberately BEFORE the auto_* gate below, which is about session
+        # HISTORY — with sessions.auto_prune off (the common setting) the arm used to return right
+        # here, so the tombstones and settled results were unreachable by every reclaim path and
+        # grew one row per turn for the life of the session (PRX-6167). Horizon-gated inside;
+        # the pass itself runs at most once per min_interval_hours per store.
+        try:
+            from hermes_state_mutation_retirement import prune_expired_receipts
+            _reaped = prune_expired_receipts(_adb)
+            if _reaped:
+                logger.info("state.db receipt reap: %d expired settled result(s) reclaimed from %s",
+                            _reaped, _adb.db_path)
+        except Exception:
+            # Retention is never worth a refused turn or a dead housekeeping arm.
+            logger.exception("state.db receipt reap failed for %s", _adb.db_path)
+        if not (_sess_cfg.get("auto_archive", False) or _sess_cfg.get("auto_prune", False)
+                or _sess_cfg.get("auto_vacuum", False)):
+            return
         if _sess_cfg.get("auto_archive", False):
             _adb.maybe_auto_archive(
                 idle_days=float(_sess_cfg.get("auto_archive_days", 3)),

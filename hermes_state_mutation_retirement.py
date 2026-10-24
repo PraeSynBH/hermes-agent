@@ -400,7 +400,120 @@ def fence_shared_routes(conn, namespace, session_ids, *, expiring=()):
 
 
 RETRY_HORIZON_S = 7 * 86400  # exact-retry horizon: a retry within it gets the byte-exact settled reply
+# A settled result's TRANSCRIPT copy (this turn's messages, reasoning, tool payloads) outlives its
+# usefulness by minutes: delivery, a duplicate settlement and a restart's receipt recovery all read
+# it within seconds, and the transcript itself is the durable record of the same text. Measured on
+# this host's stores, dropping it is 200x: 65.4 MB of result rows -> 0.32 MB, the reply kept.
+# The REPLY and the receipt survive the full RETRY_HORIZON_S; only its copy of the turn goes.
+SETTLED_RESULT_COMPACT_S = 600
 _EXPIRED = "json_valid(value) AND json_extract(value, '$.retired_at') < ?"
+# The same age test for a RESULT row, whose value is not guaranteed to be valid JSON at all (a
+# real store here holds a truncated one). ``json_valid(value) AND json_extract(...)`` is not a
+# guard: SQLite may evaluate the call first and raise `malformed JSON` — the reason
+# ROUTE_RETIRED_SQL puts every JSON read in a CASE. A row that fails json_valid is skipped, never
+# aborted on.
+_EXPIRED_ROW = ("CASE WHEN json_valid(value) THEN "
+                "CASE WHEN json_extract(value, '$.retired_at') < ? THEN 1 ELSE 0 END ELSE 0 END")
+# Last receipt reap, per store: the retention pass is cheap but not per-60s-tick cheap.
+RECEIPT_REAP_MARKER = 'gateway.receipt_reap.v1'
+# A result row still carrying a transcript copy (`_TRANSCRIPT_FIELDS` in its result). Path-taking
+# JSON functions only: ``json_extract`` returns a bare SQL text for a non-container path and
+# ``json_array_length`` then RAISES ``malformed JSON`` on it — a real store here hits that.
+_CARRIES_TRANSCRIPT = ("coalesce(json_array_length(value, '$.result.messages'), 0) > 0 "
+                       "OR json_type(value, '$.result.last_reasoning') IS NOT NULL "
+                       "OR json_type(value, '$.result.tools') IS NOT NULL "
+                       "OR json_type(value, '$.result._turn_user_row') IS NOT NULL")
+
+
+def _prune_settled_results(conn, cutoff, *, now, compact_before):
+    """Reap settled admission results whose exact-retry horizon passed, beside AND apart from
+    their admission row — and compact the transcript copy of the ones that are merely spent.
+    Returns how many result rows went.
+
+    The other branches here reach a result only through its session's RETIREMENT:
+    ``retire_terminal_receipts`` tombstones a deleted session's admissions, and the tombstone
+    branch carries the paired result out. A session that is never retired (``sessions.auto_prune``
+    off is the common setting, and true on this host) therefore exposes no settled result to any
+    delete path, and they accumulate one per turn for the life of the session — the leak behind
+    PRX-6167. Reachability is NOT the discriminator: those rows resolve fine (their admission is a
+    terminal row in this store's own ledger), so what has to change is the retention rule, not
+    "delete every result in a store whose admissions are absent". Both shapes are handled here, on
+    one clock — the result row's own ``retired_at``, stamped on first sight (a bounded grace: a row
+    written just before this pass ages from it):
+
+      * spent (``compact_before``): the transcript copy goes, in place, through the same
+        ``_compact_result`` a retired session's receipt gets. Every reader still resolves the
+        reply, so this is where the bytes are, with no reader-visible change beyond the fields
+        retirement already drops.
+      * past ``cutoff``: the result and its terminal ledger row go together. A result-less
+        terminal row is worse than nothing — ``_settled_api_result`` raises ``unknown_execution``
+        and the Bot receipt path reads ``completed`` without a result as ambiguous — while
+        forgetting the PAIR degrades exactly like a reaped tombstone's, which is this same
+        horizon's documented behaviour.
+      * an orphan whose admission row is absent from this store entirely: unreadable by
+        construction, since every reader (``finish_result``, ``admission_result``, ``_admission``)
+        resolves the admission row first. Compacting it is pointless, so it is reaped on the same
+        clock as the rest.
+
+    Never touched: a queued/started/unknown admission's row (no settled result exists for one, so
+    this cannot reach a live turn), a result whose admission TOMBSTONE is in this store (the
+    tombstone branch owns that pair and its own, later clock), and every row in another store —
+    this never issues a store-blind prefix DELETE.
+    """
+    from hermes_state_terminal import ADMISSION_PREFIX, RESULT_PREFIX
+    conn.execute("UPDATE state_meta SET value=json_set(value, '$.retired_at', ?) WHERE key GLOB ? "
+                 "AND CASE WHEN json_valid(value) THEN "
+                 "json_extract(value, '$.retired_at') IS NULL ELSE 0 END",
+                 (now, RESULT_PREFIX + '*'))
+    for (key,) in conn.execute(
+            f"SELECT key FROM state_meta WHERE key GLOB ? AND CASE WHEN json_valid(value) THEN "
+            f"CASE WHEN json_extract(value, '$.retired_at') < ? THEN ({_CARRIES_TRANSCRIPT}) "
+            f"ELSE 0 END ELSE 0 END",
+            (RESULT_PREFIX + '*', compact_before)).fetchall():
+        _compact_result(conn, key[len(RESULT_PREFIX):])
+    reaped = 0
+    for (key,) in conn.execute(
+            f'SELECT key FROM state_meta WHERE key GLOB ? AND {_EXPIRED_ROW}',
+            (RESULT_PREFIX + '*', cutoff)).fetchall():
+        admission_id = key[len(RESULT_PREFIX):]
+        if conn.execute('SELECT 1 FROM state_meta WHERE key=?',
+                        (ADMISSION_PREFIX + admission_id,)).fetchone():
+            continue  # a retired session's pair: the tombstone branch above owns its clock
+        row = conn.execute('SELECT status FROM session_admissions WHERE admission_id=?',
+                           (admission_id,)).fetchone()
+        if row is not None and row[0] != 'terminal':
+            continue  # a live turn's row is not a receipt to reclaim, whatever its stamp says
+        conn.execute('DELETE FROM state_meta WHERE key=?', (key,))
+        if row is not None:
+            conn.execute('DELETE FROM session_admissions WHERE admission_id=?', (admission_id,))
+        reaped += 1
+    return reaped
+
+
+def prune_expired_receipts(db, *, min_interval_hours=1, older_than=RETRY_HORIZON_S):
+    """Reap retention-expired gateway receipts in *db*'s store, at most once per interval.
+
+    The gateway's maintenance arm (:func:`_housekeeping_state_db_maintenance`) returns early
+    unless ``sessions.auto_prune``/``auto_archive``/``auto_vacuum`` is on — none of which is
+    about receipts — so :func:`prune_retired_tombstones` was unreachable on a host that keeps
+    session history (this one), and both the settled results of live sessions and every retired
+    tombstone accumulated forever. This is the entry point that arm calls unconditionally; the
+    horizons are unchanged (SETTLED_RESULT_COMPACT_S, then RETRY_HORIZON_S) and nothing inside
+    them is touched.
+    """
+    def write(conn):
+        now = time.time()
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (RECEIPT_REAP_MARKER,)).fetchone()
+        try:
+            last = float(json.loads(saved[0]).get('at') or 0) if saved else 0.0
+        except (TypeError, ValueError, AttributeError):
+            last = 0.0
+        if now - last < min_interval_hours * 3600:
+            return 0
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                     (RECEIPT_REAP_MARKER, json.dumps({'at': now})))
+        return prune_retired_tombstones(conn, older_than=older_than)
+    return db._execute_write(write)
 
 
 def _reclaim_expired(conn, prefix, cutoff):
@@ -409,13 +522,15 @@ def _reclaim_expired(conn, prefix, cutoff):
                  (prefix + '*', cutoff))
 
 
-def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S):
+def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S, *, compact_older_than=SETTLED_RESULT_COMPACT_S):
     """Reclaim deletion tombstones retired more than *older_than* seconds ago: the terminal admission
     with its identity pointer and compacted result, terminal workers and a sweep's (``expires``)
     retired-session marker or shared routing fence. A user delete's marker is the deletion fence itself and is never
     reclaimed: it holds only ``retired_at``, and without it a deleted id could be recreated,
     re-admitted or reissued as a Bot Chat generation.
-    Tombstones written before ``retired_at`` existed are stamped now and age from this pass."""
+    Tombstones written before ``retired_at`` existed are stamped now and age from this pass.
+    Also reaps settled results that no tombstone covers (a live session's, or an orphan's):
+    :func:`_prune_settled_results`. Returns how many of those result rows went."""
     from hermes_state_terminal import ADMISSION_PREFIX, RESULT_PREFIX, WORKER_PREFIX, identity_key
     prefixes = (ADMISSION_PREFIX, WORKER_PREFIX)
     now = time.time()
@@ -431,3 +546,4 @@ def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S):
     conn.execute(f'DELETE FROM state_meta WHERE key GLOB ? AND {_EXPIRED}', (WORKER_PREFIX + '*', cutoff))
     for prefix in (RETIRED_PREFIX, ROUTE_FENCE_PREFIX):
         _reclaim_expired(conn, prefix, cutoff)
+    return _prune_settled_results(conn, cutoff, now=now, compact_before=now - compact_older_than)
