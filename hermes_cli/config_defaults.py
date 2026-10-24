@@ -491,6 +491,8 @@ DEFAULT_CONFIG = {
         # Optional size budget (GB) for idle trees: past it the oldest idle trees are archived and
         # removed first. Live, young and Kanban trees are never counted or touched. 0 = off.
         "max_total_gb": 0,
+        "max_linked": 0,               # admission cap: linked trees per repo, 0 = no cap (worktree_pool)
+        "reclaim_before_admit": True,  # at the cap, one archive-first reclaim pass before refusing
     },
     # Filesystem checkpoints: snapshot the working directory once per turn (on the first
     # write_file/patch call); restore with /rollback. Opt-in via `hermes chat --checkpoints` or

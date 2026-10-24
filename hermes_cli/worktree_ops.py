@@ -427,6 +427,8 @@ def _setup_worktree(repo_root: str | None = None, sync_base: bool = True,
     reaped clean tree is recreated on resume instead.
 
     Set ``worktree_sync: false`` in config to branch from local ``HEAD`` (the pre-#10760-followup behavior).
+    ``worktrees.max_linked`` (0 = off) bounds the repo's population here: at the cap one archive-first
+    reclaim pass runs and, if it frees nothing, the creation is refused instead of adding a tree.
     """
     repo_root = repo_root or _git_repo_root()
     if not repo_root:
@@ -439,12 +441,22 @@ def _setup_worktree(repo_root: str | None = None, sync_base: bool = True,
     branch_name = f"hermes/{wt_name}"
 
     worktrees_dir = Path(repo_root) / ".worktrees"
-    worktrees_dir.mkdir(parents=True, exist_ok=True)
     wt_path = worktrees_dir / wt_name
     if name and wt_path.exists():
         _cprint(f"\033[31m✗ Worktree already exists: {wt_path}\033[0m")
         print(f"  Pick a different name, or remove it with: git worktree remove {wt_path}")
         return None
+
+    # Bound the population at the moment a tree is born (``worktrees.max_linked``): count this
+    # repo's linked worktrees, recycle idle ones, refuse past the cap. Unbounded by default, and
+    # then this neither shells out nor changes a byte of the output.
+    from hermes_cli import worktree_pool
+    admission = worktree_pool.admit(repo_root)
+    if not admission.allowed:
+        _cprint(f"\033[31m✗ Worktree not created: {worktree_pool.refusal_text(admission)}\033[0m")
+        return None
+
+    worktrees_dir.mkdir(parents=True, exist_ok=True)
 
     _ensure_worktrees_gitignored(repo_root)
 
@@ -470,7 +482,9 @@ def _setup_worktree(repo_root: str | None = None, sync_base: bool = True,
     if retain_db is not None:  # a -w tree: a resume may recreate it once quit removed it (N8)
         from hermes_cli.tui_worktree_resume import record_tui_worktree
         record_tui_worktree({"path": str(wt_path), "branch": branch_name, "repo_root": repo_root})
-    _cprint(f"\033[32m✓ Worktree created:\033[0m {wt_path}")
+    population = worktree_pool.note_created(repo_root, admission.count) if admission.measured else 0
+    _cprint(f"\033[32m✓ Worktree created:\033[0m {wt_path}"
+            + (f" ({population}/{admission.cap} in this repo)" if admission.measured else ""))
     print(f"  Branch: {branch_name}")
     print(f"  Base:   {base_label}")
     return {"path": str(wt_path), "branch": branch_name, "repo_root": repo_root, "base": base_ref}

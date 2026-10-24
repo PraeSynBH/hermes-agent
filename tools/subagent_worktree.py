@@ -82,6 +82,14 @@ def create_subagent_worktree(parent_cwd: Optional[str], subagent_id: Optional[st
     wt_name = f"subagent-{(subagent_id or uuid.uuid4().hex[:8]).replace('/', '-')}"
     branch = f"hermes-subagent/{wt_name}"
     wt_path = Path(repo_root) / ".worktrees" / wt_name
+    # Bound the population at admission (``worktrees.max_linked``) exactly as ``hermes -w`` does;
+    # a refused subagent tree degrades to the shared parent cwd rather than starving the child.
+    from hermes_cli import worktree_pool
+    admission = worktree_pool.admit(repo_root)
+    if not admission.allowed:
+        logger.warning("subagent worktree: %s — running this child without isolation",
+                       worktree_pool.refusal_text(admission))
+        return None
     try:
         wt_path.parent.mkdir(parents=True, exist_ok=True)
         _ensure_gitignore_entry(repo_root)
@@ -102,6 +110,8 @@ def create_subagent_worktree(parent_cwd: Optional[str], subagent_id: Optional[st
         logger.warning("subagent worktree: git worktree add failed: %s", result.stderr.strip())
         return None
     logger.info("subagent worktree created: %s (branch %s)", wt_path, branch)
+    if admission.measured:  # keep the per-process count current across a batch of children
+        worktree_pool.note_created(repo_root, admission.count)
     from hermes_cli.worktree_registry import record_worktree_repo
     record_worktree_repo(repo_root)
     return {"path": str(wt_path), "branch": branch, "repo_root": repo_root, "base_commit": base_commit}
