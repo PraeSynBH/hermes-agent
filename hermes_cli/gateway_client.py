@@ -80,6 +80,23 @@ BOOT_POLL_INTERVAL_S = 1.0
 # has new work to place. That owner answers identify in milliseconds and its drain is bounded by its
 # own cap, so a drain shorter than a second costs a wake-up rather than a run (PRX-5791).
 DRAIN_POLL_INTERVAL_S = 1.0
+# An owner that is REPLACING itself accepts this run's socket before it can serve it, and nothing
+# re-observed that window from the in-band verbs. 2026-10-24: the new process started at
+# 05:44:33.955Z, its control socket listened at 05:45:22.916Z and it published ``running`` at
+# 05:46:45.358Z; six runs dispatched at 05:44:36Z minted a ticket inside that window, sat in
+# ``session.create`` and died at their 120 s budget at 05:46:48-51Z — seconds before the owner could
+# have served them (SOU-3958/3960). ``admit_owner`` re-observes a BOOTING owner (``runtime-boot``)
+# and a restart's after-turn wait (``runtime-drain``) only; the in-band verbs had one RPC and one
+# deadline. Sample the owner's own readiness at the boot cadence while an admission verb is pending,
+# and hand the seconds it spends coming up back to the deadline. Same cadence and same cost as the
+# boot poll: one small read of the home's published state.
+RESTART_POLL_INTERVAL_S = BOOT_POLL_INTERVAL_S
+# The ceiling on that gift. Measured restart (2026-10-24): 131 s of ``starting`` for the replacing
+# owner and 259 s door-to-door from the old owner's ``stop()``; 300 s admits a run dispatched
+# anywhere inside the whole observed window. It is a CEILING, not a switch: an owner that never
+# serves still fails, `budget + this` later, and one that is merely WEDGED (alive, publishing
+# ``running``, answering nothing) earns not a single second of it.
+RESTART_WAIT_GRACE_S = 300.0
 # A profile the multiplexer's ceiling has deferred (`profile_serving`) is re-observed this often.
 # Cheap — one control-socket ``identify`` — and well inside the reconcile interval the rank moves on.
 PROFILE_SERVE_POLL_INTERVAL_S = 5.0
@@ -335,6 +352,97 @@ def admission_stall_evidence(homes) -> str | None:
     return ", ".join(parts) or None
 
 
+def restart_watch_homes(endpoint, home) -> list[Path]:
+    """Homes whose owner publishes readiness for THIS run, most specific first.
+
+    The multiplexer is ONE process: it publishes ``gateway_state.json`` in the home it was LAUNCHED
+    on (the default profile / install root), not in each profile it serves, so the client's own
+    home alone cannot see a restart on a named profile. ``window_fence_homes`` is the same set the
+    restart fence reads, for the same reason (this profile, the launch profile, the install root);
+    a standalone owner's ticket names its control home, which comes first.
+    """
+    from hermes_cli.gateway_restart_window import window_fence_homes
+
+    control = getattr(endpoint, "control_home", None) if endpoint is not None else None
+    return list(dict.fromkeys(Path(h) for h in (control, home, *window_fence_homes()) if h))
+
+
+def owner_serving_state(homes) -> str | None:
+    """``"starting"`` while a LIVE owner on one of *homes* is still coming up, else ``None``.
+
+    The owner publishes its own readiness into ``<home>/gateway_state.json``: ``starting`` from the
+    moment it claims the home until every enabled platform is connected (``run_startup`` stamps
+    ``running``/``degraded`` only after that). That is the one signal that separates a restart
+    window from a stalled loop without asking the owner a question it cannot answer yet — on this
+    host the control socket listens 83 s before the platforms are ready, so ``identify`` answers
+    "alive" for the whole window in which ``session.create`` cannot complete.
+
+    A home with no live record falls back to the lock reservation (``missing_owner_state``): a
+    claimed-but-unpublished owner is the launch -> socket half of the same window. Nothing is ever
+    inferred from an absent or dead owner — a stale record from a previous life must not credit a
+    run, or a host whose gateway is gone would hold every dispatch for the whole grace.
+    """
+    from gateway.status import read_runtime_status, runtime_status_pid_is_live
+    from hermes_cli.gateway_runtime_discovery import missing_owner_state
+
+    for candidate in homes:
+        home = Path(candidate)
+        try:
+            record = read_runtime_status(home / "gateway_state.json")
+            if isinstance(record, dict) and runtime_status_pid_is_live(record):
+                if record.get("gateway_state") == "starting":
+                    return "starting"
+                continue  # a live owner that says it is serving: no credit from this home
+            if missing_owner_state(home) == "starting":
+                return "starting"
+        except (OSError, RuntimeError, ValueError):
+            continue  # a probe must never be the reason a run dies at admission
+    return None
+
+
+class _RestartWatch:
+    """The owner's readiness, sampled while ONE admission verb is pending.
+
+    Started and stopped by ``GatewayClient._await_admission`` rather than run as a background
+    ticker: the client's context outlives admission by a whole agent turn, and a per-second probe
+    for that long is a cost this fix does not need. ``starting_s`` is how much of the wait the owner
+    spent saying it was not serving yet; the waiter hands exactly that back to the deadline.
+    """
+
+    def __init__(self, homes, *, interval=None):
+        self._homes = list(homes or ())
+        self._interval = RESTART_POLL_INTERVAL_S if interval is None else interval
+        self.starting_s = 0.0
+        self.seen = None  # the owner's own word at the last sample, for the death text
+        self._task = None
+
+    async def _poll(self):
+        sampled_at = time.monotonic()
+        while True:
+            try:
+                state = await asyncio.to_thread(owner_serving_state, self._homes)
+            except (OSError, RuntimeError, ValueError):
+                state = None
+            now = time.monotonic()
+            if state == "starting":
+                self.starting_s += now - sampled_at
+                self.seen = "starting"
+            sampled_at = now
+            await asyncio.sleep(self._interval)
+
+    def start(self):
+        if self._homes:
+            self._task = asyncio.create_task(self._poll())
+        return self
+
+    async def stop(self):
+        if self._task is None:
+            return
+        self._task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self._task
+        self._task = None
+
 
 class _AdmissionBudget(float):
     """A wait bounded by the run's ONE admission budget — and knows it.
@@ -569,7 +677,7 @@ def put_behind(events, item):
 
 class GatewayClient:
     def __init__(self, websocket, *, admission_deadline=None, admission_started=None,
-                 admission_budget=None, code_sha=None):
+                 admission_budget=None, code_sha=None, restart_homes=None):
         self.websocket = websocket
         self.events = EventQueue(maxsize=4096)
         self.pending = {}
@@ -583,6 +691,15 @@ class GatewayClient:
         self.admission_started = admission_started
         self.admission_budget = admission_budget
         self.code_sha = code_sha
+        # Homes whose owner publishes readiness while an admission verb waits
+        # (``restart_watch_homes``); empty on a peer with no home (a test double, an embedded
+        # server), where admission waits are simply bounded as before.
+        self.restart_homes = list(restart_homes or ())
+        # Seconds of ``starting`` observed and seconds actually handed back to the deadline: the
+        # distinction is what the death text reports (an owner that never served at all vs one
+        # whose whole grace went into coming up).
+        self.restart_seen_s = 0.0
+        self.restart_credit_s = 0.0
 
     def _read_on(self):
         """Keep reading past a full queue: nothing is held, or an awaited answer may sit behind the
@@ -652,6 +769,8 @@ class GatewayClient:
         try:
             await self.websocket.send(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
             budget = DEFAULT_RPC_TIMEOUT if _timeout is None else _timeout
+            if isinstance(budget, _AdmissionBudget):
+                return await self._await_admission(future, budget)
             return await asyncio.wait_for(future, None if budget == float("inf") else budget)
         except TimeoutError as exc:
             # Only a wait this run bounded with its admission budget is starvation. A mid-run RPC
@@ -660,15 +779,73 @@ class GatewayClient:
             # code would tell the retry chain to abandon a run that only needs to be retried.
             if not isinstance(_timeout, _AdmissionBudget):
                 raise
-            started = self.admission_started if self.admission_started is not None else time.monotonic()
-            raise GatewayAdmissionTimeout(
-                f"Gateway connection failed; no local fallback (phase=session, "
-                f"elapsed={time.monotonic() - started:.1f}s, TimeoutError: {exc})",
-                phase="session", elapsed=time.monotonic() - started,
-                budget=self.admission_budget if self.admission_budget is not None else GATEWAY_ADMISSION_BUDGET_S,
-                code_sha=self.code_sha) from exc
+            raise self._admission_death() from exc
         finally:
             self.pending.pop(rid, None)
+
+    async def _await_admission(self, future, budget):
+        """Await one admission-bounded answer, giving back the seconds the owner was still coming up.
+
+        A single ``wait_for`` over the whole remaining budget is what made the 2026-10-24 restart
+        six dead runs: the owner was booting for 131 s of that wait and the only thing the client
+        could do at the deadline was die. Instead the wait is RE-ARMED — the same request, never
+        resent — with the deadline wound forward by the time the owner itself reported ``starting``,
+        bounded by ``RESTART_WAIT_GRACE_S`` in total. Every case that is not a restarting owner is
+        unchanged: a wedged owner (alive, publishing ``running``, answering nothing) earns no credit
+        and fails at the budget, and so does an owner that is simply gone.
+        """
+        remaining = None if budget == float("inf") else float(budget)
+        while True:
+            watch = _RestartWatch(self.restart_homes).start()
+            try:
+                done, _pending = await asyncio.wait({future}, timeout=remaining)
+            finally:
+                await watch.stop()
+            if done:
+                return future.result()
+            credit = self._take_restart_credit(watch.starting_s)
+            if credit <= 0.0:
+                raise self._admission_death(watch.seen)
+            # The owner said it was not serving yet for `credit` seconds; this request gets exactly
+            # those seconds back. ``admission_deadline`` also governs the verbs that follow
+            # (``runtime.describe`` -> ``session.create``/``session.resume``), so they inherit it.
+            if self.admission_deadline is not None:
+                self.admission_deadline += credit
+            remaining = credit
+
+    def _take_restart_credit(self, witnessed):
+        """Seconds of the last wait to hand back to the deadline: never more than the grace has left.
+
+        ``witnessed`` is what the owner reported, ``returned`` what the budget can still afford. An
+        alternating owner (``starting`` one sample, serving the next) is charged only for its
+        starting seconds, and the grace still bounds the total — so the loop terminates on any host.
+        """
+        if witnessed <= 0.0:
+            return 0.0
+        self.restart_seen_s += witnessed
+        credit = min(witnessed, max(0.0, RESTART_WAIT_GRACE_S - self.restart_credit_s))
+        self.restart_credit_s += credit
+        return credit
+
+    def _admission_death(self, last_state=None):
+        """The ``GatewayAdmissionTimeout`` for this run, naming a restart when that is what held it.
+
+        The run log line is the only place a death at admission is read from, and the detector
+        classifies this signature by what it says (``restart_window`` keys on the restart, not on
+        the phase), so the restart has to be in the words the run dies with.
+        """
+        started = self.admission_started if self.admission_started is not None else time.monotonic()
+        elapsed = time.monotonic() - started
+        held_by = ""
+        if self.restart_seen_s > 0.0:
+            held_by = (f", the owner was still restarting (gateway_state={last_state or 'starting'}) "
+                       f"after {self.restart_credit_s:g}s of restart grace")
+        return GatewayAdmissionTimeout(
+            f"Gateway connection failed; no local fallback (phase=session, elapsed={elapsed:.1f}s, "
+            f"TimeoutError: the in-band admission verb expired{held_by})",
+            phase="session", elapsed=elapsed,
+            budget=self.admission_budget if self.admission_budget is not None else GATEWAY_ADMISSION_BUDGET_S,
+            code_sha=self.code_sha)
 
 
 def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None, subject=None,
@@ -976,8 +1153,13 @@ async def connect_gateway(endpoint=None, subject=None, *, new_work=False):
             if protocols and ws.subprotocol != GATEWAY_WS_PROTOCOL:
                 raise GatewayClientError("Gateway protocol mismatch; update/restart required")
             phase = "session"
+            # The in-band verbs are the phase that had no re-observation at all: a restarted owner
+            # accepts the socket before it can serve it, and one RPC expiring at the deadline was
+            # the verdict (SOU-3960). Give the client the homes whose owner publishes readiness so
+            # a wait against an owner that is still `starting` is wound, not lost.
             async with GatewayClient(ws, admission_deadline=deadline, admission_started=started,
-                                     admission_budget=budget, code_sha=owner_sha) as client:
+                                     admission_budget=budget, code_sha=owner_sha,
+                                     restart_homes=restart_watch_homes(endpoint, home)) as client:
                 # From here on, errors from the caller's body are NOT admission errors unless the
                 # wait that produced them was admission-bounded (``GatewayClient.rpc`` raises
                 # ``GatewayAdmissionTimeout`` for those itself). A run 200 s into its turn is
