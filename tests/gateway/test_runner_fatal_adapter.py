@@ -1,11 +1,12 @@
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent
+from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 
@@ -310,3 +311,99 @@ async def test_default_exit_policy_keeps_service_restart_verdict_on_stranded_ret
 
     runner.stop.assert_awaited()
     assert runner._exit_with_failure is True
+
+
+# ── SOU-4217: on_all_adapters_down=stay_alive must bind the NON-retryable path too ──────────────
+# The policy is the operator's "a messaging transport never takes the process down". It was honoured
+# only for retryable failures, so one logged-out optional platform (whatsapp as the sole enabled
+# platform) exited 78 at startup and put the whole multiplexed gateway into a 361 s launchd restart
+# loop for 3.96 h — every `hermes` run refused `adapter_failed / gateway draining: not_ready` while
+# cron and local agent ingress needed no messaging platform at all.
+
+_LOGGED_OUT_WHATSAPP = "WhatsApp session is logged out (scan the QR code again)"
+_LOGGED_OUT_WHATSAPP_ERROR = f"whatsapp: {_LOGGED_OUT_WHATSAPP}"
+
+
+def _sole_whatsapp_config(tmp_path, policy: str) -> GatewayConfig:
+    return GatewayConfig(
+        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True, token="token")},
+        sessions_dir=tmp_path / "sessions",
+        on_all_adapters_down=policy,
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_stay_alive_parks_a_sole_non_retryable_platform_instead_of_exiting_78(
+    tmp_path, monkeypatch,
+):
+    """SOU-4217: a sole non-retryable platform failure must not exit 78 under stay_alive."""
+    writes: list[dict] = []
+    monkeypatch.setattr("gateway.run._write_runtime_status_quiet", lambda **kw: writes.append(kw))
+    config = _sole_whatsapp_config(tmp_path, "stay_alive")
+    runner = GatewayRunner(config)
+    runner._request_clean_exit = MagicMock()
+
+    retryable: list[str] = []
+    nonretryable: list[str] = []
+    adapter = _RuntimeRetryableAdapter()
+    adapter._set_fatal_error("whatsapp_logged_out", _LOGGED_OUT_WHATSAPP, retryable=False)
+    connected = await runner._start_aggregate_connect_results(
+        [(Platform.WHATSAPP, adapter, config.platforms[Platform.WHATSAPP], "failed", None)],
+        retryable, nonretryable,
+    )
+    assert connected == 0
+    assert retryable == []
+    assert nonretryable == [_LOGGED_OUT_WHATSAPP_ERROR]
+
+    must_exit = runner._start_handle_no_connections(connected, 1, retryable, nonretryable)
+
+    assert must_exit is False, "one optional transport must not take the whole gateway down"
+    runner._request_clean_exit.assert_not_called()
+    assert runner._exit_code is None
+    # The platform itself is parked fatal and visible, not silently healthy.
+    assert any(
+        w.get("platform") == "whatsapp" and w.get("platform_state") == "fatal" for w in writes
+    ), writes
+    # The run reports degraded, so no dispatcher reads it as a green gateway.
+    assert runner._startup_parked_platforms is True
+    assert runner._serving_state() == "degraded"
+    assert {"gateway_state": "degraded", "exit_reason": None} in writes
+
+
+def test_startup_exit_policy_still_exits_78_on_a_sole_non_retryable_platform(tmp_path, monkeypatch):
+    """The default policy keeps the pre-SOU-4217 contract: exit 78 so the supervisor restarts."""
+    writes: list[dict] = []
+    monkeypatch.setattr("gateway.run._write_runtime_status_quiet", lambda **kw: writes.append(kw))
+    config = _sole_whatsapp_config(tmp_path, "exit")
+    runner = GatewayRunner(config)
+
+    must_exit = runner._start_handle_no_connections(0, 1, [], [_LOGGED_OUT_WHATSAPP_ERROR])
+
+    assert must_exit is True
+    assert runner._exit_code == GATEWAY_FATAL_CONFIG_EXIT_CODE
+    assert writes == [{"gateway_state": "startup_failed", "exit_reason": _LOGGED_OUT_WHATSAPP_ERROR}]
+    assert runner._startup_parked_platforms is False
+
+
+@pytest.mark.asyncio
+async def test_stay_alive_policy_parks_a_stranded_nonretryable_fatal_instead_of_stopping(
+    tmp_path, monkeypatch,
+):
+    """SOU-4217 runtime half: a non-retryable fatal on the last adapter stays up when the policy
+    says stay_alive. It has no reconnect path, so the run is stamped degraded instead."""
+    writes: list[dict] = []
+    monkeypatch.setattr("gateway.run._write_runtime_status_quiet", lambda **kw: writes.append(kw))
+    config = GatewayConfig(sessions_dir=tmp_path / "sessions", on_all_adapters_down="stay_alive")
+    runner = GatewayRunner(config)
+    adapter = _RuntimeRetryableAdapter()
+    adapter._set_fatal_error("whatsapp_logged_out", _LOGGED_OUT_WHATSAPP, retryable=False)
+    runner.adapters = {Platform.WHATSAPP: adapter}
+    runner.delivery_router.adapters = runner.adapters
+    runner.stop = AsyncMock()
+
+    await runner._handle_adapter_fatal_error(adapter)
+
+    runner.stop.assert_not_awaited()
+    assert runner._exit_with_failure is False
+    assert runner._startup_parked_platforms is True
+    assert {"gateway_state": "degraded", "exit_reason": None} in writes
