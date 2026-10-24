@@ -2266,12 +2266,12 @@ DEFAULT_CONFIG = {
         # List delegate_task subagent runs in session lists (desktop sidebar, dashboard, session.list),
         # nested under their parent. Off by default: they are machinery, not conversations.
         "show_subagents": False,
-        # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE). VACUUM
-        # blocks writes (~seconds per 100MB), so it runs only at startup, only when ≥1 session was
-        # deleted AND freelist/page_count > 25%.
-        # SQLite does not reclaim disk space on DELETE — freed pages are just reused on subsequent INSERTs —
-        # so without VACUUM the file stays bloated even after pruning. See #54189.
+        # VACUUM after a prune that deleted rows: startup only, ≥1 deleted, freelist > 25% (#54189 —
+        # SQLite reuses freed pages but never shrinks the file; the rewrite blocks writes).
         "vacuum_after_prune": True,
+        # VACUUM even when nothing was pruned — the reclaim path for pages an orphan GC or a manual
+        # delete freed. Off by default (a full rewrite); independent of auto_prune; same gates above.
+        "auto_vacuum": False,
         # Minimum days between VACUUM rewrites; pruning keeps its normal cadence.
         "min_vacuum_interval_days": 30,
         # Minimum hours between auto-maintenance runs (tracked in state.db state_meta, shared across
