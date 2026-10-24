@@ -4,8 +4,10 @@ The tick was measured at 1 138 ms with every loop-thread sample inside it idle i
 loop was waiting on the worker, so the work — not the loop — had to be named. Warm, that work is
 tiny (a signature pass over 17 homes is ~0.3 ms, the demand refresh and served enumeration are tens
 of milliseconds), while each ``asyncio.to_thread`` is a hop onto the executor every turn shares. So
-the invariants here are (a) each half records its own tick-timing counter, and (b) the served half
-is ONE hop — the three reads a cycle needs ride in one call, in dependency order.
+the invariants here are (a) each half records its own tick-timing counter, (b) the read pass is ONE
+call carrying the three reads a cycle needs in dependency order, and (c) the WHOLE tick is one
+poll-lane hop — both halves ride one lane slot, and the counters decompose it instead of inferring
+it (``hop - hooks - read`` is the lane wait; round 4 measured the hook half's p50 as all hop).
 """
 import asyncio
 import inspect
@@ -136,6 +138,97 @@ async def test_the_read_half_rides_the_poll_lane_not_the_shared_default_executor
 
     assert lanes == ["_live_profiles_snapshot", "_resync_changed_hook_consent"], lanes
     assert shared == [], f"the tick went back to the shared default executor: {shared!r}"
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_tick_takes_one_poll_lane_hop_for_both_halves(tmp_path, monkeypatch):
+    """Both halves ride ONE lane slot, and the counters say which body the hop carried.
+
+    The tick used to submit the hook sync and the read pass as two hops awaited in order, on a
+    2-worker lane every other poller shares. Measured on the live host the hook half's whole p50
+    (53 ms) was that hop for two ``stat`` per home, so the second hop was pure queue. One hop is
+    also one lane slot, whatever N is (PRA-6794).
+    """
+    _home, _profile, homes = _two_served(tmp_path)
+    runner = _runner(tmp_path, monkeypatch, homes=homes)
+
+    lanes = []
+
+    async def poll_lane(func, *args):
+        lanes.append(getattr(func, "__name__", repr(func)))
+        return await asyncio.get_running_loop().run_in_executor(None, func, *args)
+
+    runner._run_poll_in_executor = poll_lane
+    loop_tick_timing.reset()
+    watcher = asyncio.create_task(runner._profile_reconcile_watcher(interval=0.05))
+    try:
+        await async_wait_until(lambda: loop_tick_timing.snapshot().get("profile_reconcile", {})
+                               .get("count", 0) >= 2, timeout=10, what="two watcher ticks")
+    finally:
+        runner._running = False
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+
+    snapshot = loop_tick_timing.snapshot()
+    try:
+        ticks = snapshot["profile_reconcile"]["count"]
+        assert ticks >= 2
+        assert set(lanes) == {"_tick_off_loop"}, f"the tick hopped more than once: {lanes!r}"
+        assert len(lanes) == ticks, f"{len(lanes)} hops for {ticks} ticks"
+        assert snapshot["profile_reconcile_hop"]["count"] == ticks
+        # The bodies are timed inside the one hop they ride, so neither can outlast it, and the
+        # loop-side apply plus the hop together stay inside the tick that contains them.
+        assert snapshot["profile_reconcile_hooks"]["max_s"] <= snapshot["profile_reconcile_hop"]["max_s"]
+        assert snapshot["profile_reconcile_read"]["max_s"] <= snapshot["profile_reconcile_hop"]["max_s"]
+        assert (snapshot["profile_reconcile_hop"]["max_s"] + snapshot["profile_reconcile_served"]["max_s"]
+                <= snapshot["profile_reconcile"]["max_s"] + 0.05)
+    finally:
+        loop_tick_timing.reset()
+
+
+@pytest.mark.asyncio
+async def test_a_standalone_tick_syncs_hooks_in_one_hop_and_reads_no_profiles(tmp_path, monkeypatch):
+    """A standalone gateway has no served set to enumerate, so its tick is hooks only — one hop."""
+    _home, _profile, homes = _two_served(tmp_path)
+    runner = _runner(tmp_path, monkeypatch, homes=homes)
+    runner.config = GatewayConfig(multiplex_profiles=False)
+
+    async def _no_migration():
+        return False
+
+    runner._multiplex_for_added_profile = _no_migration
+
+    lanes = []
+    reads = []
+
+    async def poll_lane(func, *args):
+        lanes.append(getattr(func, "__name__", repr(func)))
+        return await asyncio.get_running_loop().run_in_executor(None, func, *args)
+
+    async def _reconcile(**_kwargs):
+        reads.append("reconcile")
+        return {"added": [], "removed": [], "rescanned": [], "parked": []}
+
+    runner._run_poll_in_executor = poll_lane
+    runner.reconcile_served_profiles = _reconcile
+    loop_tick_timing.reset()
+    watcher = asyncio.create_task(runner._profile_reconcile_watcher(interval=0.05))
+    try:
+        await async_wait_until(lambda: loop_tick_timing.snapshot().get("profile_reconcile", {})
+                               .get("count", 0) >= 2, timeout=10, what="two watcher ticks")
+    finally:
+        runner._running = False
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+
+    snapshot = loop_tick_timing.snapshot()
+    try:
+        assert reads == [], "a standalone tick reconciled a served set it does not have"
+        assert set(lanes) == {"_tick_off_loop"}, lanes
+        assert "profile_reconcile_read" not in snapshot, "a standalone tick read the profile roster"
+        assert snapshot["profile_reconcile_hooks"]["count"] >= 2
+    finally:
+        loop_tick_timing.reset()
 
 
 def test_the_tick_walks_the_profile_roster_once_per_read_pass(monkeypatch):

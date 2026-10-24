@@ -172,26 +172,59 @@ class GatewayProfileReconcileMixin:
             if not self._running:
                 return
             try:
-                # Wall time of the tick, summarised (~10 min) beside the dumps: this ticker is the
+                # Wall time of the tick, summarised (~1 min) beside the dumps: this ticker is the
                 # entry point of five of PRX-5524's blocked-loop dumps, so its trend is the evidence.
-                # The two halves get their own counters beside the whole tick (PRA-6850): the work in
-                # them measures in single-digit milliseconds when warm, so a tick that is still a
-                # second while both halves are cheap is the shared executor's queue, not this code —
-                # and that is only readable from the three lines side by side.
                 from gateway.loop_tick_timing import timed
                 with timed('profile_reconcile'):
-                    with timed('profile_reconcile_hooks'):
-                        await self._sync_hooks_on_consent_change()
-                    # A standalone gateway never runs a profile reconcile from the watcher, unless it is
-                    # the single-profile boot that starts multiplexing in place for a newly created
-                    # profile.
-                    if self._multiplex_on() or await self._multiplex_for_added_profile():
-                        with timed('profile_reconcile_served'):
-                            await self.reconcile_served_profiles(reason="watcher")
+                    await self._reconcile_tick()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.warning("Served-profile reconcile failed; retrying next cycle", exc_info=True)
+
+    async def _reconcile_tick(self) -> None:
+        """One watcher tick: BOTH halves' work in one poll-lane hop, then the loop-side apply.
+
+        Each half used to take a hop of its own (``_sync_hooks_on_consent_change``, then
+        ``reconcile_served_profiles``), so a quiet tick queued two slots on a 2-worker lane behind
+        every other poller for work that measures in single-digit milliseconds warm. The ring says
+        the hop, not the work, was the whole of ``profile_reconcile_hooks`` (p50 53 ms for two
+        ``stat`` per home, PRA-6850 round 4), and the two queued one after the other.
+
+        The counters now decompose a tick without inference: ``profile_reconcile_hop`` is the one
+        hop the tick takes, ``_hooks`` and ``_read`` are the bodies that ran inside it, and
+        ``_served`` is the loop-side diff/apply after it. So ``hop − hooks − read`` is the lane
+        wait, measured, and ``tick − hop − served`` is the tick's own loop-side bookkeeping.
+
+        A standalone gateway still only syncs hooks (one hop, no read pass); it starts reconciling
+        here when a second profile makes it a multiplexer.
+        """
+        from gateway.loop_tick_timing import timed
+        from hermes_constants import get_process_hermes_home
+        multiplexed = self._multiplex_on() or await self._multiplex_for_added_profile()
+        homes = {Path(h) for h in (get_process_hermes_home(), *(self._served_profile_homes or {}).values())}
+        with timed('profile_reconcile_hop'):
+            signatures, snapshot = await _poll_offload(
+                self, self._tick_off_loop, multiplexed, homes, self._hook_consent_signatures or {})
+        self._hook_consent_signatures = signatures
+        if snapshot is None:
+            return
+        with timed('profile_reconcile_served'):
+            await self.reconcile_served_profiles(reason="watcher", snapshot=snapshot)
+
+    def _tick_off_loop(self, multiplexed: bool, homes, seen: dict):
+        """Blocking half of one tick, on the worker: hook-consent sync, then the read pass.
+
+        The order is the order of the dependencies — a home's shell hooks are re-registered before
+        any adapter is rebuilt for it in the diff that follows, and ``demand.refresh`` fills the
+        ranking the served enumeration applies. Each keeps its own counter so the hop stays
+        attributable.
+        """
+        from gateway.loop_tick_timing import timed
+        with timed('profile_reconcile_hooks'):
+            signatures = self._resync_changed_hook_consent(homes, seen)
+        snapshot = self._live_profiles_snapshot() if multiplexed else None
+        return signatures, snapshot
 
     async def prime_profile_reconcile(self, *, reason: str = "boot") -> dict[str, Any]:
         """The watcher's first pass, run during startup instead of inside its first tick.
@@ -270,12 +303,15 @@ class GatewayProfileReconcileMixin:
 
     # ── reconcile ─────────────────────────────────────────────────────────────────────────────────
 
-    async def reconcile_served_profiles(self, *, reason: str = "request") -> dict[str, Any]:
+    async def reconcile_served_profiles(self, *, reason: str = "request",
+                                        snapshot: Optional[tuple] = None) -> dict[str, Any]:
         """Diff ``profiles/`` (what exists now) against the served set (the process reservation):
         reserve + build the runtime and start adapters for new profiles, tear down, unroute and
         unreserve deleted ones, (re)build adapters for served profiles whose config/.env changed.
         Other profiles' adapters are never touched. A new profile whose home another gateway owns or
         whose store is unusable is parked (logged, not served) and left for an explicit rescan.
+        ``snapshot`` is a ``(homes, signatures)`` read pass the caller already ran on this tick's
+        worker — the watcher's single poll-lane hop; without it this call takes a hop of its own.
         Returns ``{"added", "removed", "rescanned", "parked", "served_profiles"}``."""
         from gateway.run import MultiplexConfigError
         result: dict[str, Any] = {"added": [], "removed": [], "rescanned": [], "parked": [], "reason": reason}
@@ -292,7 +328,12 @@ class GatewayProfileReconcileMixin:
             # each paid their own queue — and on the poll lane, because the shared default executor's
             # hop alone measured p50 57 ms / p95 370 ms on this host. The reads inside are
             # memoised per file, so a quiet tick is a stat sweep (`profile_reconcile_read`).
-            live, live_signatures = await _poll_offload(self, self._live_profiles_snapshot)
+            # The watcher hands in the snapshot its tick's one hop already produced; every other
+            # caller (a creator's rescan, the boot pass) has none and pays a hop here.
+            if snapshot is None:
+                live, live_signatures = await _poll_offload(self, self._live_profiles_snapshot)
+            else:
+                live, live_signatures = snapshot
             live = {str(name): Path(home) for name, home in live.items()}
             listed = set(live)  # a probe skip below is not a deletion: it never clears a parked verdict
             known = dict(self._served_profile_homes or {})
