@@ -35,6 +35,10 @@ The due scan here is READ-ONLY on purpose: ``get_due_jobs()`` persists a ``last_
 a ``pending_slot`` for everything it returns (cron/jobs.py::_evaluate_due_job), and a held slot must
 not be recorded as dispatched.
 
+The ERROR below is a BACKSTOP, not the fleet-wide alert path (PRX-6133): a restart deferral records
+its own bound at T=0 (``gateway.restart_hold_ledger``) and the PRX-6044 surface control consumes it, so
+a page no longer depends on this line landing twenty minutes into a thirty-minute hold.
+
 One more correction after the 2026-10-23 cards (PRA-6925): the *cost* of the hold is now bounded,
 not just reported. A restart deferral may keep a waiting slot for one cron inactivity watchdog
 (:func:`hold_bound_seconds`) and no longer, so the ERROR above is a backstop for drain classes that

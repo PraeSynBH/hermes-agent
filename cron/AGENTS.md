@@ -42,7 +42,15 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   cycle, re-WARNed "drain opened" every minute per home and capped the observable pause at one tick
   interval — the ERROR could never fire on a multiplex host. The gateway side says the cost at T=0
   too: the restart deferral line names how many due cron slots across how many profiles the wait is
-  holding (`_cron_dispatch_hold_note`). **That hold is bounded, not merely reported** (PRA-6925):
+  holding (`_cron_dispatch_hold_note`), and — because a consumer cannot subtract a sentence — the
+  deferral also appends a machine-readable bound event at T=0 (`gateway/restart_hold_ledger.py`:
+  `{started_at, cap_s, due_slots, profiles}`, plus a closing record with the width the hold really
+  had), which the PRX-6044 surface control reads as `HELD (restart, predicted Nm)` and pages on only
+  outside R1 (>45 min per restart, >60 min per rolling 2 h — PRX-6133, CEO ruling rev 2 on
+  PRX-6109). The 26-min ERROR in `errors.log` is a backstop for drain classes that are not
+  cap-bounded; it is not the fleet-wide alert path.
+
+  **That hold is bounded, not merely reported** (PRA-6925):
   once a scan finds a due slot waiting, the deferral ends within one cron inactivity watchdog
   (`hold_bound_seconds` — `HERMES_CRON_TIMEOUT`, default 600 s) instead of running out the
   30 min `agent.restart_after_turn_timeout` cap, and the slot fires as a catch-up then. Measured

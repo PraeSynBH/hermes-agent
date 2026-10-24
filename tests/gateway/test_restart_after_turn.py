@@ -1,6 +1,7 @@
 """Unit tests for in-band restart after-turn deferral helpers (#77184)."""
 
 import asyncio
+import json
 import logging
 import math
 from pathlib import Path
@@ -216,3 +217,113 @@ def test_an_unreadable_cron_count_still_names_the_hold_and_never_breaks_the_wait
     opening = [r.getMessage() for r in caplog.records if "Restart deferral (cap" in r.getMessage()]
     assert len(opening) == 1
     assert "cron dispatch is held fleet-wide until the drain releases" in opening[0]
+
+
+# --- PRX-6133 (CEO ruling rev 2 on PRX-6109, R7): the T=0 bound event and its consumer ---------
+#
+# The surface control had to subtract a restart hold from its measurement gap by parsing the prose
+# of "Restart deferral (cap 1800s): cron dispatch is held fleet-wide … N due cron slot(s) across M
+# profile(s)", and the only escalation in the box arrived at T+26 of a T+30 hold, to a file nothing
+# reads. So the deferral now writes what it knows at T=0 as data, and closes it with the width the
+# hold actually had.
+
+def _hold_ledger(tmp_path, monkeypatch):
+    """Point the ledger at tmp_path and keep the requester lookup off the real home."""
+    import gateway.restart_hold_ledger as ledger
+
+    path = tmp_path / "restart-holds.jsonl"
+    monkeypatch.setattr(ledger, "hold_ledger_path", lambda home=None: path)
+    monkeypatch.setattr(ledger, "_requester", lambda: None)
+    return path
+
+
+def _hold_records(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_the_deferral_writes_the_bound_event_at_t_zero(tmp_path, monkeypatch, caplog):
+    """R7.1: one structured record when the hold opens, carrying the four fields."""
+    _cron_cost(monkeypatch, due=7, homes=3, bound=None)
+    path = _hold_ledger(tmp_path, monkeypatch)
+    _elapsed, result = asyncio.run(_timed_wait(_stuck_runner(0.3), caplog))
+
+    assert result is False, "this runner never drains, so the cap ends the wait"
+    begin, end = _hold_records(path)
+    assert begin["event"] == "dispatch_hold_begin"
+    assert begin["started_at"].endswith("Z") and end["ended_at"].endswith("Z")
+    assert begin["cap_s"] == 0.3, "the cap the wait is actually honouring, not the default"
+    assert begin["due_slots"] == 7 and begin["profiles"] == 3, \
+        "the fleet-wide cost, from the same scan the WARNING quotes"
+    assert begin["cron_cost_readable"] is True
+    assert begin["predicted_end_at"] > begin["started_at"], "the window the control predicts"
+    assert end["event"] == "dispatch_hold_end" and end["hold_id"] == begin["hold_id"]
+    assert end["reason"] == "cap"
+    assert end["held_s"] >= 0.25, "the END record carries the real width, not the cap"
+    assert end["due_slots"] == 7 and end["profiles"] == 3
+
+
+def test_the_bound_event_names_the_cron_bound_as_how_the_hold_ended(tmp_path, monkeypatch, caplog):
+    """A hold that ends early must not be recorded as one that spent the cap (PRA-6925)."""
+    _cron_cost(monkeypatch, due=2, homes=2, bound=0.25)
+    path = _hold_ledger(tmp_path, monkeypatch)
+    elapsed, result = asyncio.run(_timed_wait(_stuck_runner(5.0), caplog))
+
+    assert result is False and elapsed < 3.0
+    _begin, end = _hold_records(path)
+    assert end["reason"] == "cron_bound"
+    assert end["held_s"] < 5.0, "the 5 s cap was not spent, and the record says so"
+
+
+def test_the_bound_event_records_a_successful_drain(tmp_path, monkeypatch, caplog):
+    """The common ending: the work finished, so the hold cost cron only its own width."""
+    _cron_cost(monkeypatch, due=1, homes=1, bound=None)
+    path = _hold_ledger(tmp_path, monkeypatch)
+    work = {"awaitable": 1}
+    statuses = {"n": 0}
+
+    def _finishes_during_the_wait(*_a, **_k):
+        # The 30 s status mark is written once before the loop and once per status tick; work that
+        # drains between two ticks is the common ending, and it must be recorded as one.
+        statuses["n"] += 1
+        if statuses["n"] >= 2:
+            work["awaitable"] = 0
+
+    runner = SimpleNamespace(
+        _draining=True, _running=True, session_runtime_descriptor={},
+        _restart_after_turn_timeout=5.0,
+        _active_work_count=lambda: work["awaitable"],
+        _awaitable_work_count=lambda: work["awaitable"],
+        _wedged_agent_count=lambda: 0, _restart_safe_cron_count=lambda: 0,
+        _describe_active_work=list, _scale_to_zero_status=_finishes_during_the_wait,
+    )
+    assert asyncio.run(GatewayShutdownMixin._await_active_work_before_restart(runner)) is True
+
+    _begin, end = _hold_records(path)
+    assert end["reason"] == "drained"
+    assert end["held_s"] < 5.0
+
+
+def test_an_unreadable_cron_scan_is_reported_not_recorded_as_zero(tmp_path, monkeypatch, caplog):
+    """"Nothing was due yet" and "the scan failed" are different facts to a consumer."""
+    from cron import scheduler_drain_gate
+
+    def broken(homes):
+        raise OSError("store gone")
+
+    monkeypatch.setattr(scheduler_drain_gate, "due_slot_summary", broken)
+    path = _hold_ledger(tmp_path, monkeypatch)
+
+    runner = SimpleNamespace(
+        _draining=True, _running=True, session_runtime_descriptor={},
+        _restart_after_turn_timeout=0.2,
+        _active_work_count=lambda: 1, _awaitable_work_count=lambda: 1,
+        _wedged_agent_count=lambda: 0, _restart_safe_cron_count=lambda: 0,
+        _describe_active_work=list, _scale_to_zero_status=lambda *a, **k: None,
+    )
+    with caplog.at_level(logging.INFO, logger="gateway.run"):
+        assert asyncio.run(GatewayShutdownMixin._await_active_work_before_restart(runner)) is False
+
+    begin, _end = _hold_records(path)
+    assert begin["due_slots"] is None and begin["profiles"] is None
+    assert begin["cron_cost_readable"] is False
+    assert begin["cap_s"] == 0.2, "the record still carries the bound the wait honoured"
