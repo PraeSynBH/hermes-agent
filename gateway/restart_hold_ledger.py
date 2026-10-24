@@ -14,7 +14,8 @@ So each deferral appends one JSON object per phase to ``<launch home>/logs/resta
      "cron_cost_readable": true, "pid": 49093, "requester": {...}}
     {"schema": 1, "event": "dispatch_hold_end", "hold_id": "...", "started_at": "...",
      "ended_at": "...", "held_s": 1234.5, "reason": "drained|cap|cron_bound|aborted",
-     "cap_s": 1800.0, "due_slots": 3, "profiles": 2}
+     "cap_s": 1800.0, "due_slots": 3, "profiles": 2,
+     "cron_bound_extensions": 2}
 
 The four fields the ruling requires (``started_at``, ``cap_s``, ``due_slots``, ``profiles``) are on
 BOTH records, and a field the process could not read is ``null`` with ``cron_cost_readable: false``
@@ -155,16 +156,22 @@ def record_hold_end(
     reason: str,
     due_slots: Optional[int] = None,
     profiles: Optional[int] = None,
+    extensions: int = 0,
     ended_at: Optional[float] = None,
     home: Optional[Path] = None,
 ) -> bool:
     """Close the hold with its real width, so a consumer need not assume the cap was spent.
 
     ``reason`` is one of ``drained`` (the awaitable work finished), ``cap`` (the after-turn timeout
-    elapsed), ``cron_bound`` (a due slot was waiting, so the wait ended one cron inactivity
-    watchdog later — ``cron.scheduler_drain_gate.hold_bound_seconds``) or ``aborted`` (the wait was
+    elapsed), ``cron_bound`` (a due slot was waiting and the wait ended at the cron inactivity
+    watchdog — ``cron.scheduler_drain_gate.hold_bound_seconds``), or ``aborted`` (the wait was
     cancelled or raised, so it did not end by any of its own bounds). A ``None`` *hold_id* means the
     begin record could not be written, so there is nothing to close.
+
+    ``extensions`` counts the cron-bound windows this hold re-armed instead of releasing into a drain
+    that could not finish the work still active (PRX-6173). It is written only when non-zero: a hold
+    that never reached its bound keeps exactly the shape it always had, and a ``cron_bound`` record
+    carrying it says the bound was reached more than once before it finally ended the wait.
     """
     if not hold_id:
         return False
@@ -182,4 +189,6 @@ def record_hold_end(
         "profiles": profiles,
         "cron_cost_readable": due_slots is not None and profiles is not None,
     }
+    if extensions:
+        record["cron_bound_extensions"] = int(extensions)
     return _append(record, home)

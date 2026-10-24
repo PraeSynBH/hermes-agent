@@ -15,6 +15,13 @@ surface control that must subtract a hold from its measurement gap reads
 ``{started_at, cap_s, due_slots, profiles}`` instead of parsing the WARNING below. The 26-min
 ``cron.scheduler`` ERROR stays as a backstop for drain classes that are not cap-bounded; it is no
 longer the only path a fleet-wide hold has to a human.
+
+The bound itself is not the release trigger when releasing cannot serve the slot (PRX-6173): the
+hold ends in ``stop()``/drain, which keeps admission closed and then exits the process, so a slot
+"released" at the bound still waits for the replacement to listen while the work the hold protected
+is handed to a launchd-clamped 60 s drain. An elapsed bound therefore re-arms for one more window
+while the wait is still retiring work, and ends the wait unchanged when it is not — the cap remains
+the outer bound either way.
 """
 
 from __future__ import annotations
@@ -57,6 +64,25 @@ def _cron_hold_bound() -> Optional[float]:
         return hold_bound_seconds()
     except Exception:  # health: allow BLE001 -- failing here must leave the deferral exactly as it was
         return None
+
+
+def _bound_still_retires_work(awaitable_now: int, awaitable_at_arm: int) -> bool:
+    """Whether an elapsed cron bound may be re-armed for one more window (PRX-6173).
+
+    The cron bound assumes that releasing the hold is what serves the waiting slot. It is not: the
+    release runs ``stop()``/drain with admission still closed and then exits the process, so the slot
+    fires only once the replacement is listening — 127 s later on the 2026-10-24T05:42:26Z restart —
+    and in the meantime the work the hold was protecting is handed to a drain whose budget is
+    launchd-clamped to 60 s (``_load_launchd_exit_timeout``): 13 units in, 12 interrupted out, 6 runs
+    admitted into the release→listen gap and settled ``interrupted`` (PRX-6173).
+
+    So a bound that elapses while the wait is still RETIRING work (the count it protects fell across
+    the window) buys cron nothing by firing: it extends for one more window instead. A window that
+    retires nothing ends the wait exactly where PRA-6925 put it — a hold protecting nothing is pure
+    fleet-wide cron silence — and the after-turn cap still bounds the total, so this can only spend
+    time the cap already allowed, never extend the cron silence past it.
+    """
+    return awaitable_now < awaitable_at_arm
 
 
 def _cron_dispatch_hold_note(cost: Optional[tuple[int, int]] = None) -> str:
@@ -105,7 +131,7 @@ def _record_hold_begin(cost: Optional[tuple[int, int]], cap_s: float, active: in
 
 
 def _record_hold_end(hold_id: Optional[str], cost: Optional[tuple[int, int]], cap_s: float,
-                     started_at: float, reason: str) -> None:
+                     started_at: float, reason: str, extensions: int = 0) -> None:
     """Close the T=0 record with how the wait ended and how wide it really was."""
     try:
         from gateway.restart_hold_ledger import record_hold_end
@@ -113,7 +139,7 @@ def _record_hold_end(hold_id: Optional[str], cost: Optional[tuple[int, int]], ca
         due, holding = cost if cost else (None, None)
         record_hold_end(
             hold_id=hold_id, started_at=started_at, cap_s=cap_s, reason=reason,
-            due_slots=due, profiles=holding,
+            due_slots=due, profiles=holding, extensions=extensions,
         )
     except Exception:  # health: allow BLE001 -- forensics must never abort the wait it describes
         logger.debug("Restart deferral: bound event could not be closed", exc_info=True)
@@ -359,10 +385,34 @@ class GatewayRestartWaitMixin:
         # restart-safe worker to hand it to (cron/scheduler.py::_launch_external_cron_worker).
         hold_bound = _cron_hold_bound()
         hold_started: Optional[float] = None
+        awaitable_at_arm = 0
+        extensions = 0
         last_status_at = 0.0
         try:
             while self._awaitable_work_count() > 0:
                 now = loop.time()
+                awaitable_now = self._awaitable_work_count()
+                # Re-arm an elapsed cron bound while the wait is still retiring work (PRX-6173):
+                # firing it here hands the remainder to a drain that cannot finish it, and the
+                # released slot does not reach cron any sooner — admission stays closed through
+                # stop(), exit and the replacement's boot. A window that retires nothing falls
+                # through, so the wait still ends at the bound exactly as PRA-6925 measured.
+                if (hold_started is not None and hold_bound is not None
+                        and now >= hold_started + hold_bound
+                        and now < cap_deadline
+                        and _bound_still_retires_work(awaitable_now, awaitable_at_arm)):
+                    extensions += 1
+                    logger.warning(
+                        "Restart deferral: the cron bound elapsed with %d work unit(s) still active "
+                        "— %d fewer than when this window opened — so the hold is re-armed for one "
+                        "more %.0fs window (extension %d, cap %.0fs) instead of releasing them into "
+                        "a drain that will interrupt them; the held slot fires when the replacement "
+                        "listens either way",
+                        awaitable_now, awaitable_at_arm - awaitable_now,
+                        min(hold_bound, cap_deadline - now), extensions, timeout,
+                    )
+                    hold_started = now
+                    awaitable_at_arm = awaitable_now
                 deadline = cap_deadline
                 if hold_started is not None and hold_bound is not None:
                     deadline = min(cap_deadline, hold_started + hold_bound)
@@ -390,6 +440,7 @@ class GatewayRestartWaitMixin:
                     cost = _cron_hold_cost()
                     if hold_started is None and hold_bound is not None and cost and cost[0]:
                         hold_started = now
+                        awaitable_at_arm = awaitable_now
                         logger.warning(
                             "Restart deferral: %d due cron slot(s) across %d profile(s) are waiting, "
                             "so this wait now ends at most %.0fs later (cron bound) instead of the "
@@ -422,4 +473,4 @@ class GatewayRestartWaitMixin:
         finally:
             # Close the record with the width the hold actually had (PRX-6133): the cap is its
             # ceiling, and a control subtracting a window must not be told 30 min for a 6 min hold.
-            _record_hold_end(hold_id, cost, timeout, hold_started_wall, hold_reason)
+            _record_hold_end(hold_id, cost, timeout, hold_started_wall, hold_reason, extensions)
