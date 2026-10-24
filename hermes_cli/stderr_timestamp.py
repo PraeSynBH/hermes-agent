@@ -174,17 +174,28 @@ def _install_signal_forwarders(proc: subprocess.Popen[bytes]) -> dict[int, objec
     return previous
 
 
+def _gateway_argv_matcher():
+    """The canonical argv matcher, or ``None`` when this tree cannot be imported.
+
+    ``None`` is a real state, not an error to swallow: the wrapper runs from a source slice that a
+    half-applied ``hermes update`` can leave unimportable, and the caller's next decision (park or
+    relay a fatal exit) must not silently flip to "relay" just because the matcher went missing.
+    """
+    try:
+        from gateway.status import looks_like_gateway_command_line
+    except Exception:  # health: allow BLE001 -- any import failure means "unresolvable" to the caller
+        return None
+    return looks_like_gateway_command_line
+
+
 def _is_hermes_gateway_run_argv(command: Sequence[str]) -> bool:
     """True for Hermes ``gateway run`` argv this wrapper is allowed to upgrade.
 
     The wrapper is generic. Only historical/current Hermes gateway shapes get ``--external-
     supervisor``; an arbitrary launchd child must not be marked as gateway-supervised (#87005).
     """
-    try:
-        from gateway.status import looks_like_gateway_command_line
-    except Exception:
-        return False
-    return bool(looks_like_gateway_command_line(" ".join(str(part) for part in command)))
+    matcher = _gateway_argv_matcher()
+    return bool(matcher and matcher(" ".join(str(part) for part in command)))
 
 
 def _child_launchd_label_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -227,11 +238,19 @@ def _child_returncode_for_supervisor(command: Sequence[str], returncode: int) ->
     Signal deaths stay 128+N. Gateway EX_CONFIG (78) becomes 0 so
     ``KeepAlive.SuccessfulExit=false`` parks the job instead of crash-looping;
     a non-gateway child that happens to exit 78 is left alone.
+
+    A 78 is also parked when the argv matcher cannot be resolved at all: EX_CONFIG is a
+    PERMANENT failure by definition, and every other supervisor Hermes supports decides it
+    argv-blind (systemd's ``RestartPreventExitStatus=78``, the s6 finish script's 78→125). Relaying
+    an unclassifiable 78 instead makes launchd relaunch a permanent refusal, which is the exact
+    loop this mapping exists to stop — so the unresolvable case fails toward parking, not toward
+    the loop.
     """
     if returncode < 0:
         return 128 + abs(returncode)
-    if returncode == _GATEWAY_FATAL_CONFIG_EXIT_CODE and _is_hermes_gateway_run_argv(command):
-        return 0
+    if returncode == _GATEWAY_FATAL_CONFIG_EXIT_CODE:
+        if _gateway_argv_matcher() is None or _is_hermes_gateway_run_argv(command):
+            return 0
     return returncode
 
 

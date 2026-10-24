@@ -933,6 +933,7 @@ def _restart_macos_launchd_gateways(
     from hermes_cli.update_cmd_posix_pause import already_restarted
     current_label = get_launchd_label()
     resumed = already_restarted()["labels"]  # paused for the update, restarted on the new code
+    _repair_launchd_plist_without_fatal_exit_park(current_label)
     _restarted, _failed = ([], []) if current_label in resumed else _restart_launchd_gateway_after_update(
         supervision_verify=True, self_restart_pending=self_restart_pending)
     restarted_services.extend(_restarted)
@@ -958,6 +959,7 @@ def _restart_macos_launchd_gateways(
         try:
             # Locate = liveness + domain in one probe; kickstart and fresh-PID checks
             # reuse that domain so a sibling is never probed in one and restarted in another.
+            _repair_launchd_plist_without_fatal_exit_park(label)
             domain, old_pid = _locate_launchd_gateway_service(label)
             if domain is None:
                 if require_supervision and get_launchd_plist_path().with_name(f"{label}.plist").exists():
@@ -1231,6 +1233,67 @@ def _repair_unit_without_fatal_exit_park(svc_name: str, scope: str) -> None:
         f"  ⚠ {svc_name} lacks RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}: a permanent refusal "
         f"(exit {GATEWAY_FATAL_CONFIG_EXIT_CODE}) would crash-loop it instead of parking.\n"
         f"    Repair: {'sudo ' if system else ''}hermes gateway install{' --system' if system else ''}"
+    )
+
+
+def _launchd_plist_parks_on_fatal_verdict(plist_text: str) -> bool | None:
+    """True when an installed LaunchAgent definition carries the exit-78 park contract.
+
+    launchd has no ``RestartPreventExitStatus``; the analogue is two halves that must both be
+    present. ``KeepAlive.SuccessfulExit=false`` makes a clean exit a deliberate stop, and the
+    ``hermes_cli.stderr_timestamp`` wrapper in ``ProgramArguments`` is what turns a fatal gateway
+    verdict (exit 78, EX_CONFIG) into that clean exit. Either half missing and a PERMANENT refusal
+    relaunches forever — the launchd shape of #118282.
+
+    ``None`` means the file could not be judged (unparseable, or no ``ProgramArguments``): never
+    warn on a guess.
+    """
+    import plistlib
+
+    try:
+        spec = plistlib.loads(plist_text.encode("utf-8"))
+    except Exception:  # health: allow BLE001 -- malformed XML/plist raises several unrelated types; "unjudgeable" is the answer
+        return None
+    if not isinstance(spec, dict):
+        return None
+    argv = spec.get("ProgramArguments")
+    if not isinstance(argv, list) or not argv:
+        return None
+    keep_alive = spec.get("KeepAlive")
+    if keep_alive is True:
+        returns_on_clean_exit = True  # KeepAlive=true relaunches a clean stop: no parking at all
+    elif isinstance(keep_alive, dict):
+        returns_on_clean_exit = keep_alive.get("SuccessfulExit") is not False
+    else:
+        returns_on_clean_exit = False  # no KeepAlive: a clean exit is never relaunched
+    if returns_on_clean_exit:
+        return False
+    return any("hermes_cli.stderr_timestamp" in str(part) for part in argv)
+
+
+def _repair_launchd_plist_without_fatal_exit_park(label: str) -> None:
+    """Name a LaunchAgent that cannot park a fatal exit, with the command that repairs it.
+
+    Check-only by design: this runs inside the post-update restart sequence, where booting the job
+    out to rewrite its plist would collide with the restart this same pass is about to perform.
+    Every path that legitimately repairs it already refreshes the definition —
+    ``hermes gateway install --force`` and ``hermes gateway start``/``restart`` all call
+    ``refresh_launchd_plist_if_needed`` — so the remedy is a command, not a mutation here.
+    """
+    from hermes_cli.gateway import GATEWAY_FATAL_CONFIG_EXIT_CODE, get_launchd_plist_path
+
+    plist_path = get_launchd_plist_path().with_name(f"{label}.plist")
+    try:
+        plist_text = plist_path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return
+    if _launchd_plist_parks_on_fatal_verdict(plist_text) is not False:
+        return
+    print(
+        f"  ⚠ {label} cannot park a fatal verdict (exit {GATEWAY_FATAL_CONFIG_EXIT_CODE}): its plist "
+        f"lacks KeepAlive.SuccessfulExit=false or the stderr wrapper, so a permanent refusal "
+        f"would crash-loop it instead of parking.\n"
+        f"    Repair: hermes gateway install --force (for the profile that owns {label})"
     )
 
 

@@ -298,6 +298,22 @@ def test_main_maps_gateway_ex_config_to_clean_stop(tmp_path):
     assert rc_other == GATEWAY_FATAL_CONFIG_EXIT_CODE
 
 
+def test_fatal_exit_parks_even_when_the_argv_matcher_cannot_be_imported(monkeypatch):
+    """SOU-4222: the wrapper runs from a source slice a half-applied ``hermes update`` can leave
+    unimportable. Relaying an unclassifiable 78 makes launchd relaunch a PERMANENT refusal — the
+    loop this mapping exists to stop — while systemd's ``RestartPreventExitStatus=78`` and the s6
+    finish script decide 78 argv-blind anyway. So an unresolvable matcher must still park."""
+    monkeypatch.setitem(sys.modules, "gateway.status", None)  # `import gateway.status` -> ImportError
+
+    assert stderr_timestamp._gateway_argv_matcher() is None
+    assert stderr_timestamp._child_returncode_for_supervisor(["/x/hermes", "gateway", "run"], 78) == 0
+    # Only the fatal code: a retryable verdict still reaches the supervisor with the matcher gone.
+    assert (
+        stderr_timestamp._child_returncode_for_supervisor(["/x/hermes", "gateway", "run"], 75)
+        == GATEWAY_SERVICE_RESTART_EXIT_CODE
+    )
+
+
 
 @pytest.mark.platforms("posix")  # POSIX signals
 def test_wrapper_forwards_sigusr1_restart_request_to_child(tmp_path):

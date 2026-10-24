@@ -709,6 +709,8 @@ journalctl -u hermes-gateway -f
 
 Use the user service on laptops and dev boxes. Use the system service on VPS or headless hosts that should come back at boot without relying on systemd linger.
 
+The installed unit carries `RestartPreventExitStatus=78`: a fatal, config-derived verdict (`EX_CONFIG`) stops the unit instead of restarting it, while `RestartForceExitStatus=75` still restarts a requested one. macOS builds the same contract out of `KeepAlive` plus the stderr wrapper — see the macOS (launchd) section below.
+
 :::danger Don't add a custom `ExecStopPost` kill drop-in
 The unit Hermes installs already shuts the gateway down cleanly with `KillMode=mixed` + `KillSignal=SIGTERM`, and uses `Restart=always` with `RestartForceExitStatus` so updates and `/restart` respawn correctly. Do **not** add a systemd drop-in such as `ExecStopPost=/bin/kill -9 $MAINPID` — `ExecStopPost` fires on *every* stop, including clean restarts, so it `SIGKILL`s the freshly spawned instance before it stabilizes and `Restart=always` immediately respawns it. The result is an infinite restart loop (and, on Telegram, a flood of restart messages). If you've added such a drop-in, remove it: `systemctl --user edit hermes-gateway` (or `sudo systemctl edit hermes-gateway` for a system service) and delete the `ExecStopPost` line, then `systemctl --user daemon-reload`.
 :::
@@ -780,6 +782,29 @@ The plist sets `RunAtLoad`, so loading it starts the gateway. `hermes gateway in
 
 :::info Local Network access (LAN devices fail with "No route to host")
 macOS Local Network Privacy attributes a socket to the executable launchd spawned for the job. A bare venv Python has no application identity, so a launchd-run gateway could not reach LAN hosts (Home Assistant, local model servers) — every connect failed with `errno 65 No route to host` while the same URL worked from Terminal, and no prompt was ever shown to grant it. The generated plist therefore runs the gateway through `/usr/bin/osascript`; a JXA `system()` call starts the gateway without an interactive event-polling loop, and macOS treats its children as osascript's own — an Apple platform binary, exempt from the check. `ps` shows `osascript → stderr_timestamp → gateway run`; stop/restart/KeepAlive behave exactly as before. A plist installed by an older Hermes is refreshed by `hermes gateway install` (or on the next `hermes gateway start`).
+:::
+
+:::info Parking on a permanent refusal (exit `78`)
+A fatal gateway verdict — a config-derived refusal, a startup token/lock conflict — exits `78` (`EX_CONFIG`), which means *this cannot succeed on retry*. systemd gets that from `RestartPreventExitStatus=78` in the unit. launchd has no such key, so the same contract is built from two halves that must both exist:
+
+- `KeepAlive.SuccessfulExit=false` — launchd treats a **clean** exit as a deliberate stop and does not relaunch the job.
+- the `stderr_timestamp` wrapper in `ProgramArguments` — it reports the gateway's `78` as a clean exit, which is what makes the first half apply.
+
+Everything else still comes back: `75` (`EX_TEMPFAIL`, a restart request or a transient verdict) and any crash or signal death relaunch after `ThrottleInterval`. A parked job shows no PID in `launchctl list | grep hermes` and stays parked until an operator runs `hermes gateway start` (or `hermes gateway restart`) — that is the recovery step, and it also refreshes a stale plist. `hermes update` prints a warning naming any installed plist that cannot park (missing either half) with the `hermes gateway install --force` command that repairs it.
+
+To verify the contract on a specific host, watch one deliberate refusal end to end:
+
+```bash
+uid=$(id -u)
+launchctl print gui/$uid/ai.hermes.gateway | grep -E "state|runs|last exit code"
+#   before: state = running, runs = N, last exit code = (never exited) or a previous code
+# trigger a fatal verdict (a deliberate config refusal, or `hermes gateway run` against a
+# config that cannot start), then re-read the same three fields:
+#   parked: state = not running, runs = N+1, last exit code = 0
+#   looping: runs keeps climbing with last exit code = 78: EX_CONFIG   <- the contract is broken
+```
+
+`runs` staying at `N+1` means launchd did **not** relaunch after the refusal.
 :::
 
 :::tip Picking up new credentials after `hermes auth add` / `hermes auth reset`
