@@ -658,7 +658,7 @@ def discover_mcp_tools(allowed_mcp_names: Optional[list[str]] = None) -> list[st
             cookie.release()
 
 
-def reconcile_mcp_servers_with_config() -> dict[str, list[str]]:
+def reconcile_mcp_servers_with_config(config: dict | None = None) -> dict[str, list[str]]:
     """Bring the live server set in step with ``mcp_servers`` as it is on disk NOW: tear down
     servers that were removed from config or set ``enabled: false`` (a parked server keeps
     self-probing forever otherwise — for hours after the user deleted its entry), then connect
@@ -667,9 +667,15 @@ def reconcile_mcp_servers_with_config() -> dict[str, list[str]]:
     scope (one multiplexed profile's config prunes only its own connections). A lazily registered
     (schema-cache) server loses its cached tools; one still mid-connect cannot be torn down yet and
     is reported under ``"pending"`` so the caller retries. Returns
-    ``{"removed": [...], "added": [...], "pending": [...]}``; a no-op when nothing changed."""
+    ``{"removed": [...], "added": [...], "pending": [...]}``; a no-op when nothing changed.
+
+    *config* is the caller's already-loaded config (the housekeeping tick's per-profile bind,
+    PRX-6137): the read is the dearest part of the pass, so a tick that already read it hands it in
+    rather than paying for a second one. It must be read-only and no older than the tick."""
+    # No argument when there is nothing to hand in: callers (and tests) stub ``_load_mcp_config``
+    # zero-arg, and a bound config only ever arrives from the housekeeping tick's bind.
     with _owner_secret_scope():
-        servers = _config._load_mcp_config()
+        servers = _config._load_mcp_config() if config is None else _config._load_mcp_config(config)
     wanted = {name for name, cfg in servers.items() if mcp_server_enabled(cfg)}
     scope = _core._mcp_registry_scope()
     with _core._lock:
