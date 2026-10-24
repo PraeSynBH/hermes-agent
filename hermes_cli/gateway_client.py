@@ -174,6 +174,31 @@ EVENT_STALL_TIMEOUT = 30
 # queue's only consumer). Bounded: past either cap the reader waits for the consumer again.
 EVENT_OVERFLOW_FRAMES = 16384
 EVENT_OVERFLOW_BYTES = 8 * 1024 * 1024
+# The copy a turn's transport loss carries. A lost turn could never say WHICH close ended it, and at a
+# managed restart that is the whole question: the restart's deferral protects in-flight turns, so a
+# close during one means either "the owner cut this socket" or "the transport died on its own"
+# (PRX-6150: eight mid-turn losses inside one deferral all read the same sentence, and neither the run
+# log nor the gateway log could tell the two apart). Name the close code and reason when the transport
+# reported one; a non-websocket failure (OSError, a parse error) names nothing extra.
+LOST_TURN = ("Gateway disconnected; turn outcome is unknown. Resume the printed session ID to check "
+             "whether it completed or was interrupted; do not resend the work.")
+
+
+def close_detail(exc) -> str:
+    """``" (close 1013: restart wait)"`` for a websocket close, ``""`` for anything else."""
+    from websockets.exceptions import ConnectionClosed
+
+    if not isinstance(exc, ConnectionClosed):
+        return ""
+    # The frame, not the deprecated ``ConnectionClosed.code``/``.reason`` properties: the one the
+    # peer sent when there is one, else our own half of the handshake.
+    frame = getattr(exc, "rcvd", None) or getattr(exc, "sent", None)
+    code = getattr(frame, "code", None)
+    if code is None:
+        return ""
+    reason = getattr(frame, "reason", None) or ""
+    return f" (close {code}{f': {reason}' if reason else ''})"
+
 
 
 def gateway_ws_target(endpoint, ticket):
@@ -743,6 +768,7 @@ class GatewayClient:
 
     async def _read(self):
         from websockets.exceptions import ConnectionClosed
+        close = None
         try:
             async for raw in self.websocket:
                 frame = json.loads(raw)
@@ -754,11 +780,12 @@ class GatewayClient:
                         future.set_result(frame.get("result", {}))
                 elif "method" in frame:
                     await self._deliver(frame, len(raw))
-        except (ConnectionClosed, OSError, ValueError, TimeoutError):
-            pass
+        except (ConnectionClosed, OSError, ValueError, TimeoutError) as exc:
+            close = exc
         finally:
-            error = GatewayClientError("Gateway disconnected; turn outcome is unknown. "
-                "Resume the printed session ID to check whether it completed or was interrupted; do not resend the work.")
+            # The close the transport reported rides the copy: a lost turn's own log has to name
+            # whether the owner cut this socket (1013 at a restart's deferral) or it died on its own.
+            error = GatewayClientError(LOST_TURN + close_detail(close))
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(error)

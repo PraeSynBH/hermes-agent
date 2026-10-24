@@ -304,3 +304,81 @@ async def test_restart_wait_cuts_sockets_opened_before_it(tmp_path, monkeypatch,
         assert received == [("text", frame), ("disconnect", 1000)], received
     else:
         assert received == [("disconnect", 1013)], received
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opened_in_wait", [False, True])
+async def test_the_cut_is_named_once_in_the_gateway_log(tmp_path, monkeypatch, caplog, opened_in_wait):
+    """The owner's half of the receipt (PRX-6150): a socket it cuts for the restart wait says so, once.
+
+    Without this line the cut is invisible server-side — eight runs died inside one deferral
+    (2026-10-23 18:54:37 PDT) and gateway.log had no record of which side hung up — while the
+    client's own copy names the close code it received. One line per connection, not per frame:
+    the read loop keeps calling ``receive`` after the cut.
+    """
+    import json
+
+    from gateway.run_api import GatewayRuntimeAPI
+    from gateway.runtime_bootstrap import TicketStore
+    from hermes_cli import web_server as web
+    from hermes_cli import web_server_chat
+
+    tickets = TicketStore("owner", [str(tmp_path)])
+    ticket = tickets.mint(profile_id=str(tmp_path), subject="human", purpose="interactive")
+    authority = SimpleNamespace(db=SimpleNamespace(db_path=tmp_path / "state.db"), profile_id=str(tmp_path), runner=None)
+    runner = SimpleNamespace(_draining=False, _running=True, session_runtime_descriptor={"state": "ready"},
+                             session_authority=authority, session_ticket_store=tickets)
+
+    def open_restart_wait():
+        runner._draining = True
+        runner.session_runtime_descriptor.update(state="draining", drain_reason="restart_wait")
+
+    if opened_in_wait:
+        open_restart_wait()
+    received = []
+
+    async def handle(ws, **kwargs):
+        await ws.accept(subprotocol="hermes-gateway-v1")
+        open_restart_wait()  # the wait opens while this socket is live
+        while True:
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                received.append(("disconnect", message.get("code")))
+                return
+            received.append(("text", message.get("text")))
+
+    async def fallback(*args):
+        pytest.fail("a ticketed native socket must not enter the legacy fallback")
+
+    monkeypatch.setattr("tui_gateway.ws.handle_ws", handle)
+    monkeypatch.setattr(web, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+    monkeypatch.setattr(web_server_chat, "_ws_request_is_allowed", lambda ws: True)
+    frame = json.dumps({"method": "prompt.receipt"})
+    # Two inbound frames: a cut connection keeps being read, and the line must not repeat.
+    incoming = iter([{"type": "websocket.connect"}, {"type": "websocket.receive", "text": frame},
+                     {"type": "websocket.receive", "text": frame},
+                     {"type": "websocket.disconnect", "code": 1000}])
+
+    async def receive():
+        return next(incoming)
+
+    async def send(value):
+        pass
+
+    scope = {"type": "websocket", "path": "/api/ws", "scheme": "ws", "query_string": b"",
+             "client": ("127.0.0.1", 1234), "server": ("127.0.0.1", 9999),
+             "headers": [(b"sec-websocket-protocol", ("hermes-gateway-v1, hermes-gateway-ticket." + ticket).encode())],
+             "subprotocols": ["hermes-gateway-v1", "hermes-gateway-ticket." + ticket]}
+    with caplog.at_level("INFO", logger="gateway.run_api"):
+        await GatewayRuntimeAPI(fallback, runner, web.app)(scope, receive, send)
+    cut = [record.getMessage() for record in caplog.records if "cutting the session WebSocket" in record.getMessage()]
+    if opened_in_wait:
+        # Both frames are served, and the connection ends the way its client ended it.
+        assert received == [("text", frame), ("text", frame), ("disconnect", 1000)], received
+        assert cut == [], cut
+    else:
+        # One cut, then the far end's own disconnect: the line was written once.
+        assert received == [("disconnect", 1013)], received
+        assert len(cut) == 1, cut
+        assert "close 1013" in cut[0], cut[0]
+

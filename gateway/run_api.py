@@ -304,15 +304,24 @@ class GatewayRuntimeAPI:
         original_receive = receive
         allow_draining = False
         admitted_in_wait = False
+        cut_logged = False
         from gateway.drain_control import restart_wait_open
 
         async def receive_admitted():
+            nonlocal cut_logged
             message = await original_receive()
             # Only a socket admitted INTO the restart wait (to answer a parked prompt) outlives it. One
             # opened before the wait is cut as before: its client reconnects to the next owner, and a
             # held one (a kanban worker polling its card) would otherwise pin the drain to its cap.
             if ((descriptor['state'] != 'ready' or self.runner._draining) and not allow_draining
                     and not (admitted_in_wait and restart_wait_open(self.runner))):
+                # Name the cut once per connection: the client's own log carries the close code, and a
+                # close inside a deferral that protects in-flight turns is otherwise indistinguishable
+                # from a transport that died on its own (PRX-6150).
+                if not cut_logged:
+                    cut_logged = True
+                    logger.info('Restart wait: cutting the session WebSocket opened before it '
+                                '(close 1013) peer=%s', scope['hermes.gateway_socket_peer'])
                 return {'type': 'websocket.disconnect', 'code': 1013}
             return message
 
