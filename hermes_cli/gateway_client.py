@@ -104,6 +104,20 @@ RESTART_WAIT_GRACE_S = 300.0
 # "wait", and neither is ``draining``: an owner that is going away with no replacement is
 # ``admit_owner``'s wait, not a restart this client may spend its grace on.
 OWNER_COMING_UP_STATES = frozenset({"starting", "restarting"})
+# How long the OUTGOING owner's claim is allowed to stand after that owner is gone
+# (``restart_requested`` + ``gateway_state: restarting``, written by ``stop()`` before the drain and
+# re-stamped by the exit phase — SOU-3966). The claim is the ONLY readiness there is in the
+# exit -> boot stretch: the home holds no live pid, no lock and no ``starting`` until the replacement
+# boots. Measured 2026-10-24: old owner stopped 05:42:26.427Z, replacement launched 05:44:33.957Z,
+# so the gap is one supervisor respawn wide (~63 s) and a run dispatched into it spent its whole 120 s
+# budget waiting for a listener that did not exist yet (six runs, ``phase=session, elapsed=120.0s``).
+#
+# A dead pid alone proves nothing: a SIGKILLed gateway leaves the same file, so the claim is honoured
+# only while it is FRESH, and the bound is the admission budget — the window this class is already
+# measured in. A claim older than one budget cannot be covered by any run's remaining budget, so
+# crediting it past that point would only hold a dispatch for a restart that is not coming; a gateway
+# that died mid-claim costs a run no more than an absent owner already does (one budget, then death).
+RESTART_CLAIM_FRESH_S = GATEWAY_ADMISSION_BUDGET_S
 # A profile the multiplexer's ceiling has deferred (`profile_serving`) is re-observed this often.
 # Cheap — one control-socket ``identify`` — and well inside the reconcile interval the rank moves on.
 PROFILE_SERVE_POLL_INTERVAL_S = 5.0
@@ -399,8 +413,47 @@ def restart_watch_homes(endpoint, home) -> list[Path]:
     return list(dict.fromkeys(Path(h) for h in (control, home, *window_fence_homes()) if h))
 
 
+def record_age_s(record) -> float | None:
+    """Seconds since the record's own ``updated_at``, or ``None`` when it cannot be aged.
+
+    The status writer re-stamps ``updated_at`` on every write, so this is the age of the last thing
+    the process that wrote it had to say — the only clock a claim left behind by a DEAD owner can
+    be bounded with.
+    """
+    from datetime import UTC, datetime
+
+    stamp = record.get("updated_at") if isinstance(record, dict) else None
+    if not isinstance(stamp, str) or not stamp.strip():
+        return None
+    try:
+        moment = datetime.fromisoformat(stamp.strip())  # 3.11+ reads the writer's trailing "Z"
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)  # an older writer without a zone: read it as UTC
+    return max(0.0, (datetime.now(UTC) - moment).total_seconds())
+
+
+def fresh_restart_claim(record) -> bool:
+    """Is this record the outgoing owner's claim, still inside the window it promises?
+
+    Three things together, because any one alone is a lie: ``gateway_state: restarting`` is what
+    ``stop()`` publishes, ``restart_requested: true`` says a replacement was asked for (a
+    ``restarting`` written by anything else is not a promise), and a FRESH ``updated_at`` keeps the
+    claim from outliving the restart it describes (``RESTART_CLAIM_FRESH_S``).
+    """
+    from gateway.restart import RESTARTING_GATEWAY_STATE
+
+    if not isinstance(record, dict) or record.get("gateway_state") != RESTARTING_GATEWAY_STATE:
+        return False
+    if record.get("restart_requested") is not True:
+        return False
+    age = record_age_s(record)
+    return age is not None and age <= RESTART_CLAIM_FRESH_S
+
+
 def owner_serving_state(homes) -> str | None:
-    """The owner's own word while a LIVE owner on one of *homes* is still coming up, else ``None``.
+    """The owner's own word while an owner on one of *homes* is still coming up, else ``None``.
 
     The owner publishes its own readiness into ``<home>/gateway_state.json``: ``starting`` from the
     moment it claims the home until every enabled platform is connected (``run_startup`` stamps
@@ -411,10 +464,18 @@ def owner_serving_state(homes) -> str | None:
     ready, so ``identify`` answers "alive" for the whole window in which ``session.create`` cannot
     complete.
 
-    A home with no live record falls back to the lock reservation (``missing_owner_state``): a
-    claimed-but-unpublished owner is the launch -> socket half of the same window. Nothing is ever
-    inferred from an absent or dead owner — a stale record from a previous life must not credit a
-    run, or a host whose gateway is gone would hold every dispatch for the whole grace.
+    The claim is read while its writer is DEAD, which is the whole point of it: the stretch between
+    the outgoing owner's exit and the replacement's first write has no live process, no lock and no
+    ``starting``, so a liveness check on the record made the one stretch the claim was written for
+    unreadable. It is gated by ``fresh_restart_claim`` instead — the claim's own age, bounded by one
+    admission budget — so a record left behind by a gateway that is never coming back credits
+    nothing (that host already costs a run exactly one budget).
+
+    A home with no live record and no fresh claim falls back to the lock reservation
+    (``missing_owner_state``): a claimed-but-unpublished owner is the launch -> socket half of the
+    same window. Nothing is ever inferred from an absent owner — a stale ``starting``/``running``
+    record from a previous life must not credit a run, or a host whose gateway is gone would hold
+    every dispatch for the whole grace.
     """
     from gateway.status import read_runtime_status, runtime_status_pid_is_live
     from hermes_cli.gateway_runtime_discovery import missing_owner_state
@@ -428,6 +489,8 @@ def owner_serving_state(homes) -> str | None:
                 if state in OWNER_COMING_UP_STATES:
                     return str(state)
                 continue  # a live owner that says it is serving: no credit from this home
+            if fresh_restart_claim(record):
+                return "restarting"  # the writer is gone; its claim is the readiness
             if missing_owner_state(home) == "starting":
                 return "starting"
         except (OSError, RuntimeError, ValueError):
@@ -830,7 +893,8 @@ class GatewayClient:
         resent — with the deadline wound forward by the time the owner itself reported ``starting``,
         bounded by ``RESTART_WAIT_GRACE_S`` in total. Every case that is not a restarting owner is
         unchanged: a wedged owner (alive, publishing ``running``, answering nothing) earns no credit
-        and fails at the budget, and so does an owner that is simply gone.
+        and fails at the budget, and so does an owner that is simply gone — unless it left a fresh
+        restart claim behind, which is the exit -> boot half of the same window (``fresh_restart_claim``).
         """
         remaining = None if budget == float("inf") else float(budget)
         while True:
