@@ -492,6 +492,17 @@ DEFAULT_CONFIG = {
         # removed first. Live, young and Kanban trees are never counted or touched. 0 = off.
         "max_total_gb": 0,
         "max_linked": 0,               # admission cap: linked trees per repo, 0 = no cap (worktree_pool)
+        # Per-repo admission caps, keyed by repo basename (`voyonder`) or absolute path. An
+        # unnamed repo falls back to `max_linked`; 0 keeps its unbounded meaning. One number
+        # cannot say both "this repo runs ~18 at a time" and "that repo needs ~340 trees".
+        "max_linked_by_repo": {},
+        # The ratchet: after every sweep, lower a repo's cap toward `population +
+        # ratchet_headroom` (never up). A cap set once re-freezes the cliff at today's number;
+        # the ratchet makes the bound follow the population down as the reaper drains it. A
+        # changed configured number starts a fresh ratchet at that value. Off by default: it
+        # narrows a number the operator chose, so enabling it is an explicit fleet decision.
+        "ratchet": False,
+        "ratchet_headroom": 20,        # trees kept above the measured population by the ratchet
         "reclaim_before_admit": True,  # at the cap, one archive-first reclaim pass before refusing
     },
     # Filesystem checkpoints: snapshot the working directory once per turn (on the first

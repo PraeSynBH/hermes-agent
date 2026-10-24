@@ -259,6 +259,11 @@ worktrees:
   archive_retention_days: 30   # 0 keeps archives forever
   max_total_gb: 0              # optional budget for idle trees; oldest are archived + removed first
   max_linked: 0                # admission cap: most linked trees this repo may hold (0 = no cap)
+  max_linked_by_repo:          # per-repo caps, by repo basename or absolute path; unnamed -> max_linked
+    voyonder: 40
+    /Users/me/src/alaska_supply: 340
+  ratchet: false               # after each sweep, lower a repo's cap toward population + headroom
+  ratchet_headroom: 20         # trees the ratchet keeps above the population it measured
   reclaim_before_admit: true   # at the cap, run one reclaim pass before refusing a new tree
 ```
 
@@ -277,6 +282,23 @@ that frees nothing it refuses the new tree with the count, the cap and
 parent's checkout instead of failing it. The creation line reports the
 population (`✓ Worktree created: …/.worktrees/hermes-1a2b3c4d (12/40 in this
 repo)`) so growth is visible at the moment it happens.
+
+One number cannot bound every repo: the largest repo tolerates a population many
+times the working set of a small one. `max_linked_by_repo` names a repo's own cap
+(basename or absolute path; **0** keeps its "unbounded" meaning for that repo),
+and anything unnamed falls back to `max_linked`. `hermes worktree prune
+--dry-run` prints this repo's `population/cap` before the sweep table.
+
+A cap set once is a snapshot: as the reaper drains a population the cap would stay
+at the old number and the population would grow back to it. With `ratchet: true`,
+every sweep (the scheduled one and `hermes worktree prune`) records the repo's
+population and lowers its cap to `population + ratchet_headroom` — never up. The
+cushion leaves room for concurrent launches; the cap follows the population down
+instead of re-freezing the cliff. A changed configured number starts a fresh
+ratchet at that value, so raising the ceiling still works. The ratchet is off by
+default (it narrows a number you chose); the sweep writes its snapshot to
+`worktree_ratchet.json` under the profile home either way, which is also what the
+fleet's `population/cap` line reads.
 
 Subagent worktrees (`delegation.worktree_isolation: true`) follow the same
 rule when the child finishes: a clean tree is removed, and a tree with commits

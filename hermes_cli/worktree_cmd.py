@@ -92,6 +92,10 @@ def _sweep(repo_root: str, dry_run: bool, older_than: Optional[float] = None) ->
     if dry_run or worktree_sweep.classic_mode(settings):
         return plan, []
     _, _, archived = worktree_sweep.execute_plan(repo_root, plan, settings)
+    # PRX-6144: a manual prune is a sweep too — lower this repo's admission cap toward the
+    # population it just left, exactly as the scheduled sweep does.
+    from hermes_cli import worktree_pool
+    worktree_pool.ratchet_after_sweep(repo_root, None, settings)
     from hermes_cli.worktree_archive import prune_expired_archives
     expired = prune_expired_archives(repo_root, settings["archive_retention_days"])
     from agent.i18n import t
@@ -120,6 +124,12 @@ def _prune(worktree_gc, repo_root: str, args) -> int:
     actions: list = []
     kept: list = []
     plan: list = []
+    # PRX-6144: print this repo's population against the cap admission enforces, so a repo
+    # pinned at its cap is visible from the prune output without reading config.yaml. The
+    # ratchet's stored number is the one admission uses, not the configured ceiling.
+    if not as_json:
+        from hermes_cli import worktree_pool
+        print(worktree_pool.population_summary(repo_root) + "\n")
     if not getattr(args, "branches_only", False):
         plan, actions = _sweep(repo_root, dry_run, older_than)
         if not as_json:
