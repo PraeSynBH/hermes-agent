@@ -156,14 +156,17 @@ def log_reaped(keys: list[tuple[str, str]], idle_timeout: float) -> None:
     _emit("reaper", logging.INFO, f"reaped {len(keys)} idle client(s) after {idle_timeout:.0f}s: {summary}")
 
 
-def log_budget_evicted(keys: list[tuple[str, str]], budget_mb: float) -> None:
-    """Clients were shut down because their process trees pushed the service past its RSS budget.
-    INFO, one line per sweep; forgets the ``log_active`` announcement so a respawn re-announces."""
+def log_budget_evicted(keys: list[tuple[str, str]], budget_mb: float,
+                       over_tree_mb: float = 0.0) -> None:
+    """Clients were shut down because their process trees pushed the service past its RSS budget, or
+    because one tree broke the per-tree ceiling.  INFO, one line per sweep; forgets the ``log_active``
+    announcement so a respawn re-announces."""
     with _announce_lock:
         _announced_active.difference_update(keys)
     summary = ", ".join(f"{sid} ({root})" for sid, root in keys)
-    _emit("reaper", logging.INFO,
-          f"evicted {len(keys)} client(s) over the {budget_mb:.0f} MiB LSP budget: {summary}")
+    why = f"over the {over_tree_mb:.0f} MiB per-tree ceiling" if over_tree_mb else \
+        f"over the {budget_mb:.0f} MiB LSP budget"
+    _emit("reaper", logging.INFO, f"evicted {len(keys)} client(s) {why}: {summary}")
 
 
 def log_released(keys: list[tuple[str, str]], reason: str) -> None:

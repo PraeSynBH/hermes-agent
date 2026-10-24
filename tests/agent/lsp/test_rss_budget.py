@@ -14,7 +14,8 @@ import subprocess
 import pytest
 
 from agent.lsp import manager as manager_mod
-from agent.lsp.manager import DEFAULT_MAX_TOTAL_RSS_MB, LSPService, _process_tree_rss_kb
+from agent.lsp.manager import (DEFAULT_MAX_TOTAL_RSS_MB, DEFAULT_MAX_TREE_RSS_MB, LSPService,
+                               _process_tree_rss_kb)
 
 
 class _FakeClient:
@@ -34,11 +35,11 @@ class _FakeClient:
         self.stopped = True
 
 
-def _service(max_total_rss_mb: float) -> LSPService:
+def _service(max_total_rss_mb: float, max_tree_rss_mb: float = 0.0) -> LSPService:
     """Disabled service (no loop thread, no spawns) — the budget pass is exercised directly."""
     return LSPService(enabled=False, wait_mode="document", wait_timeout=0.1,
                       install_strategy="manual", idle_timeout=0.0,
-                      max_total_rss_mb=max_total_rss_mb)
+                      max_total_rss_mb=max_total_rss_mb, max_tree_rss_mb=max_tree_rss_mb)
 
 
 def _attach(service: LSPService, clients: list[_FakeClient], order: list[float]) -> None:
@@ -56,6 +57,7 @@ def _rss(monkeypatch, per_pid: dict[int, int]) -> None:
 def test_default_budget_is_a_real_cap():
     """The shipped default must actually bound the host — 2 GiB, not "unlimited by default"."""
     assert DEFAULT_MAX_TOTAL_RSS_MB == 2048.0
+    assert 1024.0 < DEFAULT_MAX_TREE_RSS_MB < 4096.0, "a per-tree ceiling between 1 and 4 GiB"
 
 
 def test_no_eviction_under_budget(monkeypatch):
@@ -97,16 +99,44 @@ def test_stops_evicting_once_the_budget_is_met(monkeypatch):
     assert not mid.stopped and not new.stopped
 
 
-def test_single_client_is_never_evicted(monkeypatch):
-    """A lone over-budget client would be the one serving the current edit; leave it alone."""
+def test_lone_client_over_the_total_is_kept(monkeypatch):
+    """There is nothing else to evict, and this is the client the current edit is using."""
     service = _service(100.0)
     only = _FakeClient(41, "/r/only")
     _attach(service, [only], [1.0])
-    _rss(monkeypatch, {41: 4096 * 1024})
+    _rss(monkeypatch, {41: 90 * 1024})
 
     asyncio.run(service._enforce_rss_budget())
 
     assert not only.stopped
+
+
+def test_lone_client_over_the_per_tree_ceiling_is_evicted(monkeypatch):
+    """The ceiling is absolute: one monorepo tree must not own the whole budget."""
+    service = _service(0.0, max_tree_rss_mb=1800.0)
+    only = _FakeClient(42, "/r/huge")
+    _attach(service, [only], [1.0])
+    _rss(monkeypatch, {42: 4096 * 1024})
+
+    asyncio.run(service._enforce_rss_budget())
+
+    assert only.stopped
+
+
+def test_budget_is_shared_across_the_profiles_of_one_process(monkeypatch):
+    """A per-service cap multiplies by the number of served profiles; the budget is the process's."""
+    first = _service(2048.0)
+    second = _service(2048.0)
+    a, b = _FakeClient(81, "/r/a"), _FakeClient(82, "/r/b")
+    _attach(first, [a], [1.0])
+    _attach(second, [b], [2.0])
+    _rss(monkeypatch, {81: 1500 * 1024, 82: 1500 * 1024})
+
+    asyncio.run(first._enforce_rss_budget())   # first publishes 1500, fits alone
+    assert not a.stopped
+    asyncio.run(second._enforce_rss_budget())  # 3000 total: second must give back 952 MiB
+
+    assert b.stopped, "the second service trims itself to what its sibling leaves"
 
 
 def test_zero_disables_the_budget(monkeypatch):
@@ -134,8 +164,9 @@ def test_clients_still_spawning_are_skipped(monkeypatch):
 
     asyncio.run(service._enforce_rss_budget())
 
-    assert not a.stopped and not b.stopped
-    assert len(service._clients) == 2
+    assert not b.stopped, "a client whose spawn is in flight is never a trim target"
+    assert a.stopped, "the eligible over-share client is still trimmed"
+    assert len(service._clients) == 1
 
 
 @pytest.mark.platforms("posix")

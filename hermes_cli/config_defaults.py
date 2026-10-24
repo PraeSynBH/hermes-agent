@@ -2425,7 +2425,14 @@ DEFAULT_CONFIG = {
         # is live, not idle, and 20-30 concurrent runs are 20-30 live trees.  Past this budget the
         # least-recently-used client is shut down (respawned transparently on its next edit).
         # 0 = no cap.  Measured with one `ps` sweep per minute; not enforced on Windows.
+        # ... and this one is a PROCESS budget: one gateway serves every profile, each profile has
+        # its own service, so services publish their totals and trim themselves to what their
+        # siblings leave.  Measured with one `ps` sweep per minute; not enforced on Windows.
         "max_total_rss_mb": 2048.0,
+        # Ceiling for ONE language-server process tree (a monorepo tsserver reaches ~1.5 GiB alone),
+        # so no single workspace can spend the whole budget.  Above the observed fleet maximum
+        # (1634 MiB) on purpose. 0 = no per-tree cap.
+        "max_tree_rss_mb": 1800.0,
         # Per-server overrides keyed by registry server_id (pyright, gopls...): disabled: true;
         # command: ["path/to/server", "--stdio"] (bypasses auto- install); env: {...};
         # initialization_options: {...} (merged into LSP initializationOptions).

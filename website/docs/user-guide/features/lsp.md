@@ -339,6 +339,10 @@ lsp:
   # Measured with one `ps` sweep per sweep interval; not enforced on Windows.
   max_total_rss_mb: 2048
 
+  # Ceiling for ONE server process tree (a monorepo tsserver reaches ~1.5 GiB on its own),
+  # so a single workspace cannot spend the whole budget. 0 = no per-tree cap.
+  max_tree_rss_mb: 1800
+
   # Per-server overrides (all optional).
   servers:
     pyright:
@@ -461,6 +465,11 @@ it fits, keeping the busiest ones hot. An evicted server respawns on its
 next edit, so an agent never loses edit tooling — it re-acquires a
 server. The sweep charges each client its whole descendant tree, not
 just the ~60 MiB wrapper process. Set `0` for no cap.
+
+`max_total_rss_mb` is a **process** budget, not a per-profile one: one gateway serves every
+profile and each has its own LSP service, so services publish their measured totals and each trims
+itself to what its siblings leave (a service already inside an even share keeps its last server).
+`max_tree_rss_mb` (default 1800) is the independent ceiling for a single tree.
 
 Servers are also released when their workspace goes away, even if they
 are not idle: removing a Hermes-managed worktree (`hermes -w` session

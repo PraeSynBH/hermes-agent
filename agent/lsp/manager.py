@@ -19,6 +19,7 @@ import math
 import os
 import subprocess
 import threading
+import weakref
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -38,6 +39,17 @@ DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
 # fleet of 20-30 concurrent runs is 20-30 live trees.  The budget is the deterministic cap; an evicted
 # client respawns on the next edit.  0 = no cap.
 DEFAULT_MAX_TOTAL_RSS_MB = 2048.0
+# Ceiling for ONE language-server process tree.  A tsserver on a large monorepo reaches 1.5 GiB on
+# its own; without this a single workspace can spend the whole process budget and every other profile
+# gets evicted in its favour.  1800 MiB sits above the observed fleet maximum (1634 MiB) so ordinary
+# trees are never touched.  0 = no per-tree cap.
+DEFAULT_MAX_TREE_RSS_MB = 1800.0
+
+# One gateway process serves every profile, and each profile has its own LSPService — so a budget
+# enforced per service is multiplied by the number of active profiles.  Services publish their
+# measured tree total here and each trims itself to what its siblings leave (see _enforce_rss_budget).
+_PROCESS_BUDGET_LOCK = threading.Lock()
+_PROCESS_USAGE: weakref.WeakKeyDictionary[LSPService, float] = weakref.WeakKeyDictionary()
 
 
 def _process_tree_rss_kb(root_pids: list[int]) -> dict[int, int]:
@@ -209,6 +221,7 @@ class LSPService:
         disabled_servers: Optional[list[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
         max_total_rss_mb: float = DEFAULT_MAX_TOTAL_RSS_MB,
+        max_tree_rss_mb: float = DEFAULT_MAX_TREE_RSS_MB,
         extra_servers: Optional[list[ServerDef]] = None,
         broken_retry_seconds: float = 0.0,
         warmup_timeout: float = 0.0,
@@ -225,6 +238,7 @@ class LSPService:
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
         self._max_total_rss_mb = max(0.0, max_total_rss_mb)
+        self._max_tree_rss_mb = max(0.0, max_tree_rss_mb)
         self._extra_servers: list[ServerDef] = list(extra_servers or [])
         self._broken_retry = max(0.0, broken_retry_seconds)
         self._warmup_timeout = max(0.0, warmup_timeout)
@@ -252,7 +266,7 @@ class LSPService:
         self._delta_baseline: dict[str, _Diags] = {}
         self._edit_checks = EditChecks()  # loop-thread state of start_edit_check
 
-        if self._enabled and (self._idle_timeout > 0 or self._max_total_rss_mb > 0):
+        if self._enabled and (self._idle_timeout > 0 or self._max_total_rss_mb > 0 or self._max_tree_rss_mb > 0):
             self._loop.run(self._start_idle_reaper(), timeout=2.0)
 
     @classmethod
@@ -290,6 +304,7 @@ class LSPService:
             disabled_servers=[n for n, c in servers.items() if c.get("disabled")],
             idle_timeout=idle_timeout,
             max_total_rss_mb=_float_or(lsp_cfg.get("max_total_rss_mb"), DEFAULT_MAX_TOTAL_RSS_MB),
+            max_tree_rss_mb=_float_or(lsp_cfg.get("max_tree_rss_mb"), DEFAULT_MAX_TREE_RSS_MB),
             extra_servers=custom_servers(servers),
             broken_retry_seconds=_float_or(lsp_cfg.get("broken_retry_seconds"), 0.0),
             warmup_timeout=_float_or(lsp_cfg.get("warmup_timeout"), 0.0),
@@ -806,45 +821,86 @@ class LSPService:
         await self._enforce_rss_budget()
 
     async def _enforce_rss_budget(self) -> None:
-        """Evict least-recently-used clients until the service's trees fit ``lsp.max_total_rss_mb``.
+        """Evict clients until this service's trees fit its share of ``lsp.max_total_rss_mb``, and
+        until no single tree exceeds ``lsp.max_tree_rss_mb``.
 
-        Idle and deleted-root reaping only touch clients nothing uses any more.  The population that
-        actually presses on the host is the opposite: one live tsserver tree (~1 GiB) per concurrent
-        run, each on its own worktree, 20-30 at a time.  Counting live runs is the fleet's business;
-        holding the RSS the fleet may spend is this service's.  Evicted clients respawn lazily on the
-        next edit (``_get_or_spawn``), so an agent never loses a tool — it re-acquires one.
+        Two rules, because the one-process-many-profiles gateway made a per-service cap a lie: the
+        budget is a PROCESS budget, and every served profile has its own :class:`LSPService`.  A
+        per-service 2 GiB read as "the host holds 2 GiB" while three active profiles held 4.5 GiB —
+        each service was individually compliant.  Services now publish their measured tree total to a
+        process-wide registry and each one trims itself to what the others leave, so the number in
+        the config is the number the host actually spends.  The per-tree ceiling is the second half:
+        a single tree (tsserver on a large monorepo) can eat the whole budget alone.
+
+        Idle and deleted-root reaping only touch clients nothing uses any more; the population that
+        presses on the host is live.  Evicted clients respawn lazily on the next edit, so an agent
+        never loses a tool — it re-acquires one.
         """
-        if self._max_total_rss_mb <= 0:
+        if self._max_total_rss_mb <= 0 and self._max_tree_rss_mb <= 0:
             return
         with self._state_lock:
             pending = set(self._spawning)
             snapshot = [(key, c) for key, c in self._clients.items() if key not in pending]
             last_used = {key: self._last_used.get(key, 0.0) for key, _ in snapshot}
         pids = [(key, c) for key, c in snapshot if getattr(c, "pid", None)]
-        # A single client is never evicted: it is the one the current edit just used.
-        if len(pids) < 2:
+        if not pids:
+            self._publish_usage_kb(0.0)
             return
         rss_kb = _process_tree_rss_kb([pid for _, c in pids if (pid := c.pid) is not None])
-        budget_kb = self._max_total_rss_mb * 1024.0
-        total_kb = float(sum(rss_kb.values()))
-        if not rss_kb or total_kb <= budget_kb:
+        if not rss_kb:
             return
-        order = sorted(pids, key=lambda kc: last_used.get(kc[0], 0.0))  # oldest first
+        own_kb = float(sum(rss_kb.values()))
+        self._publish_usage_kb(own_kb)
+        cap_kb = self._max_tree_rss_mb * 1024.0
+        allowance_kb = float("inf")
+        share_kb = float("inf")
+        if self._max_total_rss_mb > 0:
+            budget_kb = self._max_total_rss_mb * 1024.0
+            allowance_kb = max(0.0, budget_kb - self._sibling_usage_kb())
+            # An even share is the fair-play floor: a service already inside its share is never left
+            # with no server at all just because a heavier sibling wants the rest of the budget.
+            share_kb = budget_kb / self._services_in_process()
+        over_tree = {pid for pid, kb in rss_kb.items() if cap_kb > 0 and kb > cap_kb}
+        if own_kb <= allowance_kb and not over_tree:
+            return
+        # Oldest first, but a tree over the per-tree ceiling goes before anything else, and the most
+        # recently used client is kept unless it is itself over the ceiling.
+        order = sorted(pids, key=lambda kc: (0 if kc[1].pid in over_tree else 1,
+                                             last_used.get(kc[0], 0.0)))
         evicted: list[LSPClient] = []
-        for key, client in order[:-1]:  # keep the most recently used one
-            if total_kb <= budget_kb:
-                break
+        for key, client in order:
             pid = client.pid
+            must_go = pid in over_tree
+            if not must_go and (own_kb <= allowance_kb
+                                or (len(order) - len(evicted) <= 1 and own_kb <= share_kb)):
+                break
             with self._state_lock:
                 if self._clients.pop(key, None) is None:
                     continue
                 self._last_used.pop(key, None)
-            total_kb -= float(rss_kb.get(pid or -1, 0))
+            own_kb -= float(rss_kb.get(pid or -1, 0))
             evicted.append(client)
         if evicted:
+            self._publish_usage_kb(max(0.0, own_kb))
             eventlog.log_budget_evicted([(c.server_id, c.workspace_root) for c in evicted],
-                                        self._max_total_rss_mb)
+                                        self._max_total_rss_mb,
+                                        over_tree_mb=self._max_tree_rss_mb if over_tree else 0.0)
             await asyncio.gather(*(client.shutdown() for client in evicted), return_exceptions=True)
+
+    def _publish_usage_kb(self, own_kb: float) -> None:
+        """Record this service's measured tree total where its siblings' sweeps can read it."""
+        with _PROCESS_BUDGET_LOCK:
+            _PROCESS_USAGE[self] = own_kb
+
+    def _sibling_usage_kb(self) -> float:
+        """Tree RSS already spent by the other services of THIS process."""
+        with _PROCESS_BUDGET_LOCK:
+            return float(sum(kb for svc, kb in _PROCESS_USAGE.items() if svc is not self))
+
+    def _services_in_process(self) -> int:
+        """How many services (served profiles) currently hold a measured tree total."""
+        with _PROCESS_BUDGET_LOCK:
+            return max(1, len(_PROCESS_USAGE))
 
     def release_workspace(self, workspace_root: str) -> int:
         """Shut down the clients serving ``workspace_root`` or any root beneath it; returns how many.
