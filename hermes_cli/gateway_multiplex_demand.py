@@ -398,11 +398,42 @@ def _read_manifest(path: Path):
     return state, parsed, age, None
 
 
+# Every 30 s the reconcile tick re-reads each named profile's cron store and ``.env`` to rank the
+# ceiling, and each of those used to be open+parse. On a gateway with ~950 threads a read is a GIL
+# round trip, so the sweep — not the arithmetic — was the tick's floor (PRA-6850: 42 profiles,
+# `profile_reconcile_served` p50 1.3 s). Memoised on the file's ``(mtime_ns, size)``: an unchanged
+# store costs one ``stat``. ``_state_age`` stays live — it is a clock reading, not a file fact.
+_SOURCE_MEMO: dict[Path, tuple[Any, Any]] = {}
+
+
+def _source_signature(path: Path) -> Optional[tuple[int, int]]:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _memoised(path: Path, signature: Any, compute):
+    """``compute()`` for *path*, re-used while *signature* is unchanged (the tick's whole point)."""
+    hit = _SOURCE_MEMO.get(path)
+    if hit is not None and hit[0] == signature:
+        return hit[1]
+    value = compute()
+    _SOURCE_MEMO[path] = (signature, value)
+    return value
+
+
 def _cron_jobs(home: Path) -> tuple[int, tuple[str, ...]]:
     """S1: enabled jobs in ``<home>/cron/jobs.json``. A corrupt file is unreadable, not zero."""
     path = Path(home) / "cron" / "jobs.json"
-    if not path.exists():
+    signature = _source_signature(path)
+    if signature is None:
         return 0, ()
+    return _memoised(path, signature, lambda: _read_cron_jobs(path))
+
+
+def _read_cron_jobs(path: Path) -> tuple[int, tuple[str, ...]]:
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
@@ -425,6 +456,13 @@ def _credentials(home: Path, keys: Mapping[str, str]) -> tuple[tuple[str, ...], 
     path = Path(home) / ".env"
     if not path.is_file():
         return (), ()
+    signature = _source_signature(path)
+    if signature is None:
+        return (), ()
+    return _memoised(path, (signature, len(keys)), lambda: _read_credentials(path, keys))
+
+
+def _read_credentials(path: Path, keys: Mapping[str, str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
     try:
         with open(path, "rb") as fh:
             fh.read(1)
@@ -546,6 +584,7 @@ def reset() -> None:
     with _LOCK:
         _snapshot = None
     _wanted.clear()
+    _SOURCE_MEMO.clear()  # a "fresh read" means the per-file memos too
 
 
 def note_wanted(name: str, *, ttl: Optional[float] = None, clock=None) -> None:

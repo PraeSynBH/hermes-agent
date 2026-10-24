@@ -98,22 +98,44 @@ async def test_the_served_half_of_a_quiet_tick_is_one_thread_hop(tmp_path, monke
     runner = _runner(tmp_path, monkeypatch, homes=homes)
 
     calls = []
-    real_to_thread = asyncio.to_thread
+    real_read = reconcile_mod.GatewayProfileReconcileMixin._live_profiles_snapshot
 
-    def spy(fn, /, *args, **kwargs):
-        calls.append(getattr(fn, "__name__", repr(fn)))
-        return real_to_thread(fn, *args, **kwargs)
+    def spy(self):
+        calls.append(1)
+        return real_read(self)
 
-    monkeypatch.setattr(asyncio, "to_thread", spy)
-    try:
-        await runner.reconcile_served_profiles(reason="watcher")
-    finally:
-        monkeypatch.setattr(asyncio, "to_thread", real_to_thread)
+    monkeypatch.setattr(reconcile_mod.GatewayProfileReconcileMixin, "_live_profiles_snapshot", spy)
+    await runner.reconcile_served_profiles(reason="watcher")
 
-    assert calls == ["_live_profiles_snapshot"], (
-        f"a quiet reconcile timed the whole read half in one hop, got {calls!r}")
-    assert not inspect.iscoroutinefunction(runner._live_profiles_snapshot), (
+    assert calls == [1], f"a quiet reconcile enumerated once, got {len(calls)} passes"
+    assert not inspect.iscoroutinefunction(real_read), (
         "the read half is handed to a worker as one blocking call")
+
+
+@pytest.mark.asyncio
+async def test_the_read_half_rides_the_poll_lane_not_the_shared_default_executor(tmp_path, monkeypatch):
+    """The hop is what the tick paid: on the default pool it measured p50 57 ms for 0.3 ms of work."""
+    _home, _profile, homes = _two_served(tmp_path)
+    runner = _runner(tmp_path, monkeypatch, homes=homes)
+
+    lanes = []
+    shared = []
+
+    async def poll_lane(func, *args):
+        lanes.append(getattr(func, "__name__", repr(func)))
+        return func(*args)
+
+    async def default_pool(func, *args, **kwargs):
+        shared.append(getattr(func, "__name__", repr(func)))
+        return func(*args, **kwargs)
+
+    runner._run_poll_in_executor = poll_lane
+    monkeypatch.setattr(asyncio, "to_thread", default_pool)
+    await runner.reconcile_served_profiles(reason="watcher")
+    await runner._sync_hooks_on_consent_change()
+
+    assert lanes == ["_live_profiles_snapshot", "_resync_changed_hook_consent"], lanes
+    assert shared == [], f"the tick went back to the shared default executor: {shared!r}"
 
 
 def test_the_demand_read_still_precedes_the_served_enumeration(tmp_path, monkeypatch):

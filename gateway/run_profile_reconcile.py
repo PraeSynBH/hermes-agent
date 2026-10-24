@@ -90,6 +90,23 @@ def profile_serve_signature(home: Path) -> tuple:
     return tuple(sig)
 
 
+async def _poll_offload(runner, func, *args):
+    """One hop for this tick's blocking half, on the runner's POLL lane when it has one.
+
+    ``asyncio.to_thread`` submits to the loop's default executor — the pool every turn and every
+    library call in the process shares. On the host this card was measured on that hop cost p50
+    57 ms / p95 370 ms for a body that does two ``stat`` per home, which is the "loop idle inside a
+    1 138 ms tick" shape: the loop waited on a worker that had not been scheduled yet. The poll lane
+    is the lane built for exactly this (a fixed set of workers, a hop that must answer now,
+    ``gateway.run_idle_gates.offload_for_poll``); a stand-in runner without one keeps ``to_thread``.
+    """
+    from gateway.run_idle_gates import offload_for_poll
+    offload = offload_for_poll(runner)
+    if offload is None:
+        return await asyncio.to_thread(func, *args)
+    return await offload(func, *args)
+
+
 def _serve_signatures(homes: dict[str, Path]) -> dict[str, tuple]:
     """Off-loop half of the changed-profile diff: one batched stat pass per reconcile cycle.
 
@@ -218,8 +235,12 @@ class GatewayProfileReconcileMixin:
         registered). Hook registration only: adapters and sessions are never touched."""
         from hermes_constants import get_process_hermes_home
         homes = {Path(h) for h in (get_process_hermes_home(), *(self._served_profile_homes or {}).values())}
-        self._hook_consent_signatures = await asyncio.to_thread(
-            self._resync_changed_hook_consent, homes, self._hook_consent_signatures or {})
+        # The poll lane, not the default executor (PRA-6850): the work here is a two-`stat` sweep per
+        # home, but `asyncio.to_thread` submits to the pool every turn shares, and on this host that
+        # hop measured p50 57 ms / p95 370 ms on its own. A per-tick hop that must answer now belongs
+        # on the fixed poll lane (`offload_for_poll`).
+        self._hook_consent_signatures = await _poll_offload(
+            self, self._resync_changed_hook_consent, homes, self._hook_consent_signatures or {})
 
     def _resync_changed_hook_consent(self, homes, seen: dict) -> dict:
         """Blocking half of ``_sync_hooks_on_consent_change``; returns the signatures it applied. The
@@ -266,15 +287,11 @@ class GatewayProfileReconcileMixin:
             active = getattr(self, "_primary_profile_name", None) or "default"
             # Demand feeds the ranking the enumeration below applies, and reads every named
             # profile's cron store + .env: off the loop, once per tick, exactly like the served-set
-            # signature sweep (SOU-3075 §3.4).
-            # One off-loop pass for the three reads a cycle needs (PRA-6850). Each
-            # ``asyncio.to_thread`` is a hop onto the shared default executor, and on a busy host the
-            # hops — not the reads — are what a tick costs: the tick that named this card spent
-            # 1 138 ms with the loop idle in ``select`` the whole time, while the work below measures
-            # in tens of milliseconds warm. Sequential hops each pay that queue again, so they are
-            # one call, in the order the reads depend on each other (demand feeds the ranking the
-            # enumeration applies).
-            live, live_signatures = await asyncio.to_thread(self._live_profiles_snapshot)
+            # signature sweep (SOU-3075 §3.4). One pass for all three (PRA-6850) — sequential hops
+            # each paid their own queue — and on the poll lane, because the shared default executor's
+            # hop alone measured p50 57 ms / p95 370 ms on this host. The reads inside are
+            # memoised per file, so a quiet tick is a stat sweep (`profile_reconcile_read`).
+            live, live_signatures = await _poll_offload(self, self._live_profiles_snapshot)
             live = {str(name): Path(home) for name, home in live.items()}
             listed = set(live)  # a probe skip below is not a deletion: it never clears a parked verdict
             known = dict(self._served_profile_homes or {})
@@ -383,13 +400,19 @@ class GatewayProfileReconcileMixin:
         ``profile_serve_signature`` is two ``os.stat`` calls per served profile; riding along here
         keeps them off the loop without paying a hop of their own.
         """
+        from gateway.loop_tick_timing import timed
         from hermes_cli import gateway_multiplex_capacity as capacity
         from hermes_cli.profiles import profiles_to_serve
-        if capacity.profile_ceiling() is not None:
-            from hermes_cli import gateway_multiplex_demand as demand
-            demand.refresh()
-        homes = {str(name): Path(home) for name, home in profiles_to_serve(True)}
-        return homes, _serve_signatures(homes)
+        # Timed where it runs, not at the await: `profile_reconcile_served` is hop + this + the
+        # loop-side tail, so the difference between the two lines is the executor queue — the
+        # number PRA-6850 could only infer from the 8/8 idle-in-`select` shots.
+        with timed('profile_reconcile_read'):
+            if capacity.profile_ceiling() is not None:
+                from hermes_cli import gateway_multiplex_demand as demand
+                demand.refresh()
+            homes = {str(name): Path(home) for name, home in profiles_to_serve(True)}
+            signatures = _serve_signatures(homes)
+        return homes, signatures
 
     def _hold_busy_capacity_removals(self, removed, added, live, deferred_by_capacity):
         """Hold capacity deferrals that hold live work, and park the newcomers they displace.
