@@ -16,8 +16,9 @@ import queue
 import threading
 import time
 
-from hermes_cli.gateway_client import (DEFAULT_RPC_TIMEOUT, LOST_TURN, RESUME_KEY_MISMATCH, GatewayClientError,
-                                       GatewayRPCError, close_detail)
+from hermes_cli.gateway_client import (DEFAULT_RPC_TIMEOUT, GATEWAY_STARTUP_RPC_DEADLINE_S, LOST_TURN,
+                                       RESUME_KEY_MISMATCH, RESTART_WAIT_GRACE_S, GatewayClientError,
+                                       GatewayRPCError, admission_timeout, close_detail)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,36 @@ logger = logging.getLogger(__name__)
 DISCONNECTED = LOST_TURN
 # A request refused before it reached any socket: nothing is in doubt, so never the copy above.
 NOT_SENT = "Gateway disconnected before the request was sent; nothing was sent."
+# The verbs a viewer issues before it owns a session. They are ADMISSIONS, not reads: the owner
+# binds the profile, loads the agent config and opens the state DB for them, on the same loop that
+# runs every other turn. Against a flat ``DEFAULT_RPC_TIMEOUT`` (30 s) a booting owner — its loop
+# stalling admission in ~10 s slices (``gateway.loop_latency`` p95 10.4 s at 11:49:08Z) — killed
+# runs its own 120 s admission budget would have carried: 2026-10-24T11:48:09Z, three heartbeats
+# ended at 102.5-103.9 s with "Gateway did not answer session.create" while their siblings, whose
+# create landed one second later, admitted (PRX-6206). The ws client (``gateway_chat``) has taken
+# this budget for the same verbs all along; this path never did.
+ADMISSION_VERBS = frozenset({"runtime.describe", "session.create", "session.resume"})
+# Their answers are what end admission for this viewer: the verbs after them are ordinary requests
+# whose failures must stay retryable and whose cap must stay flat (``session.resume`` 200 s into a
+# turn, ``/reload``, ``/rollback``), so the admission budget is not their deadline.
+_SESSION_VERBS = frozenset({"session.create", "session.resume"})
+# Slack over a request's own answer budget while the caller waits for its future: the client's RPC
+# decides when the wait is over, and this only stops a dead loop from parking the caller thread.
+RPC_ANSWER_SLACK_S = 5.0
+
+
+def answer_guard(budget: float, *, admission: bool) -> float:
+    """How long the caller waits for an answer before it calls the transport dead.
+
+    ``GatewayClient`` is the one that decides an admission wait is over: it re-arms with the
+    seconds the owner spent publishing ``starting``/``restarting``, bounded by
+    ``RESTART_WAIT_GRACE_S``. A guard of ``budget + slack`` would fire inside that grace and make
+    the restart credit unobservable from this path, so an admission guard clears the widest wait the
+    client can still be running; a flat request keeps its old shape.
+    """
+    return budget + RPC_ANSWER_SLACK_S + (RESTART_WAIT_GRACE_S if admission else 0.0)
+
+
 # ``session.resume`` refusals that mean "this viewer may not open that session": the caller keeps the
 # session it is on instead of adopting the target (startup resume, bare -c fallback).
 RESUME_REFUSALS = frozenset({"not_found", "permission_denied"})
@@ -192,6 +223,9 @@ class GatewayConnection:
         # True when that key is the typed ``--api-key`` (not a keyed startup alias's): a startup resume the
         # owner will not bind it to is refused as the thin client refuses it, never attached plain.
         self.launch_api_key_typed = False
+        # This viewer owns a session: admission is over, so its verbs keep the flat transport cap
+        # (see ADMISSION_VERBS). Set by the first answered ``session.create``/``session.resume``.
+        self._admitted = False
 
     @property
     def new_work(self) -> bool:
@@ -510,21 +544,43 @@ class GatewayConnection:
             wake.set()  # ends the watcher above
             await asyncio.gather(stop, return_exceptions=True)
 
+    def _answer_budget(self, method, timeout):
+        """``(budget, admission)`` for one request: the run's ONE admission budget until a session exists.
+
+        The admission verbs (``ADMISSION_VERBS``) are waited out by the client against the same
+        deadline ``connect_gateway`` opened for this run — including the seconds an owner that
+        publishes ``starting``/``restarting`` hands back (``GatewayClient._await_admission``) — and a
+        wait that expires there is filed as unit starvation, not as an unclassifiable transport
+        timeout. Everything else keeps ``DEFAULT_RPC_TIMEOUT``.
+        """
+        if timeout is not None:
+            return timeout, False
+        client = self.client
+        if method in ADMISSION_VERBS and not self._admitted and client is not None:
+            return admission_timeout(client, GATEWAY_STARTUP_RPC_DEADLINE_S), True
+        return DEFAULT_RPC_TIMEOUT, False
+
     def call_tagged(self, method, *, timeout=None, abandon=None, **params):
         """``(result, epoch)``: the epoch of the socket that carried the request, so work it admitted
         is tied to that gateway life even if another caller redials before this one reads ``epoch``.
         ``abandon`` (polled) true stops the wait with :class:`CallStopped`; the answer is dropped."""
         from concurrent.futures import wait
-        budget = DEFAULT_RPC_TIMEOUT if timeout is None else timeout
         if abandon is not None and abandon():
             raise CallStopped(method)
+        # The live socket FIRST: an admission verb's budget is the deadline that socket's client
+        # carries, so it must be read after the dial (``start``) and before the request is sent.
+        self.start()
+        budget, admission = self._answer_budget(method, timeout)
         future, epoch = self._send(method, budget, params)
-        deadline = time.monotonic() + budget + 5
+        deadline = time.monotonic() + answer_guard(budget, admission=admission)
         try:
             while abandon is not None and not wait([future], 0.1).done and time.monotonic() < deadline:
                 if abandon():
                     raise CallStopped(method)
-            return future.result(max(deadline - time.monotonic(), 0)), epoch
+            result = future.result(max(deadline - time.monotonic(), 0))
         except TimeoutError as exc:
             future.cancel()
             raise GatewayClientError(f"Gateway did not answer {method}") from exc
+        if method in _SESSION_VERBS:
+            self._admitted = True  # this viewer owns a session: admission is over
+        return result, epoch
