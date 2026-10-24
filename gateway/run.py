@@ -1807,15 +1807,21 @@ def _load_profile_secret_scope(profile_home: Path) -> dict:
 @_contextmanager
 def _profile_runtime_scope(
     profile_home: Path, prepared_secret_scope: Optional[dict] = None, *,
-    hydrate_secrets: bool = True):
+    hydrate_secrets: bool = True, prepared_terminal_scope: Optional[dict] = None):
     """Scope config/skills/memory AND credentials to a profile for one turn (multiplexed path only).
     ``set_hermes_home_override`` is a contextvar (reaches the agent worker via ``copy_context()``);
     ``set_secret_scope`` makes the profile ``.env`` the credential source without mutating
-    ``os.environ``, so subprocesses never inherit cross-profile secrets."""
+    ``os.environ``, so subprocesses never inherit cross-profile secrets.
+
+    *prepared_terminal_scope* is a policy built by the caller (the housekeeping tick's per-profile
+    bind, ``run_profile_reconcile.ServedProfile``): installing a built mapping is a ContextVar set,
+    while building one re-reads the profile's ``.env`` and ``config.yaml`` signature — on the
+    housekeeping thread those reads are what a busy multiplexed process charges ~17 ms apiece
+    (PRX-6164)."""
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from agent.secret_scope import set_secret_scope, reset_secret_scope
 
-    home_token = secret_token = None
+    home_token = secret_token = terminal_token = None
     try:
         home_token = set_hermes_home_override(str(profile_home))
         if prepared_secret_scope is not None:
@@ -1827,13 +1833,21 @@ def _profile_runtime_scope(
             secrets = owner_secret_scope(Path(profile_home))
         secret_token = set_secret_scope(secrets, profile_home=str(profile_home))
         # Install the routed profile's COMPLETE terminal policy, never ambient TERMINAL_* a prior turn set.
-        # Without it terminal_tool reads the process-global TERMINAL_* vars a previous profile's turn may have
-        # pinned (first-writer-wins backend leak; #68559).
-        from tools.terminal_scope import install_and_reset_profile_terminal_scope
+        # Without it terminal_tool reads the process-global TERMINAL_* vars a previous profile's turn may
+        # have pinned (first-writer-wins backend leak; #68559).
+        from tools.terminal_scope import (
+            install_built_profile_terminal_scope, install_profile_terminal_scope)
 
-        with install_and_reset_profile_terminal_scope(Path(profile_home)):
-            yield
+        if prepared_terminal_scope is not None:
+            terminal_token = install_built_profile_terminal_scope(prepared_terminal_scope)
+        else:
+            terminal_token = install_profile_terminal_scope(Path(profile_home))
+        yield
     finally:
+        if terminal_token is not None:
+            from tools.terminal_scope import reset_terminal_scope
+
+            reset_terminal_scope(terminal_token)
         if secret_token is not None:
             reset_secret_scope(secret_token)
         if home_token is not None:
