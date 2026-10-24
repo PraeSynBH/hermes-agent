@@ -475,6 +475,61 @@ class SessionMaintenanceMixin:
             self._record_db_file_identity()
         return optimized
 
+    def _vacuum_if_worthwhile(
+        self, now: float, min_vacuum_interval_days: int, min_vacuum_freelist_ratio: float,
+    ) -> dict[str, Any]:
+        """The ONE automatic VACUUM admission + rewrite; never raises.
+
+        Shared by :meth:`maybe_auto_prune_and_vacuum` (VACUUM only after its own prune freed rows)
+        and :meth:`maybe_auto_vacuum` (VACUUM with no prune at all), so the throttle, the holder
+        scan and the freelist gate cannot drift between them. Returns the report keys to merge into
+        the caller's result: always ``vacuumed``, plus ``freelist_ratio`` when the freelist was
+        measured, ``vacuum_skipped_holders`` when a live holder blocked it, and ``error`` on failure.
+        """
+        out: dict[str, Any] = {"vacuumed": False}
+        since_vacuum = _seconds_since(now, self.get_meta("last_vacuum"))
+        if since_vacuum is not None and since_vacuum < min_vacuum_interval_days * 86400:
+            return out
+        try:
+            out["freelist_ratio"] = ratio = self._freelist_ratio()
+            # Same admission `hermes sessions optimize` runs: VACUUM plus the TRUNCATE checkpoint
+            # retire the WAL generation a sibling writer (gateway, Desktop, dashboard, cron) still
+            # holds, and that is exactly the state every agent then refuses turns in (#110054).
+            # The foreign scan skips our own pid, so it is paired with the in-process arm: under
+            # one multiplexed process another live SessionDB generation for this same path is
+            # just as much a holder as another process would be.
+            # Automatic maintenance only ever SKIPS — a turn is never refused over housekeeping.
+            from hermes_state_holders import (
+                foreign_state_db_holders, in_process_state_db_holders)
+            holders = (foreign_state_db_holders(self.db_path)
+                       + in_process_state_db_holders(self.db_path, exclude=self))
+            if holders:
+                out["vacuum_skipped_holders"] = len(holders)
+                logger.debug(
+                    "state.db auto-maintenance: skipping VACUUM, %d other process(es) hold the "
+                    "store or a WAL sidecar (%s)",
+                    len(holders), ", ".join(f"{pid}:{target}" for pid, target in holders[:3]))
+            elif ratio is None or ratio > min_vacuum_freelist_ratio:
+                try:
+                    # VACUUM rewrites every page with ~zero CPU: renew the lease here so
+                    # a multi-minute rewrite on a large state.db never outlives the clamp.
+                    report_startup_progress(900.0, phase="state_db_auto_vacuum")
+                    self.vacuum()
+                    out["vacuumed"] = True
+                    self.set_meta("last_vacuum", str(now))
+                except Exception as exc:
+                    logger.warning("state.db VACUUM failed: %s", exc, exc_info=True)
+                    out["error"] = str(exc)
+            else:
+                logger.debug("state.db auto-maintenance: skipping VACUUM, only "
+                             "%.1f%% of pages reclaimable (threshold %.0f%%)",
+                             ratio * 100.0, min_vacuum_freelist_ratio * 100.0)
+        except Exception as exc:
+            # Maintenance never blocks startup; the traceback is what makes one failure diagnosable.
+            logger.warning("state.db VACUUM admission failed: %s", exc, exc_info=True)
+            out["error"] = str(exc)
+        return out
+
     def maybe_auto_prune_and_vacuum(
         self, retention_days: int = 90, min_interval_hours: int = 24, vacuum: bool = True,
         sessions_dir: Optional[Path] = None, min_vacuum_interval_days: int = 30,
@@ -534,43 +589,12 @@ class SessionMaintenanceMixin:
                 respect_gateway_heartbeats=False,  # state-owned lifecycles, not gateway heartbeats
             )
             result["closed"] = len(closed)
-            # VACUUM only if rows were freed, the time throttle passed AND the
-            # freelist ratio passed — it holds an exclusive lock for a full rewrite.
-            since_vacuum = _seconds_since(now, self.get_meta("last_vacuum"))
-            vacuum_due = since_vacuum is None or since_vacuum >= min_vacuum_interval_days * 86400
-            if vacuum and pruned > 0 and vacuum_due:
-                result["freelist_ratio"] = ratio = self._freelist_ratio()
-                # Same admission `hermes sessions optimize` runs: VACUUM plus the TRUNCATE checkpoint
-                # retire the WAL generation a sibling writer (gateway, Desktop, dashboard, cron) still
-                # holds, and that is exactly the state every agent then refuses turns in (#110054).
-                # The foreign scan skips our own pid, so it is paired with the in-process arm: under
-                # one multiplexed process another live SessionDB generation for this same path is
-                # just as much a holder as another process would be.
-                # Automatic maintenance only ever SKIPS — a turn is never refused over housekeeping.
-                from hermes_state_holders import (
-                    foreign_state_db_holders, in_process_state_db_holders)
-                holders = (foreign_state_db_holders(self.db_path)
-                           + in_process_state_db_holders(self.db_path, exclude=self))
-                if holders:
-                    result["vacuum_skipped_holders"] = len(holders)
-                    logger.debug(
-                        "state.db auto-maintenance: skipping VACUUM, %d other process(es) hold the "
-                        "store or a WAL sidecar (%s)",
-                        len(holders), ", ".join(f"{pid}:{target}" for pid, target in holders[:3]))
-                elif ratio is None or ratio > min_vacuum_freelist_ratio:
-                    try:
-                        # VACUUM rewrites every page with ~zero CPU: renew the lease here so
-                        # a multi-minute rewrite on a large state.db never outlives the clamp.
-                        report_startup_progress(900.0, phase="state_db_auto_vacuum")
-                        self.vacuum()
-                        result["vacuumed"] = True
-                        self.set_meta("last_vacuum", str(now))
-                    except Exception as exc:
-                        logger.warning("state.db VACUUM failed: %s", exc)
-                else:
-                    logger.debug("state.db auto-maintenance: skipping VACUUM, only "
-                                 "%.1f%% of pages reclaimable (threshold %.0f%%)",
-                                 ratio * 100.0, min_vacuum_freelist_ratio * 100.0)
+            # VACUUM only if rows were freed: the rewrite holds an exclusive lock, and the rest of
+            # the admission (time throttle, holder scan, freelist gate) is shared with the
+            # prune-less :meth:`maybe_auto_vacuum` so the two callers cannot drift.
+            if vacuum and pruned > 0:
+                result.update(self._vacuum_if_worthwhile(
+                    now, min_vacuum_interval_days, min_vacuum_freelist_ratio))
             # Record even when pruned == 0 so the throttle holds.
             self.set_meta("last_auto_prune", str(now))
             if closed or pruned > 0:
@@ -583,4 +607,39 @@ class SessionMaintenanceMixin:
             result["error"] = str(exc)
         finally:
             _release_auto_maintenance_lock(maintenance_lock)
+        return result
+
+
+    def maybe_auto_vacuum(
+        self, min_vacuum_interval_days: int = 30,
+        min_vacuum_freelist_ratio: float = AUTO_VACUUM_MIN_FREELIST_RATIO,
+    ) -> dict[str, Any]:
+        """Idempotent startup VACUUM with NO prune (never raises).  The reclaim path for a store whose
+        freelist was freed by someone else — an orphan GC, a manual delete, a sibling's cleanup — while
+        ``sessions.auto_prune`` stays off, because deleting session history is opt-in and must stay so.
+        Without this a host that is not pruning can never get its pages back: every external VACUUM is
+        refused by the holder scan while a long-lived gateway holds all the stores, and the gateway's
+        own VACUUM arm is unreachable until a prune frees rows.
+
+        Runs the same admission as the prune's VACUUM arm through :meth:`_vacuum_if_worthwhile`: the
+        ``min_vacuum_interval_days`` throttle on ``last_vacuum``, the holder scan (foreign processes plus
+        this process's other live generations, excluding this handle), and the freelist-ratio gate so a
+        dense store is never rewritten for nothing. It only ever SKIPS — automatic maintenance never
+        refuses a turn. Returns the :meth:`maybe_auto_prune_and_vacuum` report shape with
+        ``pruned``/``closed`` always 0; ``last_auto_prune`` is left untouched (nothing was pruned).
+        """
+        from hermes_state_repair import _release_auto_maintenance_lock, _try_acquire_auto_maintenance_lock
+        result: dict[str, Any] = {"skipped": False, "pruned": 0, "closed": 0, "vacuumed": False}
+        maintenance_lock = _try_acquire_auto_maintenance_lock(self.db_path)
+        if maintenance_lock is None:
+            result["skipped"] = True
+            return result
+        try:
+            result.update(self._vacuum_if_worthwhile(
+                time.time(), min_vacuum_interval_days, min_vacuum_freelist_ratio))
+        finally:
+            _release_auto_maintenance_lock(maintenance_lock)
+        if result["vacuumed"]:
+            logger.info("state.db auto-maintenance: VACUUM (no prune) reclaimed %.1f%% of pages",
+                        (result.get("freelist_ratio") or 0.0) * 100.0)
         return result

@@ -60,6 +60,14 @@ def _run_state_db_auto_maintenance(session_db) -> None:
                 min_interval_hours=int(cfg.get("min_interval_hours", 24)),
             )
 
+        # VACUUM with no prune: the reclaim arm for a store whose freelist was freed by anything
+        # other than this prune (an orphan GC, a manual delete) — reachable only when a CLI owns the
+        # store, since the holder scan skips while a gateway holds it.
+        if cfg.get("auto_vacuum", False):
+            session_db.maybe_auto_vacuum(
+                min_vacuum_interval_days=int(cfg.get("min_vacuum_interval_days", 30)),
+            )
+
         if not cfg.get("auto_prune", False):
             return
         session_db.maybe_auto_prune_and_vacuum(
