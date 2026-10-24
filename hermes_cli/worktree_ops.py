@@ -483,6 +483,7 @@ def _setup_worktree(repo_root: str | None = None, sync_base: bool = True,
         from hermes_cli.tui_worktree_resume import record_tui_worktree
         record_tui_worktree({"path": str(wt_path), "branch": branch_name, "repo_root": repo_root})
     population = worktree_pool.note_created(repo_root, admission.count) if admission.measured else 0
+    worktree_pool.clear_refusal(repo_root)  # this repo just admitted one; no cap refusal stands
     _cprint(f"\033[32m✓ Worktree created:\033[0m {wt_path}"
             + (f" ({population}/{admission.cap} in this repo)" if admission.measured else ""))
     print(f"  Branch: {branch_name}")

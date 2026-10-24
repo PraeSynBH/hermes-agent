@@ -33,6 +33,11 @@ RECLAIM_IDLE_HOURS = 24
 _count_cache: dict[str, int] = {}
 _count_lock = threading.Lock()
 
+# Last refusal per repo, for callers that must tell "at the cap" from "git broke": a refused
+# creation is a capacity condition, not a failure of the launch, so the CLI books it as a
+# deferral (EX_TEMPFAIL) instead of an error the dispatcher would count against the task.
+_last_refusal: dict[str, Admission] = {}
+
 
 @dataclass
 class Admission:
@@ -159,7 +164,20 @@ def admit(repo_root: str) -> Admission:
     verdict = Admission(count - freed < cap, count - freed, cap, freed)
     if not verdict.allowed:
         logger.warning("Refusing to create a worktree in %s: %s", repo_root, refusal_text(verdict))
+        _last_refusal[os.path.realpath(repo_root)] = verdict
     return verdict
+
+
+def last_refusal(repo_root: str) -> Optional[Admission]:
+    """The refusal this process booked for *repo_root*, or None — so a launch whose worktree
+    setup returned None can tell "the repo is at its cap" (a capacity deferral) from "git or the
+    filesystem failed" (an error). Absent for an admitted creation."""
+    return _last_refusal.get(os.path.realpath(repo_root))
+
+
+def clear_refusal(repo_root: str) -> None:
+    """Drop the booked refusal for *repo_root* — called once a creation succeeds."""
+    _last_refusal.pop(os.path.realpath(repo_root), None)
 
 
 def refusal_text(verdict: Admission) -> str:

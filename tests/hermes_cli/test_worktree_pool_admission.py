@@ -174,6 +174,50 @@ def test_subagent_tree_is_refused_at_the_cap_and_degrades_to_the_parent_cwd(repo
     assert _linked(repo) == 1
 
 
+def test_a_cap_refusal_is_booked_for_the_launcher_and_cleared_by_an_admission(repo):
+    """A refusal at the cap must be tellable from a broken git by the caller that aborts the
+    launch: the marker carries the verdict, an admitted creation clears it, and an unbounded repo
+    never books one."""
+    from hermes_cli import worktree_pool
+    from hermes_cli.worktree_ops import _setup_worktree
+
+    worktree_pool.reset_cache()
+    worktree_pool.clear_refusal(str(repo))
+    _set_worktrees_config("  max_linked: 1\n")
+    _tree(repo, "hermes-busy")
+
+    assert _setup_worktree(str(repo), sync_base=False) is None
+    booked = worktree_pool.last_refusal(str(repo))
+    assert booked is not None and booked.allowed is False
+    assert (booked.count, booked.cap) == (1, 1)
+
+    # room for one more: the next creation admits and drops the marker
+    _set_worktrees_config("  max_linked: 3\n")
+    assert _setup_worktree(str(repo), sync_base=False) is not None
+    assert worktree_pool.last_refusal(str(repo)) is None
+
+
+def test_cli_reports_a_cap_refusal_so_the_launch_defers_instead_of_failing(repo):
+    """``cli.main`` exits 0 with no session when worktree setup returns None, which the dispatcher
+    books as a failure. The cap case must surface as a deferral, so the seam ``main`` reads has to
+    answer with the refusal text — and stay silent for any other setup failure."""
+    import cli
+    from hermes_cli import worktree_pool
+    from hermes_cli.worktree_ops import _setup_worktree
+
+    worktree_pool.reset_cache()
+    worktree_pool.clear_refusal(str(repo))
+    _set_worktrees_config("  max_linked: 1\n  reclaim_before_admit: false\n")
+    _tree(repo, "hermes-busy")
+
+    assert _setup_worktree(str(repo), sync_base=False) is None
+    refusal = cli._worktree_cap_refusal(repo_root=str(repo))
+    assert refusal and "1/1" in refusal and "hermes worktree prune" in refusal
+
+    worktree_pool.clear_refusal(str(repo))
+    assert cli._worktree_cap_refusal(repo_root=str(repo)) is None
+
+
 def test_settings_read_the_registered_keys_and_coerce_them(repo):
     """``sweep_settings`` is the one reader of ``worktrees.*``; both keys answer from config."""
     from hermes_cli.worktree_sweep import sweep_settings

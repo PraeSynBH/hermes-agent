@@ -542,6 +542,24 @@ from hermes_cli.worktree_ops import (
     release_lsp_clients,
 )
 
+
+def _worktree_cap_refusal(repo_root: Optional[str] = None) -> Optional[str]:
+    """Refusal text when THIS process refused a worktree because its repo is at the cap, else None.
+
+    ``_setup_worktree`` returns None both when admission refused at ``worktrees.max_linked`` and
+    when git or the filesystem failed. The first is a capacity condition — the run never entered an
+    isolated tree and lost nothing — so ``main`` books it as ``TURN_NOT_ADMITTED_EXIT_CODE``
+    (EX_TEMPFAIL) and the dispatcher re-offers it instead of counting a failure against the task.
+    """
+    try:
+        from hermes_cli import worktree_pool
+        repo = repo_root or _git_repo_root()
+    except Exception:
+        return None
+    verdict = worktree_pool.last_refusal(repo) if repo else None
+    return worktree_pool.refusal_text(verdict) if verdict else None
+
+
 # ============================================================================= Git Worktree Isolation
 # (#652) =============================================================================
 _active_worktree: Optional[dict[str, str]] = None
@@ -1763,6 +1781,13 @@ def main(
     # A requested worktree whose setup failed aborts: never silently run without isolation.
     wt_info = _join_worktree() if _join_worktree is not None else None
     if _join_worktree is not None and not wt_info:
+        # Still never silently run without isolation — but a repo at its worktree cap is a
+        # capacity condition, not a failed launch: exit EX_TEMPFAIL so the dispatch re-offers it.
+        refusal = _worktree_cap_refusal()
+        if refusal:
+            from hermes_cli.turn_exit import TURN_NOT_ADMITTED_EXIT_CODE
+            print(f"hermes: no worktree isolation in this repo — {refusal}", file=sys.stderr)
+            sys.exit(TURN_NOT_ADMITTED_EXIT_CODE)
         return
 
     # The worktree note is rendered by the gateway from the session's folder (agent/coding_context.py).
