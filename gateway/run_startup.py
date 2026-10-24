@@ -91,8 +91,9 @@ class GatewayStartupMixin:
         logger.info("Agent budget: max_iterations=%s (agent.max_turns from config.yaml, else the HERMES_MAX_ITERATIONS bridge)",
                     "unlimited" if limit == TURN_LIMIT_UNLIMITED else limit)
 
-    # A configured platform failed non-retryably this boot and is parked: every "we are serving"
-    # status stamp (startup, drain release, scale-to-zero wake) must say ``degraded``, not ``running``.
+    # A configured platform failed non-retryably (at boot, or mid-run on the stay_alive path) and
+    # is parked: every "we are serving" status stamp (startup, drain release, scale-to-zero wake)
+    # must say ``degraded``, not ``running``.
     _startup_parked_platforms: bool = False
 
     def _serving_state(self) -> str:
@@ -1487,6 +1488,22 @@ class GatewayStartupMixin:
             return False
         if startup_nonretryable_errors and not startup_retryable_errors:
             reason = "; ".join(startup_nonretryable_errors)
+            if self._on_all_adapters_down() == "stay_alive":
+                # The operator's policy is "a messaging transport never takes the process down",
+                # and it is the CORRECT reading here: messaging adapter count is not a proxy for
+                # "is this process useful". Cron, the control socket and agent ingress need no
+                # platform at all, so exit 78 turns one logged-out optional platform into a
+                # supervisor restart loop that starves every run (SOU-4201). Park the fatal
+                # failures and serve the rest of the gateway's surface, degraded.
+                from gateway.run_stay_alive import park_and_report_degraded
+                logger.error(
+                    "Gateway hit a non-retryable startup conflict: %s — no messaging platform "
+                    "connected, but on_all_adapters_down=stay_alive: parking the platform(s) and "
+                    "serving cron / control socket / agent ingress. Fix the reported error, then "
+                    "`hermes gateway restart`.", reason,
+                )
+                park_and_report_degraded(self)
+                return False
             logger.error("Gateway hit a non-retryable startup conflict: %s", reason)
             self._startup_fail_fatal_config(reason)
             return True

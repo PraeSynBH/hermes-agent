@@ -29,6 +29,7 @@ from gateway.alert_webhook import page_platform_fatal, page_platform_recovered
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.helpers import carry_inbound_dedup, hand_over_held_inbound
 from gateway.restart import is_global_startup_conflict
+from gateway.run_stay_alive import stay_alive_after_losing_the_last_adapters
 from gateway.run_shutdown import _log_suppressed
 from gateway.session import SessionSource
 from hermes_cli.observability.shared_metrics_gateway import record_platform_connect, record_platform_disconnect
@@ -403,16 +404,10 @@ class GatewayAdapterLifecycleMixin:
             # after.
             await self._safe_adapter_disconnect(adapter, adapter.platform)
         if not self.adapters and not self._failed_platforms:
-            if adapter.fatal_error_retryable and self._on_all_adapters_down() == "stay_alive":
-                # No supervising service manager to revive the process (#118080): stay alive and
-                # keep serving cron / api_server / dashboard while the reconnect watcher owns
-                # recovery of the lost platform.
-                logger.warning(
-                    "No connected messaging platforms remain; on_all_adapters_down=stay_alive — "
-                    "gateway staying alive, reconnect watcher owns recovery of %s.",
-                    adapter.platform.value,
-                )
-                self._ensure_reconnect_watcher_running()
+            if self._on_all_adapters_down() == "stay_alive":
+                # No supervisor will revive this process (#118080) and local ingress needs no
+                # platform: a non-retryable loss is parked degraded instead of exiting 78 (SOU-4201).
+                stay_alive_after_losing_the_last_adapters(self, adapter)
                 return
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
             if adapter.fatal_error_retryable:
