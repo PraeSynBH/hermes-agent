@@ -904,13 +904,86 @@ def _resolve_shell_init_files() -> list[str]:
     return resolved
 
 
+# Name of the shell variable holding the PATH this process inherited, saved before the init
+# files run so :func:`_inherited_path_order_shell` can restore their relative order.
+_INHERITED_PATH_VAR = "__hermes_inherited_path"
+
+
+def _inherited_path_order_shell() -> str:
+    """Shell lines restoring the inherited PATH's relative order after the init files ran.
+
+    A login shell hands us the parent's PATH; an init file that re-prepends a directory
+    (``brew shellenv``, rustup, any ``PATH="…:$PATH"``) demotes EVERY entry that came before
+    it. A machine that puts a security shim first in its PATH (a ``docker``/``node`` wrapper
+    directory that must shadow the real binary) therefore reaches the agent with the shim
+    behind the binary it was meant to guard, even though the parent process resolved the
+    shim. The snapshot is what every terminal command runs with, so this is the population
+    that leaks — not the human's shell, which re-applies its own ordering at the end of its rc.
+
+    Only entries BOTH PATHs list are reordered, and they keep the parent's order: a directory
+    the init files alone contribute (nvm/asdf/pyenv, a venv, ``brew shellenv`` on a
+    launchd-started gateway) keeps the position they gave it, so the snapshot's reason to exist
+    is untouched. Duplicates collapse (first occurrence wins) — the shell already resolved
+    them that way before, so re-sourcing cannot grow the PATH without bound.
+
+    Safe on an empty PATH and on entries containing glob characters (``set -f``)."""
+    var = _INHERITED_PATH_VAR
+    shared, pending = f"{var}_shared", f"{var}_pending"
+    return "\n".join((
+        f'if [ -n "${{{var}:-}}" ]; then',
+        f"  {var}_ifs=$IFS; IFS=':'; set -f",
+        # 1. the inherited entries still present, in inherited order (deduped). `shared` is
+        #    the immutable membership set; `pending` is consumed one entry per slot below.
+        f"  {shared}=''",
+        f'  for {var}_dir in ${var}; do',
+        f'    [ -n "${{{var}_dir}}" ] || continue',
+        f'    case ":$PATH:" in *":${{{var}_dir}}:"*) ;; *) continue ;; esac',
+        f'    case ":${{{shared}}}:" in *":${{{var}_dir}}:"*) continue ;; esac',
+        f'    {shared}="${{{shared}}}${{{var}_dir}}:"',
+        "  done",
+        f'  if [ -n "${{{shared}}}" ]; then',
+        f'    {pending}="${{{shared}}}"',
+        # 2. walk the post-init PATH; the first occurrence of each shared dir is a slot and
+        #    takes the next inherited entry, so shared dirs keep the parent's order while
+        #    init-only dirs stay exactly where the init files put them.
+        f"    {var}_out='' {var}_seen=':' {var}_done=':'",
+        f"    for {var}_dir in $PATH; do",
+        f'      [ -n "${{{var}_dir}}" ] || continue',
+        f'      case ":${{{shared}}}:" in *":${{{var}_dir}}:"*)',
+        f'        case "${{{var}_done}}" in *":${{{var}_dir}}:"*) continue ;; esac',
+        f'        {var}_done="${{{var}_done}}${{{var}_dir}}:"',
+        f'        {var}_take="${{{pending}%%:*}}"',
+        f'        {pending}="${{{pending}#*:}}"',
+        f'        {var}_out="${{{var}_out}}${{{var}_take}}:"',
+        "        continue ;;",
+        "      esac",
+        f'      case "${{{var}_seen}}" in *":${{{var}_dir}}:"*) continue ;; esac',
+        f'      {var}_seen="${{{var}_seen}}${{{var}_dir}}:"',
+        f'      {var}_out="${{{var}_out}}${{{var}_dir}}:"',
+        "    done",
+        f"    IFS=${var}_ifs; set +f",
+        f'    PATH=${{{var}_out%:}}; export PATH',
+        "  else",
+        f"    IFS=${var}_ifs; set +f",
+        "  fi",
+        f"  unset {var}_dir {var}_ifs {var}_out {var}_seen {var}_done {var}_take {shared} {pending} {var}",
+        "fi",
+    ))
+
+
 def _prepend_shell_init(cmd_string: str, files: list[str]) -> str:
     """Prepend guarded, silent ``source <file>`` lines: ``set +e`` keeps going on
-    errors, ``2>/dev/null`` hides noisy prompts, ``|| true`` neutralises the status."""
+    errors, ``2>/dev/null`` hides noisy prompts, ``|| true`` neutralises the status.
+
+    The inherited PATH is saved first and its relative order restored afterwards
+    (:func:`_inherited_path_order_shell`), so re-sourcing the user's init files cannot demote
+    an entry the parent process had earlier — see PRX-6197 for the shim it stranded."""
     if not files:
         return cmd_string
     safe = [p.replace("'", "'\\''") for p in files]
-    prelude = ["set +e", *(f"[ -r '{p}' ] && . '{p}' 2>/dev/null || true" for p in safe)]
+    prelude = ["set +e", f'{_INHERITED_PATH_VAR}="$PATH"',
+               *(f"[ -r '{p}' ] && . '{p}' 2>/dev/null || true" for p in safe),
+               _inherited_path_order_shell()]
     return "\n".join(prelude) + "\n" + cmd_string
 
 
