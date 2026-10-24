@@ -4,6 +4,13 @@ At boot the gateway adopted an already-running bridge (``_attach_to_bridge(None)
 Popen to poll: ``_check_managed_bridge_exit`` returned ``None`` forever while the poll loop spun on the
 dead port (2,571 "Poll error" lines over 6.5 h) with no fatal error, no reconnect and no board signal.
 A paging channel was fully down while every status surface said "connected".
+
+PRA-7000 adds the other half: the ONE death the adapter classified by reading bridge.log could miss
+the line it was looking for. bridge.js prints "listening" then, on a revoked companion device,
+"Logged out." and exits(1) — all within seconds of the spawn, so an offset recorded when the adapter
+attached (after a 30 s startup wait) sits PAST the logout. The verdict fell back to a retryable
+"bridge exited", the card promised auto-recovery that cannot re-pair a device, and the bridge was
+respawned forever.
 """
 
 import asyncio
@@ -117,6 +124,87 @@ async def test_old_logged_out_lines_from_before_attach_do_not_mislabel_a_crash(t
 
     assert await adapter._check_managed_bridge_exit() is not None
     assert adapter.fatal_error_code == "whatsapp_bridge_exited"
+
+
+@pytest.mark.asyncio
+async def test_a_logout_written_before_the_attach_offset_is_still_logged_out(tmp_path):
+    """PRA-7000: the offset is recorded at attach, which can be PAST the logout line.
+
+    Production (PRA-6998): bridge.log held "listening on port 49641" at 05:02:14 and "Logged out." at
+    05:02:20, and the minute-later exit was reported as ``whatsapp_bridge_exited`` — retryable — because
+    the bytes the check read started after the logout. The start marker delimits the spawn, so the read
+    no longer depends on when the adapter attached.
+    """
+    log = tmp_path / "bridge.log"
+    log.write_text(
+        "2026-10-24 05:02:14,292 🌉 WhatsApp bridge listening on port 49641 (mode: bot)\n"
+        "2026-10-24 05:02:20,570 ❌ Logged out. Delete session and restart to re-authenticate.\n",
+        encoding="utf-8")
+    adapter = _make_adapter(tmp_path / "session")
+    adapter._bridge_log = log
+    adapter._bridge_log_offset = log.stat().st_size  # attached AFTER the logout was written
+    _dead(adapter)
+
+    assert await adapter._check_managed_bridge_exit() is not None
+    assert adapter.fatal_error_code == "whatsapp_logged_out"
+    assert adapter.fatal_error_retryable is False, (
+        "a revoked companion device is only repairable by a human scanning the QR")
+
+
+@pytest.mark.asyncio
+async def test_a_logout_is_found_past_a_crash_loops_log_noise(tmp_path):
+    """The 4000-byte tail was a second way to miss it: one crash loop can overrun the window."""
+    log = tmp_path / "bridge.log"
+    noise = "".join(f"Error: reconnect attempt {i} failed\n" for i in range(400))
+    log.write_text(
+        "🌉 WhatsApp bridge listening on port 49641 (mode: bot)\n" + noise +
+        "❌ Logged out. Delete session and restart to re-authenticate.\n",
+        encoding="utf-8")
+    adapter = _make_adapter(tmp_path / "session")
+    adapter._bridge_log = log
+    adapter._bridge_log_offset = log.stat().st_size
+    _dead(adapter)
+
+    assert await adapter._check_managed_bridge_exit() is not None
+    assert adapter.fatal_error_code == "whatsapp_logged_out"
+
+
+def test_a_bridge_that_dies_during_the_startup_wait_is_classified_not_defaulted(tmp_path):
+    """The production path: the exit lands while connect() waits for /health, before any attach.
+
+    ``_bridge_died`` used to set ``retryable=True`` without consulting bridge.log at all, so even a
+    logout it had the evidence for was paged as a self-healing HIGH instead of a CRITICAL that needs a
+    human (PRA-7000).
+    """
+    log = tmp_path / "bridge.log"
+    log.write_text(
+        "🌉 WhatsApp bridge listening on port 49641 (mode: bot)\n"
+        "❌ Logged out. Delete session and restart to re-authenticate.\n",
+        encoding="utf-8")
+    adapter = _make_adapter(tmp_path / "session")
+    adapter._bridge_log = log
+    adapter._bridge_log_offset = 0  # recorded before the spawn: every startup byte is in scope
+
+    assert adapter._bridge_died("Bridge process died (exit code 1)") is False
+    assert adapter.fatal_error_code == "whatsapp_logged_out"
+    assert adapter.fatal_error_retryable is False
+    assert "hermes whatsapp" in adapter.fatal_error_message
+
+
+def test_a_startup_crash_with_no_logout_line_stays_retryable(tmp_path):
+    """The other direction: a real startup crash must still reach the reconnect watcher."""
+    log = tmp_path / "bridge.log"
+    log.write_text(
+        "🌉 WhatsApp bridge listening on port 49641 (mode: bot)\n"
+        "Error: Cannot find package '@whiskeysockets/baileys'\n",
+        encoding="utf-8")
+    adapter = _make_adapter(tmp_path / "session")
+    adapter._bridge_log = log
+    adapter._bridge_log_offset = 0
+
+    assert adapter._bridge_died("Bridge process died (exit code 1)") is False
+    assert adapter.fatal_error_code == "whatsapp_bridge_exited"
+    assert adapter.fatal_error_retryable is True
 
 
 @pytest.mark.asyncio

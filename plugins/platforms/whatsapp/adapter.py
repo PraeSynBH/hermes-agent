@@ -350,6 +350,16 @@ _ADOPTED_BRIDGE_WEDGED_STREAK = 2 * _ADOPTED_BRIDGE_DEAD_STREAK
 _BRIDGE_HEALTH_PROBE_SECS = 15
 _BRIDGE_NOT_CONNECTED_SECS = 60
 
+# bridge.js's first line on a normal start, and the only per-spawn boundary in bridge.log (it is opened
+# in append mode, so one file holds every restart). The logged-out check anchors on the LAST of these
+# instead of on the adapter's attach offset: on a logged-out session bridge.js writes "listening" and
+# then "Logged out." within seconds and exits, which is before _wait_for_bridge returns and before an
+# attach-time offset could ever cover it (PRA-7000).
+_BRIDGE_START_MARKER = b"listening on port"
+# One spawn's log is small; this bound only exists so a crash loop cannot make the read unbounded. It is
+# 1 MiB instead of the 4000-byte tail that missed the logout line once a crash loop had overrun it.
+_BRIDGE_LOG_SCAN_BYTES = 1 << 20
+
 
 def _needs_bridge(method):
     """Adapter-method decorator: return ``SendResult(error=...)`` when ``_bridge_unavailable()`` says so."""
@@ -481,8 +491,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # An adopted bridge has no log handle of its own; naming its log here keeps exit messages and the
         # logged-out check pointed at the file bridge.js actually writes.
         self._bridge_log = self._bridge_log or (self._session_path.parent / "bridge.log")
-        with suppress(OSError):
-            self._bridge_log_offset = self._bridge_log.stat().st_size
+        if managed_process is None:
+            # Adopted: the moment we attached is the earliest boundary we can honestly claim. A bridge we
+            # spawned keeps the boundary connect() recorded BEFORE the spawn — moving it here would put it
+            # past the startup lines, which is exactly how a logged-out death read as a retryable crash.
+            with suppress(OSError):
+                self._bridge_log_offset = self._bridge_log.stat().st_size
         self._bridge_unreachable_streak = 0
         self._last_bridge_health_probe = 0.0
         self._bridge_not_connected_since = None
@@ -562,8 +576,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         print(f"[{self.name}] {detail}")
         print(f"[{self.name}] Check log: {self._bridge_log}")
         self._close_bridge_log()
+        if code == "whatsapp_bridge_exited":
+            # This is the startup death — the same event as the managed exit below, only reported before
+            # the bridge ever answered. It used to set "retryable" unconditionally, so a logged-out
+            # session (bridge.js writes "Logged out." and exits(1) seconds after "listening") produced a
+            # retryable verdict, a HIGH card promising auto-recovery, and a respawn of a doomed bridge
+            # every backoff (PRA-7000). Classify it the same way the post-attach paths do.
+            code, detail = self._bridge_gone_cause(f"{detail} (see {self._bridge_log})")
         # Named so the reconnect status and connect telemetry say why instead of an unclassified failure.
-        self._set_fatal_error(code, f"{detail} (see {self._bridge_log})", retryable=True)
+        self._set_fatal_error(code, detail, retryable=code != "whatsapp_logged_out")
         return False
 
     async def _poll_bridge_health(self, died_msg: str) -> tuple[Optional[bool], bool, dict]:
@@ -714,6 +735,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Bridge output goes to a log file so QR codes, errors, and reconnection messages survive for troubleshooting.
             self._bridge_log = self._session_path.parent / "bridge.log"
             self._bridge_log_fh = bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")  # noqa: ASYNC230 -- long-lived log handle handed to the bridge subprocess
+            # The logged-out check's boundary belongs to the SPAWN, not to the attach that follows a
+            # successful _wait_for_bridge: bridge.js writes "listening" and, on a revoked session,
+            # "Logged out." within seconds of this line, so an attach-time offset lands past the one line
+            # that names the cause (PRA-7000).
+            with suppress(OSError):
+                self._bridge_log_offset = self._bridge_log.stat().st_size
             node = find_node_executable("node")
             if node is None:
                 raise RuntimeError("Node.js is no longer available; run `hermes pm install`")
@@ -824,25 +851,48 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """``(code, message)`` naming a logged-out session — the one bridge death a human has to fix.
 
         bridge.js exits(1) on ``DisconnectReason.loggedOut`` after writing "Logged out." (or a
-        ``logged_out`` pair event), and an exit code alone cannot tell that from a startup crash. Only
-        bytes written after this adapter attached are read, so an old logout in an appended log cannot
-        mislabel a fresh crash.
+        ``logged_out`` pair event), and an exit code alone cannot tell that from a startup crash. The
+        read starts at the LAST ``listening on port`` line so the signal cannot be missed: bridge.log is
+        appended across restarts and the adapter's offset is recorded after a successful startup wait,
+        so in production the logout line sits behind that offset; a fixed-size tail could also be
+        overrun by crash-loop output. Missing the line is how a logged-out session was reported as
+        retryable, with a card promising a recovery no respawn can deliver (PRA-7000).
         """
-        offset = getattr(self, "_bridge_log_offset", 0) or 0
-        try:
-            # Binary on purpose: the offset is a byte count, and the tail is decoded with errors="replace".
-            with open(self._bridge_log or (self._session_path.parent / "bridge.log"), "rb") as fh:  # windows-footgun: ok -- binary read; no text-mode encoding applies
-                fh.seek(offset)
-                tail = fh.read()[-4000:].decode("utf-8", "replace")
-        except OSError:
-            tail = ""
-        if "Logged out." in tail or "logged_out" in tail:
+        text = self._bridge_log_since_start().decode("utf-8", "replace")
+        if "Logged out." in text or "logged_out" in text:
             return ("whatsapp_logged_out",
                     "WhatsApp session is logged out — the linked device is gone, so no message can be sent or "
                     "received. Re-pair it with `hermes whatsapp` (scan the QR) and then restart the gateway: this "
                     "is not retried automatically, because bridge.js exits on a logged-out session and every "
                     f"retry would re-spawn a bridge that cannot connect. Bridge log: {self._bridge_log or (self._session_path.parent / 'bridge.log')}")
         return "whatsapp_bridge_exited", fallback_message
+
+    def _bridge_log_since_start(self) -> bytes:
+        """Bytes the bridge process that just died wrote, or ``b""`` when the log cannot be read.
+
+        Anchor: the last ``listening on port`` line (bridge.js's first write on a normal start), falling
+        back to the offset recorded before this process was spawned or adopted. Anchoring on the start
+        line rather than the offset is what makes a logout unmissable when it was written before the
+        adapter attached. The trade is a possible false "logged out" for a session that logged out in an
+        EARLIER spawn and whose replacement then died before it could print its own start line; that
+        verdict is non-retryable and tells a human to re-pair, which is a safe place to land — the
+        reverse (a doomed retry loop with a card promising recovery) is not (PRA-7000).
+        """
+        path = self._bridge_log or (self._session_path.parent / "bridge.log")
+        try:
+            # Binary on purpose: offsets are byte counts, and the segment is decoded with errors="replace".
+            with open(path, "rb") as fh:  # windows-footgun: ok -- binary read; no text-mode encoding applies
+                size = fh.seek(0, os.SEEK_END)
+                window_start = max(0, size - _BRIDGE_LOG_SCAN_BYTES)
+                fh.seek(window_start)
+                data = fh.read()
+        except OSError:
+            return b""
+        start = data.rfind(_BRIDGE_START_MARKER)
+        if start != -1:
+            return data[start:]
+        offset = getattr(self, "_bridge_log_offset", 0) or 0
+        return data[max(0, offset - window_start):]
 
     def _terminate_bridge(self, *, force: bool) -> None:
         try:
