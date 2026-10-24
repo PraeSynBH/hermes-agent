@@ -275,6 +275,7 @@ def maybe_run_gateway_check(
     plugins_dir: Optional[Path] = None,
     log=None,
     now: Optional[float] = None,
+    config_get: Optional[Callable] = None,
 ) -> Optional[list]:
     """The tick every gateway boot / housekeeping pass calls.
 
@@ -288,6 +289,10 @@ def maybe_run_gateway_check(
     Returns the check results, or None when not due / disabled. Due-gated
     by ``plugins.auto_update_check_hours`` (0 disables); a network error
     costs one warning and a stamped marker — never an apply.
+
+    *config_get* is the caller's ``(section, key)`` reader over a config it
+    already loaded — the housekeeping tick binds one per served profile per
+    tick (PRX-6137) instead of this arm re-reading ``config.yaml``.
     """
     if plugins_dir is None:
         from hermes_cli import plugins_cmd
@@ -307,6 +312,7 @@ def maybe_run_gateway_check(
         from functools import partial
         apply_updates_fn = partial(plugins_cmd.cmd_update, interactive=False)
     return run_scheduled_check(
+        config_get=config_get,
         run_checks_fn=run_checks_fn,
         plugins_dir=plugins_dir,
         apply_updates_fn=apply_updates_fn,

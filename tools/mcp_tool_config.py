@@ -694,17 +694,23 @@ def _portable_mcp_servers(safe_servers: dict[str, dict], rejected: frozenset[str
         logger.debug("Failed to load portable MCP servers", exc_info=True)
 
 
-def _load_mcp_config() -> dict[str, dict]:
-    """``mcp_servers`` from config.yaml as ``{name: config}`` (empty on error / safe mode), ``${VAR}`` interpolated."""
+def _load_mcp_config(config: dict | None = None) -> dict[str, dict]:
+    """``mcp_servers`` from config.yaml as ``{name: config}`` (empty on error / safe mode), ``${VAR}`` interpolated.
+
+    *config* is an already-loaded read-only config to take ``mcp_servers`` from (the housekeeping
+    tick's per-profile bind, PRX-6137) — it saves the read and the deepcopy, and is not mutated
+    here. ``None`` reads the current config, as every non-tick caller wants."""
     from agent.safe_worker_policy import safe_worker_enabled
     if safe_worker_enabled():
         return {}
     try:
-        from hermes_cli.config import load_config
         from utils import env_var_enabled as _env_enabled
         if _env_enabled("HERMES_SAFE_MODE"):
             return {}
-        servers = load_config().get("mcp_servers")
+        if config is None:
+            from hermes_cli.config import load_config
+            config = load_config()
+        servers = config.get("mcp_servers")
         try:  # ensure .env vars are available for interpolation
             from hermes_cli.env_loader import load_hermes_dotenv
             load_hermes_dotenv()

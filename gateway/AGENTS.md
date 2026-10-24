@@ -173,6 +173,14 @@ gateway under the backend, and do NOT "fix" update locks by widening the tree-ki
   Resolve the owning home from the session record (`profile_home`, `agent:<profile>:` key), never
   from `os.environ`, which holds the launch profile. Why: eviction that flushed under the launch scope
   wrote a secondary profile's memories into the default profile's store, silently.
+- **A housekeeping tick binds each served profile ONCE.** `run_profile_reconcile.py::ServedProfile`
+  holds one profile's home, its hydrated secret scope and (lazily) its `load_config_readonly()`;
+  `_run_due_chores` opens the window (`begin_housekeeping_tick`) and every per-profile arm on that
+  tick reuses the binding instead of re-entering the scope and re-reading config. Take the config
+  from the binding (`bound_profile_chore`) rather than calling `load_config*()` in a per-profile
+  chore — on 17 served homes the fan-out was ~1.6 s a pass and a tick paid it per arm (PRX-6137).
+  The window is tick-scoped, never process-scoped: a config edited mid-run must be seen by the next
+  tick's DRIFT reconcile (#112445), which is why `end_housekeeping_tick` drops the bindings.
 - **`api_server` rebuilds the agent per request but not the memory provider.** The adapter bypasses
   `TurnRunner` and the agent cache (per-request callbacks, model route, ephemeral prompt), so
   `platforms/api_server_memory_sessions.py` parks each session's initialised `MemoryManager` between

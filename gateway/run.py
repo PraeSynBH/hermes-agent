@@ -4478,7 +4478,8 @@ def _start_gateway_housekeeping(
     running long, and ``carried_chores`` is what makes that a rotation: the most-starved chore goes
     first next tick (PRX-6104)."""
     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
-    from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
+    from gateway.run_profile_reconcile import (
+        _mcp_config_reconciler, bound_profile_chore, profile_scoped_chore)
     from gateway.run_housekeeping_disk import housekeeping_media_caches, maybe_post_auto_prune_prompt
     from gateway.run_identity import reconcile_orphans as _housekeeping_reconcile_orphans
     chores: list[tuple[int, str, Any]] = [
@@ -4515,7 +4516,9 @@ def _start_gateway_housekeeping(
         # Due-gated inside: the first tick after startup runs an overdue check, not tick 60.
         # Per served profile: plugins dir, last-run marker and plugins.auto_apply are all the
         # profile's own (get_hermes_home()/load_config_readonly() bind to the scope).
-        (1, "Plugin update check", profile_scoped_chore(runner, _housekeeping_plugin_update_check)),
+        # Bound variant: the cadence reads ``plugins.*`` off the tick's bind instead of loading
+        # config.yaml again per profile (PRX-6137).
+        (1, "Plugin update check", bound_profile_chore(runner, _housekeeping_plugin_update_check)),
         (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
         # Polled every 5th tick, not every tick (PRX-6104). On macOS malloc_trim does not exist, so
         # trim_memory() can only run a full gc.collect() — which holds the GIL for 1-9 s on this

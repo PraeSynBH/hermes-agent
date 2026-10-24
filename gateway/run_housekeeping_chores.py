@@ -119,6 +119,7 @@ def _run_due_chores(chores, tick_count: int, carried: dict | None = None,
     is due — the checkpoint prune and the state.db maintenance are both gated that way.
     """
     from gateway.loop_tick_timing import timed
+    from gateway.run_profile_reconcile import begin_housekeeping_tick, end_housekeeping_tick
     budget = HOUSEKEEPING_TICK_BUDGET_S if budget_s is None else budget_s
     carried = {} if carried is None else carried
     due = [i for i, (every, _label, _fn) in enumerate(chores) if tick_count % every == 0]
@@ -129,6 +130,10 @@ def _run_due_chores(chores, tick_count: int, carried: dict | None = None,
     split: list[tuple[str, float]] = []
     started = time.monotonic()
     _tick_deadline.deadline = started + budget
+    # One bind per served profile for the whole tick: every per-profile arm on this tick shares the
+    # profile's scope and config read instead of paying them again (PRX-6137). Dropped with the tick,
+    # so a config edited mid-run is still seen by the next tick's DRIFT reconcile (#112445).
+    begin_housekeeping_tick()
     try:
         with timed('housekeeping_tick', budget_s=budget, per_tick_debug=False):
             spent = 0.0
@@ -145,6 +150,7 @@ def _run_due_chores(chores, tick_count: int, carried: dict | None = None,
                 split.append((_chore_slug(label), elapsed))
             _log_tick_split(split, time.monotonic() - started, budget, len(carried))
     finally:
+        end_housekeeping_tick()
         _tick_deadline.deadline = None
 
 
@@ -223,14 +229,22 @@ def _housekeeping_curator() -> None:
     maybe_run_curator(idle_for_seconds=float("inf"), on_summary=lambda msg: logger.info("curator: %s", msg))
 
 
-def _housekeeping_plugin_update_check() -> None:
+def _housekeeping_plugin_update_check(binding=None) -> None:
     """Plugin update-check cadence (plugins_cadence): due-gated by
     plugins.auto_update_check_hours, read-only, receipt-surfaced; the
     opt-in auto-apply rides the manual update pipeline. A network error
-    costs one warning and a stamped marker — never an apply."""
+    costs one warning and a stamped marker — never an apply.
+
+    *binding* is the tick's :class:`~gateway.run_profile_reconcile.ServedProfile`: the
+    cadence reads ``plugins.*`` from its once-per-tick config read instead of loading
+    ``config.yaml`` again for every served profile (PRX-6137)."""
     from hermes_cli.plugins_cadence import maybe_run_gateway_check
 
-    maybe_run_gateway_check(log=logger)
+    config_get = None
+    if binding is not None:
+        from hermes_cli.config import cfg_get
+        config_get = lambda section, key: cfg_get(binding.load_config(), section, key, default=None)
+    maybe_run_gateway_check(log=logger, config_get=config_get)
 
 
 def _housekeeping_deferred_fts_retry() -> None:

@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 from functools import partial
 from pathlib import Path
@@ -842,36 +843,119 @@ def want_profile_verb(runner):
     return handler
 
 
+class ServedProfile:
+    """One served profile, bound for the length of a housekeeping tick (PRX-6137).
+
+    A per-profile arm used to re-enter a profile's runtime scope — and, if it needed config, re-read
+    ``load_config_readonly()`` — every time it ran, so a tick with four per-profile chores paid the
+    same bind four times over (~1.6 s per pass on this host's 17 served homes, two of them at
+    cadence 1). The bind is what cost, not the set compare the chore does with it, so the tick binds
+    each profile ONCE and hands this object to every arm on that tick:
+    :meth:`scope` reuses one hydrated secret scope, :meth:`load_config` returns one config read.
+
+    Deliberately TICK-scoped, never process-scoped (``end_housekeeping_tick`` drops the set): a
+    profile's config can change while the gateway runs, and the arms already treat DRIFT as the
+    signal that matters — ``mcp-config-reconcile`` exists to fix drift within one tick (#112445) — so
+    a read must never outlive the tick that made it and delay that remedy.
+    """
+
+    __slots__ = ("config", "home", "label", "secrets")
+
+    def __init__(self, label: str, home: Path | None):
+        self.label = str(label)
+        self.home = Path(home) if home is not None else None
+        self.secrets: dict | None = None   # hydrated once, reused by every later arm
+        self.config: dict | None = None    # this tick's load_config_readonly(), read on first use
+
+    def scope(self):
+        """This profile's runtime scope, entering it with the secret scope hydrated once."""
+        from gateway.run import _load_profile_secret_scope, _profile_runtime_scope
+        home = self.home
+        if home is None:  # single-profile: the fan-out binds the launch scope, not one per name
+            raise RuntimeError("a single-profile binding has no per-profile scope")
+        if self.secrets is None:
+            self.secrets = _load_profile_secret_scope(home)
+        return _profile_runtime_scope(home, prepared_secret_scope=self.secrets)
+
+    def load_config(self) -> dict:
+        """This tick's config for the profile — read once, inside the profile's own scope.
+
+        Call it from inside :meth:`scope` (``_for_each_served_profile`` enters it before running the
+        body): the read has to see the profile's ``.env``-expanded values, and under multiplexing an
+        unscoped read is the launch profile's. The returned dict is the shared read-only cache
+        object — callers must not mutate it.
+        """
+        if self.config is None:
+            from hermes_cli.config import load_config_readonly
+            self.config = load_config_readonly()
+        return self.config
+
+
+# This tick's bindings, on the thread that runs the tick (one housekeeping thread per gateway).
+# ``None`` outside a tick: a caller that runs a per-profile arm from somewhere else gets fresh,
+# unshared bindings rather than one that could have been read before its config changed.
+_tick_profiles = threading.local()
+
+
+def begin_housekeeping_tick() -> None:
+    """Open the tick's profile-binding window (``run_housekeeping_chores._run_due_chores``)."""
+    _tick_profiles.bindings = None
+    _tick_profiles.open = True
+
+
+def end_housekeeping_tick() -> None:
+    """Drop the tick's bound profiles. No bound config may outlive the tick that read it."""
+    _tick_profiles.bindings = None
+    _tick_profiles.open = False
+
+
+def _served_profile_bindings(runner) -> list:
+    """The bindings a per-profile arm iterates: one per served profile, built once per tick."""
+    if not getattr(_tick_profiles, "open", False):
+        return _build_served_profile_bindings(runner)
+    if _tick_profiles.bindings is None:
+        _tick_profiles.bindings = _build_served_profile_bindings(runner)
+    return _tick_profiles.bindings
+
+
+def _build_served_profile_bindings(runner) -> list:
+    config = getattr(runner, "config", None)
+    if not getattr(config, "multiplex_profiles", False):
+        return [ServedProfile("default", None)]
+    from gateway.run import _multiplex_profile_homes
+    return [ServedProfile(name, home) for name, home in _multiplex_profile_homes(config)]
+
+
 def _mcp_config_reconciler(runner=None):
     """Housekeeping chore keeping live MCP servers in step with ``mcp_servers`` on disk, every tick
     after the first (startup discovery owns that one). Reconciling on DRIFT rather than only on a
     config EDIT is what brings back a server whose FIRST connect failed (#112445): it never reached
     ``_servers``, so the parked self-probe — a property of a task that connected once — cannot revive
-    it, and its config never changes. The reconcile is a cached config read plus set compares when
-    nothing moved; a server dropped from config is torn down (a parked one otherwise self-probes
+    it, and its config never changes. The reconcile is a set compare over the tick's bound config
+    when nothing moved; a server dropped from config is torn down (a parked one otherwise self-probes
     every ``_PARKED_RETRY_INTERVAL`` for the life of the process) and a missing one is reconnected
     only once its per-server connect cooldown (30s→600s backoff) has lapsed, so a chronically failing
     server is retried on that schedule, not every tick. Interactive OAuth is suppressed — this runs
     on a housekeeping thread nobody is watching."""
     primed: set = set()
 
-    def _reconcile_current(label: str) -> None:
+    def _reconcile_current(binding: ServedProfile) -> None:
         from tools.mcp_oauth import suppress_interactive_oauth
         from tools.mcp_tool_discovery import reconcile_mcp_servers_with_config
-        if label not in primed:
-            primed.add(label)
+        if binding.label not in primed:
+            primed.add(binding.label)
             return  # first tick: startup discovery already reflects this config (or is still running)
         with suppress_interactive_oauth():
-            result = reconcile_mcp_servers_with_config()
+            result = reconcile_mcp_servers_with_config(config=binding.load_config())
         if result["removed"] or result["added"]:
             logger.info("MCP servers reconciled with config (%s): removed=%s added=%s",
-                        label, result["removed"], result["added"])
+                        binding.label, result["removed"], result["added"])
 
     return lambda: _for_each_served_profile(runner, _reconcile_current)
 
 
 def _for_each_served_profile(runner, body) -> None:
-    """Run ``body(profile_label)`` once per served profile, inside that profile's runtime scope.
+    """Run ``body(binding)`` once per served profile, inside that profile's runtime scope.
 
     Housekeeping runs on a bare thread with no turn on the stack, so nothing binds a profile for it:
     ``get_hermes_home()`` and ``get_secret()`` see the LAUNCH profile's values, and under
@@ -880,30 +964,42 @@ def _for_each_served_profile(runner, body) -> None:
     WARNINGs per hourly tick per chore). A single-profile gateway runs ``body`` once, unscoped:
     there the process env IS the profile's own value — unless a hosted room already flipped the
     process-wide guard (#112878), in which case the launch profile's OWN scope is bound, as
-    ``run_turn.py::_standalone_launch_scope`` does for turns."""
-    from gateway.run import _multiplex_profile_homes, _profile_runtime_scope
+    ``run_turn.py::_standalone_launch_scope`` does for turns.
+
+    *binding* is a :class:`ServedProfile`: the profile's label, and — read lazily, once per tick —
+    its hydrated secret scope and config. The binding object is reused across arms inside one tick
+    (``_served_profile_bindings``), so the tick pays that read once instead of once per arm.
+    """
+    from gateway.run import _profile_runtime_scope
     config = getattr(runner, "config", None)
+    bindings = _served_profile_bindings(runner)
     if not getattr(config, "multiplex_profiles", False):
         from gateway.run_turn import GatewayTurnMixin
         with GatewayTurnMixin._standalone_launch_scope():
-            body("default")
+            body(bindings[0])
         return
-    for profile_name, profile_home in _multiplex_profile_homes(config):
+    for binding in bindings:
         # One boundary per profile: callers (``_housekeeping_chore``) catch only at the tick level,
         # so one profile's unreadable store or broken .env abandoned every profile after it, on
         # every tick. The launch store failing is reachable (``_init_session_db`` tolerates it and
         # keeps running), and serve defers every served profile's sweep to this loop.
         try:
-            with _profile_runtime_scope(Path(profile_home)):
-                body(str(profile_name))
+            with binding.scope():
+                body(binding)
         except Exception as exc:
-            logger.debug("Housekeeping for profile %s skipped: %s", profile_name, exc)
+            logger.debug("Housekeeping for profile %s skipped: %s", binding.label, exc)
 
 
 def profile_scoped_chore(runner, chore):
     """Wrap a zero-arg housekeeping chore that reads the profile's home, config or credentials so it
     runs once per served profile under that profile's scope (see ``_for_each_served_profile``)."""
-    return lambda: _for_each_served_profile(runner, lambda _label: chore())
+    return lambda: _for_each_served_profile(runner, lambda _binding: chore())
+
+
+def bound_profile_chore(runner, chore):
+    """Wrap a per-profile chore that wants the tick's binding instead of re-reading its config —
+    ``chore(binding)`` gets the profile's label and its once-per-tick ``load_config()``."""
+    return lambda: _for_each_served_profile(runner, chore)
 
 
 def migrate_profile_identity_verb(runner):
