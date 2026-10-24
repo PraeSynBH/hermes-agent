@@ -234,3 +234,27 @@ def test_same_gateway_recovers_terminalization_failure_without_resending(
     status = queue.get_status("exec-4")
     assert status["status"] == "unknown"
     assert "not retried" in status["error"]
+
+
+def test_slow_drain_names_the_phase_that_spent_it(tmp_path, monkeypatch, caplog):
+    """A drain over its ceiling reports recover/claim/send/finish (PRX-6104).
+
+    The housekeeping tick's per-chore figure names the drain arm but not what inside it cost the
+    tick — a 30 s drain with no row finished is a lock or a scan, one with 30 s in ``send`` is the
+    network. ``slow_seconds=0`` makes every drain report so the split itself is asserted here
+    rather than its timing.
+    """
+    import cron.delivery_queue as queue
+
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    queue.enqueue("exec-slow", {"id": "job-slow"}, "brief")
+    send = Mock(return_value=None)
+
+    with caplog.at_level("WARNING", logger="cron.delivery_queue"):
+        assert queue.drain(send, slow_seconds=0.0) == 1
+
+    slow = [r for r in caplog.records if "delivery queue drain slow" in r.getMessage()]
+    assert len(slow) == 1
+    message = slow[0].getMessage()
+    for phase in ("recover=", "claim=", "send=", "finish=", "rows=1"):
+        assert phase in message, message

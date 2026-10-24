@@ -326,33 +326,57 @@ def recover_abandoned() -> int:
 
 
 def drain(
-    send: Callable[[dict, str, bool], Optional[str]], *, limit: int = 20
+    send: Callable[[dict, str, bool], Optional[str]], *, limit: int = 20, slow_seconds: float = 2.0
 ) -> int:
-    """Deliver pending rows through *send*, terminalizing every claimed row."""
+    """Deliver pending rows through *send*, terminalizing every claimed row.
+
+    A drain that exceeds ``slow_seconds`` logs its own phase split (PRX-6104). The housekeeping
+    tick's per-chore figure names this arm but not what inside it cost the tick: a 30 s drain with
+    no row finished is a lock or a scan, a drain with 30 s in ``send`` is the network, and the two
+    have opposite fixes. The split here is what separates them without a profiler.
+    """
+    started = time.monotonic()
     recover_abandoned()
+    recover_s = time.monotonic() - started
     processed = 0
+    claim_s = 0.0
+    send_s = 0.0
+    finish_s = 0.0
     for _ in range(max(0, limit)):
+        claim_start = time.monotonic()
         row = claim_next()
+        claim_s += time.monotonic() - claim_start
         if row is None:
             break
         with _lock:
             _ACTIVE_DELIVERIES.add(row["execution_id"])
         try:
+            send_start = time.monotonic()
             try:
                 error = send(
                     row["job"], row["content"], bool(row["for_failure"])
                 )
             except BaseException as exc:
                 error = f"{type(exc).__name__}: {exc}"
+            send_s += time.monotonic() - send_start
+            finish_start = time.monotonic()
             if _finish(row["execution_id"], error=error,
                        suppressed=bool(row["job"].get("_notification_all_targets_suppressed"))):
                 from cron.delivery_outcome import settle_quietly
 
                 settle_quietly(row["job"].get("id"), row["execution_id"])
+            finish_s += time.monotonic() - finish_start
         finally:
             with _lock:
                 _ACTIVE_DELIVERIES.discard(row["execution_id"])
         processed += 1
+    total_s = time.monotonic() - started
+    if total_s >= slow_seconds:
+        logger.warning(
+            "delivery queue drain slow: %.0fms total "
+            "(recover=%.0fms claim=%.0fms send=%.0fms finish=%.0fms rows=%d)",
+            total_s * 1000.0, recover_s * 1000.0, claim_s * 1000.0,
+            send_s * 1000.0, finish_s * 1000.0, processed)
     return processed
 
 

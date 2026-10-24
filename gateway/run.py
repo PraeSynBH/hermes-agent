@@ -4517,7 +4517,14 @@ def _start_gateway_housekeeping(
         # profile's own (get_hermes_home()/load_config_readonly() bind to the scope).
         (1, "Plugin update check", profile_scoped_chore(runner, _housekeeping_plugin_update_check)),
         (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
-        (1, "gateway housekeeping memory trim", _housekeeping_memory_trim),
+        # Polled every 5th tick, not every tick (PRX-6104). On macOS malloc_trim does not exist, so
+        # trim_memory() can only run a full gc.collect() — which holds the GIL for 1-9 s on this
+        # heap and releases no pages back to the OS. At cadence 1 against a 60 s tick its own 60 s
+        # cooldown never suppressed it, so it ran every tick: 45% of all measured tick cost (340 s
+        # of 752 s over 186 ticks, p50 2.5 s, max 17.7 s). CPython's generational collector keeps
+        # running between polls; this arm is the leak backstop. A configured cooldown longer than
+        # this cadence still suppresses the call, so config can only make the trim rarer.
+        (5, "gateway housekeeping memory trim", _housekeeping_memory_trim),
         (1, "MCP config reconcile", _mcp_config_reconciler(runner)),
         # The spawn-ledger reconciler proves residue and reaps it. It was never invoked from a tick
         # before PRA-6928, so helper orphans accumulated until a gateway boot happened to run it.
