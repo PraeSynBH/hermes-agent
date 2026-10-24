@@ -260,7 +260,7 @@ worktrees:
   max_total_gb: 0              # optional budget for idle trees; oldest are archived + removed first
   max_linked: 0                # admission cap: most linked trees this repo may hold (0 = no cap)
   max_linked_by_repo:          # per-repo caps, by repo basename or absolute path; unnamed -> max_linked
-    voyonder: 40
+    voyonder: 60               # a number BELOW today's population defers every new launch until reclamation catches up
     /Users/me/src/alaska_supply: 340
   ratchet: false               # after each sweep, lower a repo's cap toward population + headroom
   ratchet_headroom: 20         # trees the ratchet keeps above the population it measured
@@ -287,7 +287,13 @@ One number cannot bound every repo: the largest repo tolerates a population many
 times the working set of a small one. `max_linked_by_repo` names a repo's own cap
 (basename or absolute path; **0** keeps its "unbounded" meaning for that repo),
 and anything unnamed falls back to `max_linked`. `hermes worktree prune
---dry-run` prints this repo's `population/cap` before the sweep table.
+--dry-run` prints this repo's `population/cap` before the sweep table, and the
+fleet sweeper's worktree receipt carries the same number per repo
+(`… | population/cap: voyonder 210/212, alaska_supply 347/362`).
+
+A cap below a repo's population today is not a target to grow into: it refuses
+every new tree until reclamation drains the population down to it, so pick
+`population + headroom` and let the ratchet walk it from there.
 
 A cap set once is a snapshot: as the reaper drains a population the cap would stay
 at the old number and the population would grow back to it. With `ratchet: true`,
