@@ -17,7 +17,13 @@ The contracts pinned here:
 * the death text names the restart, which is what the detector's ``restart_window`` class reads;
 * the readiness reader credits exactly the two names a restart is published under (``starting`` while
   the incoming owner boots, ``restarting`` for the outgoing owner's claim across the exit->boot gap,
-  SOU-3966) and never invents a restart from a stale record, a dead pid or an absent owner.
+  SOU-3966) and never invents a restart from a stale record or an absent owner;
+* the claim is read while its author is DEAD — the exit->boot gap is the one stretch with no live
+  process, no lock and no ``starting``, so keying the claim on liveness made the window it was
+  written for unreadable, and a run admitted into it died at its budget (PRX-6199: the six
+  ``phase=session, elapsed=120.0s`` rows released on the 05:42:26Z hold's release instant);
+* ...and it is bounded by its own age (one admission budget), so a gateway that was SIGKILLed
+  mid-claim costs a dispatch one budget rather than holding it for the whole grace.
 
 Durations are SCALED (a 130 s outage is not a test): the admit test keeps the incident's ratio — the
 owner serves 12.5% past the budget (130 s vs 120 s) — and the others use sub-second budgets.
@@ -37,12 +43,26 @@ import pytest
 DEAD_PID = 999999
 
 
-def _write_state(home: Path, state: str, *, pid: int | None = None) -> None:
-    """Publish the owner's readiness exactly where the gateway publishes it."""
+def _write_state(home: Path, state: str, *, pid: int | None = None, age_s: float = 0.0,
+                 restart_requested: bool | None = None) -> None:
+    """Publish the owner's readiness exactly where the gateway publishes it.
+
+    ``age_s`` backdates ``updated_at`` — the field the reader freshness-checks a claim with, and
+    the only thing that separates a replacement that is coming from a gateway that is gone.
+    """
     home.mkdir(parents=True, exist_ok=True)
-    (home / "gateway_state.json").write_text(
-        json.dumps({"pid": os.getpid() if pid is None else pid, "gateway_state": state}),
-        encoding="utf-8")
+    record = {"pid": os.getpid() if pid is None else pid, "gateway_state": state,
+              "updated_at": _stamp(time.time() - age_s)}
+    if restart_requested is not None:
+        record["restart_requested"] = restart_requested
+    (home / "gateway_state.json").write_text(json.dumps(record), encoding="utf-8")
+
+
+def _stamp(epoch: float) -> str:
+    """``_utc_now_iso``'s format (``2026-10-24T05:44:33.957Z``): what the gateway writes."""
+    from datetime import UTC, datetime
+    moment = datetime.fromtimestamp(epoch, UTC)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
 
 
 def _owner(gateway_client, *, serving):
@@ -213,6 +233,124 @@ def test_the_watch_reads_the_home_the_owner_publishes_in():
     assert homes[0] == Path("/ctl/home")
     assert Path("/profile/home") in homes
     assert len(homes) == len({str(home) for home in homes}), "the same home must not be sampled twice"
+
+
+def test_a_run_admitted_into_the_exit_boot_gap_admits(tmp_path, monkeypatch):
+    """The 05:44:36Z incident exactly: no live process on the home, and the claim still there.
+
+    ``stop()`` publishes ``gateway_state: restarting`` before the drain and the exit phase re-stamps
+    it just before the process goes away, so the only stretch that has NO live owner — the one that
+    held six heartbeats for 131-145 s — is also the one where the record's pid is already dead. The
+    reader threw that claim away (a dead pid was treated as "no owner"), so the six runs earned no
+    credit at all: ``phase=session, elapsed=120.0s, TimeoutError:`` in their own rows, and the
+    replacement published ``running`` 3 s after their budget expired.
+    """
+    from hermes_cli import gateway_client
+
+    home = tmp_path / "owner"
+    # The outgoing owner is gone; its claim is what is left on the home.
+    _write_state(home, "restarting", pid=DEAD_PID, restart_requested=True)
+    _scaled(monkeypatch, gateway_client, home, budget=0.5, grace=5.0)
+    admitted = []
+
+    async def run():
+        serving = asyncio.Event()
+        async with _owner(gateway_client, serving=serving) as server:
+            port = server.sockets[0].getsockname()[1]
+
+            def boot():
+                # The replacement's FIRST publication — past this run's whole budget, which is the
+                # only way the dead gap alone decides the run: one sample of `starting` before the
+                # deadline is enough credit to re-arm, so the gap has to outlast it.
+                _write_state(home, "starting")
+
+            def serve_now():
+                _write_state(home, "running")
+                serving.set()
+
+            loop = asyncio.get_running_loop()
+            loop.call_later(gateway_client.admission_budget_seconds() * 1.8, boot)
+            loop.call_later(1.6, serve_now)
+            async with _attach(gateway_client, port) as client:
+                await client.rpc("session.create",
+                                 _timeout=gateway_client.admission_timeout(client, 120.0))
+                admitted.append(time.monotonic())
+
+    asyncio.run(run())
+    assert admitted, ("a run admitted while the home holds only the outgoing owner's claim must "
+                      "credit that gap and admit when the replacement serves; on the pre-fix tree "
+                      "it dies at its budget")
+
+
+def test_the_claim_is_credited_only_while_it_is_fresh(tmp_path):
+    """A SIGKILLed gateway leaves the same file, so the claim is a WINDOW, never a promise.
+
+    Credit it unconditionally and every dispatch on a host whose gateway is gone is held for the
+    whole grace — the failure the liveness check exists to prevent.
+    """
+    from hermes_cli import gateway_client
+
+    home = tmp_path / "home"
+    home.mkdir()
+    fresh = gateway_client.RESTART_CLAIM_FRESH_S
+
+    _write_state(home, "restarting", pid=DEAD_PID, restart_requested=True)
+    assert gateway_client.owner_serving_state([home]) == "restarting"
+
+    # Same file, written before the window: a restart that is not happening any more.
+    _write_state(home, "restarting", pid=DEAD_PID, restart_requested=True, age_s=fresh + 5.0)
+    assert gateway_client.owner_serving_state([home]) is None
+
+    # A `restarting` state with no claim behind it is not a restart anyone promised.
+    _write_state(home, "restarting", pid=DEAD_PID, restart_requested=False)
+    assert gateway_client.owner_serving_state([home]) is None
+
+    # An undated claim cannot be aged, so it cannot be bounded, so it credits nothing.
+    (home / "gateway_state.json").write_text(
+        json.dumps({"pid": DEAD_PID, "gateway_state": "restarting", "restart_requested": True}),
+        encoding="utf-8")
+    assert gateway_client.owner_serving_state([home]) is None
+
+
+def test_the_reader_reads_the_claim_the_outgoing_owner_actually_writes(tmp_path, monkeypatch):
+    """Writer/reader contract, not a fixture: the fields are the ones ``stop()`` really persists.
+
+    The claim is only worth reading if the reader understands the file the owner leaves behind — a
+    ``restart_requested`` written as anything but ``true``, or a stamp the reader cannot parse, would
+    silently credit nothing and this class would stay exactly as it was. So drive the REAL writer
+    (``gateway.status.write_runtime_status``, the one ``_claim_restart_window`` calls), then make the
+    record's pid dead, which is what the process exit does to it.
+    """
+    from gateway import status as gateway_status
+    from hermes_cli import gateway_client
+
+    home = tmp_path / "home"
+    home.mkdir()
+    path = home / "gateway_state.json"
+    monkeypatch.setattr(gateway_status, "_get_runtime_status_path", lambda: path)
+    monkeypatch.setattr(gateway_status, "_runtime_status_state_path", None)
+    monkeypatch.setattr(gateway_status, "_runtime_status_state", None)
+
+    assert gateway_status.write_runtime_status(
+        gateway_state="restarting", restart_requested=True, wait_timeout=5.0)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["pid"] = DEAD_PID  # the owner is gone; the claim is what is left
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    assert gateway_client.owner_serving_state([home]) == "restarting"
+    assert gateway_client.record_age_s(record) is not None
+
+
+def test_the_claim_window_is_the_admission_budget():
+    """The bound is the number the window is already measured in, not a new knob.
+
+    A claim older than one admission budget cannot be covered by any run's remaining budget, so
+    crediting it past that point only holds a run for a restart that is not coming — and a gateway
+    that died mid-claim must cost a dispatch no more than an absent owner already does.
+    """
+    from hermes_cli import gateway_client
+
+    assert gateway_client.RESTART_CLAIM_FRESH_S == gateway_client.GATEWAY_ADMISSION_BUDGET_S
 
 
 def test_the_grace_is_above_the_measured_restart():
