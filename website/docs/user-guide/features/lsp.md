@@ -471,6 +471,12 @@ profile and each has its own LSP service, so services publish their measured tot
 itself to what its siblings leave (a service already inside an even share keeps its last server).
 `max_tree_rss_mb` (default 1800) is the independent ceiling for a single tree.
 
+While servers run, the service also publishes `<hermes home>/state/lsp_census.json` after every
+sweep: one entry per live client with its server id, workspace root, pid, the **session that last
+used it**, seconds since that use, and its tree RSS. A `ps` census can see the process but not whose
+work it is — a worktree path carries no run id — so this file is what lets an outside instrument
+answer "whose run owns this tree?" without guessing from paths.
+
 Servers are also released when their workspace goes away, even if they
 are not idle: removing a Hermes-managed worktree (`hermes -w` session
 end, Kanban task cleanup, a delegated subagent's pruned worktree) shuts

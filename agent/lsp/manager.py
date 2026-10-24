@@ -260,6 +260,10 @@ class LSPService:
         self._broken: dict[_Key, float] = {}
         self._spawning: dict[_Key, asyncio.Future] = {}
         self._last_used: dict[_Key, float] = {}
+        # (server, root) -> the session that last used it.  Published in the census file so an
+        # instrument outside this process can ask "whose work is this tree?" — the question a ps
+        # census cannot answer for a worktree path (PRA-6854).
+        self._owners: dict[_Key, str] = {}
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
         # abs file path → diagnostics snapshot taken immediately before a write.
@@ -608,6 +612,7 @@ class LSPService:
 
     async def _open_and_wait_async(
         self, file_path: str, *, snapshot: bool = False, budget: Optional[float] = None,
+        owner: Optional[str] = None,
     ) -> Optional[_Diags]:
         """Open + wait for FRESH diagnostics: ``[]`` = checked clean, ``None`` = no verdict in budget.
 
@@ -615,7 +620,7 @@ class LSPService:
         skips didSave; both modes wait at most ``budget`` (``lsp.wait_timeout`` unless the caller
         computed a cold-root warm-up budget via :meth:`_wait_budget`).
         """
-        client = await self._get_or_spawn(file_path)
+        client = await self._get_or_spawn(file_path, owner=owner)
         if client is None:
             return None
         try:
@@ -650,7 +655,10 @@ class LSPService:
             client = self._clients.get(self._live_key(srv, root))
         return list(client.diagnostics_for(file_path, fresh_only=True)) if client else []
 
-    async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
+    async def _get_or_spawn(self, file_path: str, owner: Optional[str] = None) -> Optional[LSPClient]:
+        # ``owner`` below is also the local flag for "this call owns the spawn"; keep the session
+        # name under its own binding so the two cannot collide.
+        session_owner = owner
         srv = self._server_for(file_path)
         if srv is None:
             return None
@@ -678,6 +686,8 @@ class LSPService:
             client = self._clients.get(key)
             if client is not None and client.is_running:
                 self._last_used[key] = time.time()
+                if session_owner:
+                    self._owners[key] = session_owner
             else:
                 client = None
                 spawning = self._spawning.get(key)
@@ -713,6 +723,8 @@ class LSPService:
                 with self._state_lock:
                     self._clients[key] = client
                     self._last_used[key] = time.time()
+                    if session_owner:
+                        self._owners[key] = session_owner
                 eventlog.log_active(srv.server_id, root)
             spawning.set_result(client)
             return await self._attach_root(srv, client, root) if client is not None else None
@@ -812,6 +824,7 @@ class LSPService:
             clients = [self._clients.pop(key) for key in idle_keys]
             for key in idle_keys:
                 self._last_used.pop(key, None)
+                self._owners.pop(key, None)
         if clients:
             eventlog.log_reaped([(c.server_id, c.workspace_root) for c in clients], self._idle_timeout)
             await asyncio.gather(*(client.shutdown() for client in clients), return_exceptions=True)
@@ -819,6 +832,7 @@ class LSPService:
         # idle from the server's point of view — tsserver keeps its multi-GiB heap for a tree that is gone.
         await self._detach_roots(lambda folder: not os.path.isdir(folder), reason="workspace root deleted")
         await self._enforce_rss_budget()
+        await self._write_census()
 
     async def _enforce_rss_budget(self) -> None:
         """Evict clients until this service's trees fit its share of ``lsp.max_total_rss_mb``, and
@@ -887,6 +901,25 @@ class LSPService:
                                         over_tree_mb=self._max_tree_rss_mb if over_tree else 0.0)
             await asyncio.gather(*(client.shutdown() for client in evicted), return_exceptions=True)
 
+    async def _write_census(self) -> None:
+        """Publish pid, root, owner session and idle age per client (see agent/lsp/census.py)."""
+        from agent.lsp import census
+        now = time.time()
+        with self._state_lock:
+            snapshot = [(key, c) for key, c in self._clients.items()]
+            owners = {key: self._owners.get(key, "") for key, _ in snapshot}
+            idle = {key: now - self._last_used.get(key, now) for key, _ in snapshot}
+        if not snapshot:
+            census.write_census([])
+            return
+        pids = [pid for _, c in snapshot if (pid := c.pid) is not None]
+        rss_kb = _process_tree_rss_kb(pids) if pids else {}
+        entries = [{"server": c.server_id, "root": c.workspace_root, "pid": c.pid,
+                    "owner": owners.get(key, ""), "idle_seconds": round(idle.get(key, 0.0), 1),
+                    "tree_rss_mb": round(rss_kb.get(c.pid, 0) / 1024.0, 1) if c.pid else 0.0}
+                   for key, c in snapshot]
+        census.write_census(entries)
+
     def _publish_usage_kb(self, own_kb: float) -> None:
         """Record this service's measured tree total where its siblings' sweeps can read it."""
         with _PROCESS_BUDGET_LOCK:
@@ -947,6 +980,7 @@ class LSPService:
             clients = [self._clients.pop(key) for key in dead_keys]
             for key in dead_keys:
                 self._last_used.pop(key, None)
+                self._owners.pop(key, None)
             trims = [(c, [f for f in c.workspace_folders if is_gone(f)]) for c in self._clients.values()]
         for client, folders in trims:
             for folder in folders:
@@ -969,6 +1003,7 @@ class LSPService:
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._owners.clear()
         await asyncio.gather(*(c.shutdown() for c in clients), return_exceptions=True)
 
 

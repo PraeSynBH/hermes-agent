@@ -162,7 +162,7 @@ async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str], p
                                prev_result.baseline_text if prev_result else baseline_text, True)
         budget = svc._wait_budget(abs_path)
         try:
-            diags = await asyncio.wait_for(_check(svc, abs_path, baseline_text, post_text, budget),
+            diags = await asyncio.wait_for(_check(svc, abs_path, baseline_text, post_text, budget, owner=owner),
                                            timeout=2 * budget + _SPAWN_CEILING)
         except asyncio.CancelledError:
             raise
@@ -190,7 +190,7 @@ async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str], p
 
 
 async def _check(svc: LSPService, abs_path: str, baseline_text: Optional[str], post_text: Optional[str],
-                 budget: float) -> Optional[_Diags]:
+                 budget: float, owner: Optional[str] = None) -> Optional[_Diags]:
     """Verdict on ``post_text`` (the bytes this edit wrote) first; only when it has diagnostics, the
     verdict on ``baseline_text`` (cached from an earlier check when that text was checked before) to drop
     the pre-existing ones.  The server is left holding the file's current disk content afterwards.
