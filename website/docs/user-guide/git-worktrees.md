@@ -258,11 +258,25 @@ worktrees:
   archive_max_file_mb: 50      # untracked files above this are not archived; their tree is kept
   archive_retention_days: 30   # 0 keeps archives forever
   max_total_gb: 0              # optional budget for idle trees; oldest are archived + removed first
+  max_linked: 0                # admission cap: most linked trees this repo may hold (0 = no cap)
+  reclaim_before_admit: true   # at the cap, run one reclaim pass before refusing a new tree
 ```
 
-There is no limit on how many trees may exist: hundreds of parallel subagents
-each keep their tree for as long as they work in it. `max_total_gb` only ever
-evicts idle trees past their tier.
+Unbounded by default: hundreds of parallel subagents each keep their tree for as
+long as they work in it, and `max_total_gb` only ever evicts idle trees past
+their tier.
+
+`max_linked` bounds *arrival* instead — the one thing a reclamation policy
+cannot do, since it can only see trees idle past its age floor. Before every
+worktree is created (a `hermes -w` launch or an isolated subagent), Hermes
+counts the repo's linked worktrees with `git worktree list`. At the cap it runs
+one bounded reclaim pass — the same archive-first sweep, so a live lock owner,
+any process inside a tree, and Kanban trees are still never touched — and if
+that frees nothing it refuses the new tree with the count, the cap and
+`hermes worktree prune`. A refused subagent tree simply runs the child in the
+parent's checkout instead of failing it. The creation line reports the
+population (`✓ Worktree created: …/.worktrees/hermes-1a2b3c4d (12/40 in this
+repo)`) so growth is visible at the moment it happens.
 
 Subagent worktrees (`delegation.worktree_isolation: true`) follow the same
 rule when the child finishes: a clean tree is removed, and a tree with commits

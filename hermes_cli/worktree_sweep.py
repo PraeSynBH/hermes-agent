@@ -28,7 +28,8 @@ from typing import Optional
 
 logger = logging.getLogger("cli")
 
-_DEFAULTS = {"archive_dirty": True, "archive_max_file_mb": 50, "archive_retention_days": 30, "max_total_gb": 0}
+_DEFAULTS = {"archive_dirty": True, "archive_max_file_mb": 50, "archive_retention_days": 30, "max_total_gb": 0,
+             "max_linked": 0, "reclaim_before_admit": True}
 _PROTECTED_BRANCHES = {"main", "master", "develop", "dev", "trunk"}
 _ARCHIVE_REASONS = {"dirty": "uncommitted changes", "unpushed": "unpushed commits"}
 
@@ -64,11 +65,16 @@ def sweep_settings() -> dict:
     except Exception:
         logger.debug("worktrees config unreadable; using defaults", exc_info=True)
     settings["archive_dirty"] = bool(settings["archive_dirty"])
+    settings["reclaim_before_admit"] = bool(settings["reclaim_before_admit"])
     for key in ("archive_max_file_mb", "archive_retention_days", "max_total_gb"):
         try:
             settings[key] = max(0.0, float(settings[key]))
         except (TypeError, ValueError):
             settings[key] = float(_DEFAULTS[key])
+    try:
+        settings["max_linked"] = max(0, int(float(settings["max_linked"] or 0)))
+    except (TypeError, ValueError):
+        settings["max_linked"] = 0
     return settings
 
 
