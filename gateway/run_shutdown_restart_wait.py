@@ -8,6 +8,13 @@ accounting it is derived from rather than in the teardown body.
 
 ``gateway.run`` internals are imported lazily inside method bodies (import cycle), so
 ``patch("gateway.run.X")`` keeps intercepting them at call time.
+
+What the wait costs cron is now DATA, not only a log line (PRX-6133, CEO ruling rev 2 on PRX-6109
+R7): the deferral writes ``gateway.restart_hold_ledger`` records at T=0 and at its end, so the
+surface control that must subtract a hold from its measurement gap reads
+``{started_at, cap_s, due_slots, profiles}`` instead of parsing the WARNING below. The 26-min
+``cron.scheduler`` ERROR stays as a backstop for drain classes that are not cap-bounded; it is no
+longer the only path a fleet-wide hold has to a human.
 """
 
 from __future__ import annotations
@@ -74,6 +81,41 @@ def _cron_dispatch_hold_note(cost: Optional[tuple[int, int]] = None) -> str:
                 f" across {holding} profile(s) are waiting and fire as catch-up")
     return ("cron dispatch is held fleet-wide until the drain releases (no cron slot is due yet; "
             "any that comes due is held and fires as catch-up)")
+
+
+def _record_hold_begin(cost: Optional[tuple[int, int]], cap_s: float, active: int,
+                       started_at: float) -> Optional[str]:
+    """Append the T=0 bound event (``gateway.restart_hold_ledger``); ``None`` if it could not land.
+
+    ``cost`` is the same scan the opening clause used, so the record and the sentence cannot
+    disagree about how many slots the wait holds; ``None`` means the scan failed and the record says
+    so instead of claiming zero.
+    """
+    try:
+        from gateway.restart_hold_ledger import record_hold_begin
+
+        due, holding = cost if cost else (None, None)
+        return record_hold_begin(
+            cap_s=cap_s, started_at=started_at, due_slots=due, profiles=holding, active_units=active,
+        )
+    except Exception:  # health: allow BLE001 -- forensics must never abort the wait it describes
+        logger.debug("Restart deferral: bound event unwritable", exc_info=True)
+        return None
+
+
+def _record_hold_end(hold_id: Optional[str], cost: Optional[tuple[int, int]], cap_s: float,
+                     started_at: float, reason: str) -> None:
+    """Close the T=0 record with how the wait ended and how wide it really was."""
+    try:
+        from gateway.restart_hold_ledger import record_hold_end
+
+        due, holding = cost if cost else (None, None)
+        record_hold_end(
+            hold_id=hold_id, started_at=started_at, cap_s=cap_s, reason=reason,
+            due_slots=due, profiles=holding,
+        )
+    except Exception:  # health: allow BLE001 -- forensics must never abort the wait it describes
+        logger.debug("Restart deferral: bound event could not be closed", exc_info=True)
 
 
 class GatewayRestartWaitMixin:
@@ -244,9 +286,19 @@ class GatewayRestartWaitMixin:
         # duration, so every ticked profile's due slots are held from this instant. Saying it here,
         # once, is what the 33-36 min holes were missing — the first per-profile WARNING a ticker
         # wrote named one home and one boundary, never the fleet-wide cost of the wait.
+        cost = _cron_hold_cost()
         logger.warning(
-            "Restart deferral (cap %.0fs): %s", timeout, _cron_dispatch_hold_note(),
+            "Restart deferral (cap %.0fs): %s", timeout, _cron_dispatch_hold_note(cost),
         )
+        # The same T=0 fact, machine-readable (PRX-6133, CEO ruling rev 2 on PRX-6109 R7): what a
+        # human reads above, the surface control has to SUBTRACT, and it was doing that by parsing
+        # this sentence. One line per phase in <launch home>/logs/restart-holds.jsonl; the end
+        # record carries the real width, because the cap is only the ceiling on it.
+        hold_started_wall = time.time()
+        hold_id = _record_hold_begin(cost, timeout, active, hold_started_wall)
+        # Left as "aborted" until an exit path names its own ending: a wait torn down by a
+        # cancellation must not be recorded as one that spent the cap.
+        hold_reason = "aborted"
         from gateway.drain_control import open_restart_wait
         # Admission stays closed for the whole wait: it closed at request time (``request_restart``)
         # and this wait only holds what was already in flight. Reopening it here would start turns
@@ -267,58 +319,66 @@ class GatewayRestartWaitMixin:
         hold_bound = _cron_hold_bound()
         hold_started: Optional[float] = None
         last_status_at = 0.0
-        while self._awaitable_work_count() > 0:
-            now = loop.time()
-            deadline = cap_deadline
-            if hold_started is not None and hold_bound is not None:
-                deadline = min(cap_deadline, hold_started + hold_bound)
-            if now >= deadline:
-                if deadline < cap_deadline:
-                    logger.warning(
-                        "Restart deferral ends at the cron bound after %.0fs: a due cron slot has "
-                        "been held %.0fs (bound %.0fs = HERMES_CRON_TIMEOUT) with %d work unit(s) "
-                        "still active; proceeding to stop()/drain, which lets the held slot fire "
-                        "as catch-up, instead of keeping admission closed for the remaining %.0fs "
-                        "of the %.0fs cap",
-                        now - started, now - hold_started, hold_bound,
-                        self._active_work_count(), cap_deadline - now, timeout,
+        try:
+            while self._awaitable_work_count() > 0:
+                now = loop.time()
+                deadline = cap_deadline
+                if hold_started is not None and hold_bound is not None:
+                    deadline = min(cap_deadline, hold_started + hold_bound)
+                if now >= deadline:
+                    if deadline < cap_deadline:
+                        hold_reason = "cron_bound"
+                        logger.warning(
+                            "Restart deferral ends at the cron bound after %.0fs: a due cron slot has "
+                            "been held %.0fs (bound %.0fs = HERMES_CRON_TIMEOUT) with %d work unit(s) "
+                            "still active; proceeding to stop()/drain, which lets the held slot fire "
+                            "as catch-up, instead of keeping admission closed for the remaining %.0fs "
+                            "of the %.0fs cap",
+                            now - started, now - hold_started, hold_bound,
+                            self._active_work_count(), cap_deadline - now, timeout,
+                        )
+                    else:
+                        hold_reason = "cap"
+                        logger.warning(
+                            "Restart after-turn wait timed out after %.0fs with %d "
+                            "still active; proceeding to stop()/drain which may "
+                            "interrupt remaining work (#77184)", timeout, self._active_work_count(),
+                        )
+                    return False
+                if (now - last_status_at) >= 30.0:
+                    cost = _cron_hold_cost()
+                    if hold_started is None and hold_bound is not None and cost and cost[0]:
+                        hold_started = now
+                        logger.warning(
+                            "Restart deferral: %d due cron slot(s) across %d profile(s) are waiting, "
+                            "so this wait now ends at most %.0fs later (cron bound) instead of the "
+                            "%.0fs cap — a held slot is fleet-wide cron silence, and %d work unit(s) "
+                            "have not finished in the meantime",
+                            cost[0], cost[1], hold_bound, timeout, self._awaitable_work_count(),
+                        )
+                    logger.info(
+                        "Restart deferred: waiting on %d active work unit(s) "
+                        "(%d wedged and excluded, %d restart-safe and excluded; "
+                        "%.0fs remaining before force drain, admission closed); %s: %s",
+                        self._awaitable_work_count(), self._wedged_agent_count(),
+                        self._restart_safe_cron_count(), deadline - now,
+                        _cron_dispatch_hold_note(cost), self._describe_active_work(),
                     )
-                else:
-                    logger.warning(
-                        "Restart after-turn wait timed out after %.0fs with %d "
-                        "still active; proceeding to stop()/drain which may "
-                        "interrupt remaining work (#77184)", timeout, self._active_work_count(),
-                    )
-                return False
-            if (now - last_status_at) >= 30.0:
-                cost = _cron_hold_cost()
-                if hold_started is None and hold_bound is not None and cost and cost[0]:
-                    hold_started = now
-                    logger.warning(
-                        "Restart deferral: %d due cron slot(s) across %d profile(s) are waiting, "
-                        "so this wait now ends at most %.0fs later (cron bound) instead of the "
-                        "%.0fs cap — a held slot is fleet-wide cron silence, and %d work unit(s) "
-                        "have not finished in the meantime",
-                        cost[0], cost[1], hold_bound, timeout, self._awaitable_work_count(),
-                    )
-                logger.info(
-                    "Restart deferred: waiting on %d active work unit(s) "
-                    "(%d wedged and excluded, %d restart-safe and excluded; "
-                    "%.0fs remaining before force drain, admission closed); %s: %s",
-                    self._awaitable_work_count(), self._wedged_agent_count(),
-                    self._restart_safe_cron_count(), deadline - now,
-                    _cron_dispatch_hold_note(cost), self._describe_active_work(),
+                    self._scale_to_zero_status("draining", "restart wait: status mark failed")
+                    last_status_at = now
+                await asyncio.sleep(0.1)
+            hold_reason = "drained"
+            if self._active_work_count() > 0:
+                logger.warning(
+                    "Restart deferred wait: %d excluded work unit(s) remain "
+                    "(%d wedged, %d restart-safe external cron); proceeding to stop()/drain",
+                    self._active_work_count(), self._wedged_agent_count(),
+                    self._restart_safe_cron_count(),
                 )
-                self._scale_to_zero_status("draining", "restart wait: status mark failed")
-                last_status_at = now
-            await asyncio.sleep(0.1)
-        if self._active_work_count() > 0:
-            logger.warning(
-                "Restart deferred wait: %d excluded work unit(s) remain "
-                "(%d wedged, %d restart-safe external cron); proceeding to stop()/drain",
-                self._active_work_count(), self._wedged_agent_count(),
-                self._restart_safe_cron_count(),
-            )
-            return False
-        logger.info("Restart deferred wait complete — active work drained; proceeding to stop()")
-        return True
+                return False
+            logger.info("Restart deferred wait complete — active work drained; proceeding to stop()")
+            return True
+        finally:
+            # Close the record with the width the hold actually had (PRX-6133): the cap is its
+            # ceiling, and a control subtracting a window must not be told 30 min for a 6 min hold.
+            _record_hold_end(hold_id, cost, timeout, hold_started_wall, hold_reason)
