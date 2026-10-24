@@ -196,7 +196,10 @@ async def _check(svc: LSPService, abs_path: str, baseline_text: Optional[str], p
     the pre-existing ones.  The server is left holding the file's current disk content afterwards.
     A clean edit costs one round trip, and push-only servers answer the baseline fast in the common
     case (errors -> fewer errors is a change they publish)."""
-    client = await svc._get_or_spawn(abs_path)
+    # ``owner`` here is the whole point of the census row this check produces: ``_get_or_spawn``
+    # stores it in ``_owners`` when the client is reused or spawned, and ``_write_census`` publishes
+    # it.  Dropping it made every client the edit path serves anonymous (PRA-6980).
+    client = await svc._get_or_spawn(abs_path, owner=owner)
     if client is None:
         return None
     srv = svc._server_for(abs_path)

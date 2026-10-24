@@ -72,8 +72,8 @@ INSTALL_RECIPES: dict[str, dict[str, Any]] = {
     "powershell": _manual("pwsh"),
 }
 
-_install_locks: dict[str, threading.Lock] = {}
-_install_results: dict[str, Optional[str]] = {}
+_install_locks: dict[tuple[str, str], threading.Lock] = {}
+_install_results: dict[tuple[str, str], Optional[str]] = {}
 _install_lock_meta = threading.Lock()
 _WINDOWS_WRAPPER_SUFFIXES = (".cmd", ".exe", ".bat")
 
@@ -117,16 +117,33 @@ def _npm_bin_dir() -> Path:
     return hermes_lsp_bin_dir().parent / "node_modules" / ".bin"
 
 
+def staged_binary(name: str, *, is_windows: Optional[bool] = None) -> Optional[str]:
+    """This profile's own ``<home>/lsp/bin/<name>`` when it is runnable, else ``None``.
+
+    Probe-only: it must not create the staging dir, because it runs on every spawn.  Never answers
+    with another profile's copy — the gateway serves many homes from one process, and a server
+    installed for a different home makes per-profile attribution meaningless (PRA-6980).
+    """
+    from hermes_constants import get_hermes_home
+
+    win = _is_windows() if is_windows is None else is_windows
+    base = get_hermes_home() / "lsp" / "bin" / name
+    return next((str(c) for c in _native_binary_candidates(base, is_windows=win)
+                 if c.exists() and os.access(c, os.X_OK)), None)
+
+
 def _existing_binary(name: str, *, is_windows: Optional[bool] = None) -> Optional[str]:
     """Probe the staging dir (+ npm's bin dir on Windows) then PATH for a binary named ``name``.
 
     ``is_windows`` overrides the host check so the Windows resolution is testable as data on every lane.
     """
     win = _is_windows() if is_windows is None else is_windows
-    bases = [hermes_lsp_bin_dir() / name] + ([_npm_bin_dir() / name] if win else [])
-    for staged in (c for base in bases for c in _native_binary_candidates(base, is_windows=win)):
-        if staged.exists() and os.access(staged, os.X_OK):
-            return str(staged)
+    bases = [_npm_bin_dir() / name] if win else []  # npm's relative wrappers only work from .bin
+    staged = staged_binary(name, is_windows=win) or next(
+        (str(c) for base in bases for c in _native_binary_candidates(base, is_windows=win)
+         if c.exists() and os.access(c, os.X_OK)), None)
+    if staged is not None:
+        return staged
     if any(r.get("strategy") == "pip" and r.get("bin") == name for r in INSTALL_RECIPES.values()):
         import pm
 
@@ -141,6 +158,19 @@ def _existing_binary(name: str, *, is_windows: Optional[bool] = None) -> Optiona
     return next((p for s in suffixes if (p := shutil.which(f"{name}{s}"))), None)
 
 
+def _install_key(pkg: str) -> tuple[str, str]:
+    """Cache key for an install attempt: the profile home AND the package.
+
+    Keyed by package alone, the first profile to need a server answered every other profile's
+    lookup with ITS binary path — one gateway process serves many homes, so a cto session ended up
+    running ``…/profiles/agent/lsp/bin/bash-language-server`` (PRA-6980).  Each profile installs
+    into its own ``lsp/bin``, so each profile gets its own cache entry.
+    """
+    from hermes_constants import hermes_home_key
+
+    return (hermes_home_key(), pkg)
+
+
 def try_install(pkg: str, strategy: str = "auto") -> Optional[str]:
     """Try to install ``pkg``; return the binary path or ``None``.
 
@@ -149,14 +179,15 @@ def try_install(pkg: str, strategy: str = "auto") -> Optional[str]:
     """
     if strategy != "auto":
         return _existing_binary(INSTALL_RECIPES.get(pkg, {}).get("bin", pkg))
-    if pkg in _install_results:
-        return _install_results[pkg]
+    key = _install_key(pkg)
+    if key in _install_results:
+        return _install_results[key]
     with _install_lock_meta:
-        lock = _install_locks.setdefault(pkg, threading.Lock())
+        lock = _install_locks.setdefault(key, threading.Lock())
     with lock:
-        if pkg not in _install_results:
-            _install_results[pkg] = _do_install(pkg)
-        return _install_results[pkg]
+        if key not in _install_results:
+            _install_results[key] = _do_install(pkg)
+        return _install_results[key]
 
 
 def _do_install(pkg: str) -> Optional[str]:

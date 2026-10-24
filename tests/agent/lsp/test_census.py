@@ -86,6 +86,102 @@ def test_census_is_emptied_when_no_client_is_left(monkeypatch):
     assert published == [[]], "a stale census file would outlive the servers it described"
 
 
+class _QuietClient:
+    """Enough of an ``LSPClient`` for one real edit check to end with "no verdict in budget"."""
+
+    seeds_first_push = False
+
+    def __init__(self, pid: int, root: str, server_id: str = "fake-ls") -> None:
+        self.pid = pid
+        self.workspace_root = root
+        self.server_id = server_id
+        self.workspace_folders = [root]
+
+    async def open_file(self, path, *, language_id=None, text=None) -> int:
+        return 1
+
+    async def save_file(self, path) -> None:
+        return None
+
+    async def wait_for_diagnostics(self, path, version, *, mode, timeout) -> bool:
+        return False
+
+    def document_text(self, path):
+        return None
+
+    def diagnostics_for(self, path, *, fresh_only=False):
+        return []
+
+    async def shutdown(self) -> None:
+        return None
+
+
+def _enabled_service() -> LSPService:
+    """A real, running service: the edit check runs on its loop, as it does in the gateway."""
+    return LSPService(enabled=True, wait_mode="document", wait_timeout=0.1,
+                      install_strategy="manual", idle_timeout=0.0,
+                      max_total_rss_mb=0.0, max_tree_rss_mb=0.0)
+
+
+def _wire_quiet_server(monkeypatch, service: LSPService, root: str, client: _QuietClient) -> None:
+    from agent.lsp.servers import ServerDef
+
+    async def _spawn(_srv, _root, _trusted):
+        return client
+
+    monkeypatch.setattr(service, "enabled_for", lambda fp: True)
+    monkeypatch.setattr(service, "_server_for", lambda fp: ServerDef(
+        server_id="fake-ls", extensions=(".fake",), resolve_root=lambda fp, ws: ws,
+        build_spawn=lambda root, ctx: None, seed_first_push=False))
+    monkeypatch.setattr("agent.lsp.manager.resolve_workspace_for_file", lambda fp: (root, True))
+    monkeypatch.setattr(service, "_trusted", lambda r: True)
+    monkeypatch.setattr(service, "_spawn_client", _spawn)
+
+
+def _published_census(monkeypatch) -> list[list[dict]]:
+    published: list[list[dict]] = []
+    monkeypatch.setattr(census_mod, "write_census", lambda entries, path=None: published.append(entries))
+    return published
+
+
+def test_an_edit_check_from_the_tool_path_publishes_its_session_as_the_owner(monkeypatch):
+    """PRA-6980: the check dropped the owner on the way to ``_get_or_spawn``, so every client the
+    write path served was published with ``owner: ""`` — an unmeasured row, not a clean one."""
+    service = _enabled_service()
+    try:
+        _wire_quiet_server(monkeypatch, service, "/w/tool", _QuietClient(91, "/w/tool"))
+        published = _published_census(monkeypatch)
+
+        future = service.start_edit_check("/w/tool/x.fake", pre_text="a = 1\n", post_text="a = ]\n",
+                                          owner="local-abc123")
+        assert future is not None
+        future.result(timeout=10.0)
+        asyncio.run(service._write_census())
+    finally:
+        service.shutdown()
+
+    assert [entry["owner"] for entry in published[0]] == ["local-abc123"]
+
+
+def test_an_edit_that_bound_no_owner_is_attributed_to_the_ambient_session(monkeypatch):
+    """A programmatic writer (``execute_code``'s ``hermes_tools.write_file``, a skill script) never
+    crosses ``_owned()``; the service boundary takes the session the caller runs for instead."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "local-ambient999")
+    service = _enabled_service()
+    try:
+        _wire_quiet_server(monkeypatch, service, "/w/amb", _QuietClient(92, "/w/amb"))
+        published = _published_census(monkeypatch)
+
+        future = service.start_edit_check("/w/amb/x.fake", pre_text=None, post_text="b = 2\n")
+        assert future is not None
+        future.result(timeout=10.0)
+        asyncio.run(service._write_census())
+    finally:
+        service.shutdown()
+
+    assert [entry["owner"] for entry in published[0]] == ["local-ambient999"]
+
+
 def test_owner_is_recorded_for_the_session_that_uses_a_root(monkeypatch):
     from agent.lsp.servers import ServerDef
 
