@@ -174,11 +174,17 @@ gateway under the backend, and do NOT "fix" update locks by widening the tree-ki
   from `os.environ`, which holds the launch profile. Why: eviction that flushed under the launch scope
   wrote a secondary profile's memories into the default profile's store, silently.
 - **A housekeeping tick binds each served profile ONCE.** `run_profile_reconcile.py::ServedProfile`
-  holds one profile's home, its hydrated secret scope and (lazily) its `load_config_readonly()`;
-  `_run_due_chores` opens the window (`begin_housekeeping_tick`) and every per-profile arm on that
-  tick reuses the binding instead of re-entering the scope and re-reading config. Take the config
-  from the binding (`bound_profile_chore`) rather than calling `load_config*()` in a per-profile
-  chore — on 17 served homes the fan-out was ~1.6 s a pass and a tick paid it per arm (PRX-6137).
+  holds one profile's home, its hydrated secret scope, (lazily) its `load_config_readonly()` AND its
+  built `TERMINAL_*` policy; `_run_due_chores` opens the window (`begin_housekeeping_tick`) and every
+  per-profile arm on that tick reuses the binding instead of re-entering the scope and re-reading
+  config. Take the config from the binding (`bound_profile_chore`) rather than calling
+  `load_config*()` in a per-profile chore — on 17 served homes the fan-out was ~1.6 s a pass and a
+  tick paid it per arm (PRX-6137). The terminal policy is bound for the same reason and must stay
+  bound: `build_profile_terminal_scope()` opens the profile's `.env` and re-signatures `config.yaml`
+  per call, which is ~0.2 ms of work but ~17 ms of wait for the GIL in the live multiplexed process,
+  paid twice a tick by each of the two cadence-1 arms (PRX-6164 — the residual PRX-6137 left). An
+  over-budget tick logs a second `housekeeping_tick per-profile:` line naming the dearest served
+  profiles, so a fan-out's cost is attributed to a profile and not just to the arm.
   The window is tick-scoped, never process-scoped: a config edited mid-run must be seen by the next
   tick's DRIFT reconcile (#112445), which is why `end_housekeeping_tick` drops the bindings.
 - **`api_server` rebuilds the agent per request but not the memory provider.** The adapter bypasses

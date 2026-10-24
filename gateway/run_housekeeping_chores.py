@@ -35,6 +35,8 @@ _LIVENESS_CHORES = frozenset({"Runtime heartbeat", "Cron ticker supervisor"})
 # The split shows the dearest arms and folds the rest into one figure: enough to name the arm on any
 # over-budget tick, short enough to stay one log line.
 _SPLIT_ARMS = 6
+# How many profiles the per-profile line names before folding the rest into one figure.
+_SPLIT_PROFILES = 5
 # An under-budget tick logs its split at INFO only above this; a quiet tick stays at DEBUG.
 _SLOW_TICK_LOG_S = 0.5
 # The channel-directory refresh is a Slack web fan-out on the loop and the tick waits for it: at most
@@ -87,10 +89,32 @@ def _log_tick_split(split, total_s: float, budget_s: float, carried: int) -> Non
     if total_s > budget_s:
         logger.warning("housekeeping_tick over its %.0fms budget: %.0fms total (%s)",
                        budget_s * 1000.0, total_s * 1000.0, detail)
+        _log_profile_split()
     elif total_s > _SLOW_TICK_LOG_S:
         logger.info("housekeeping_tick %.0fms (%s)", total_s * 1000.0, detail)
     else:
         logger.debug("housekeeping_tick %.0fms (%s)", total_s * 1000.0, detail)
+
+
+def _log_profile_split() -> None:
+    """Second line on over-budget ticks: the fan-out's cost by served profile (PRX-6164).
+
+    An arm-level figure on 17 homes cannot say whether one profile or the whole set is the cost.
+    Both cadence-1 arms fan out per profile, and the answer decides the fix: one hot profile is a
+    data problem, seventeen evenly-slow ones is the per-entry work (scope bind, config read) and
+    belongs bound to the tick. Only over-budget ticks pay for it — a healthy tick stays one line.
+    """
+    from gateway.run_profile_reconcile import tick_profile_costs
+
+    costs = tick_profile_costs()
+    if not costs:
+        return
+    ordered = sorted(costs.items(), key=lambda item: item[1], reverse=True)
+    shown = ordered[:_SPLIT_PROFILES]
+    fields = [f"{name}={seconds * 1000.0:.0f}ms" for name, seconds in shown]
+    if len(ordered) > len(shown):
+        fields.append(f"other={sum(s for _n, s in ordered[len(shown):]) * 1000.0:.0f}ms")
+    logger.warning("housekeeping_tick per-profile: %d visited (%s)", len(ordered), ", ".join(fields))
 
 
 def _housekeeping_chore(label: str, fn, *args, **kwargs) -> None:

@@ -859,13 +859,14 @@ class ServedProfile:
     a read must never outlive the tick that made it and delay that remedy.
     """
 
-    __slots__ = ("config", "home", "label", "secrets")
+    __slots__ = ("config", "home", "label", "secrets", "terminal")
 
     def __init__(self, label: str, home: Path | None):
         self.label = str(label)
         self.home = Path(home) if home is not None else None
         self.secrets: dict | None = None   # hydrated once, reused by every later arm
         self.config: dict | None = None    # this tick's load_config_readonly(), read on first use
+        self.terminal: dict | None = None  # this tick's TERMINAL_* policy, built on first use
 
     def scope(self):
         """This profile's runtime scope, entering it with the secret scope hydrated once."""
@@ -875,7 +876,31 @@ class ServedProfile:
             raise RuntimeError("a single-profile binding has no per-profile scope")
         if self.secrets is None:
             self.secrets = _load_profile_secret_scope(home)
-        return _profile_runtime_scope(home, prepared_secret_scope=self.secrets)
+        return _profile_runtime_scope(home, prepared_secret_scope=self.secrets,
+                                      prepared_terminal_scope=self.terminal_scope())
+
+    def terminal_scope(self) -> dict:
+        """This tick's complete ``TERMINAL_*`` policy for the profile.
+
+        Built once and reused by every scope entry this tick: building it re-reads the profile's
+        ``.env`` and re-signatures ``config.yaml``, and each of those reads blocks the housekeeping
+        thread on a file handle — in a multiplexed process the wait to get the GIL back is what the
+        two cadence-1 arms were paying ~17 ms per profile for, twice a tick each (PRX-6164). The
+        build is idempotent for the same files, so a tick-scoped copy is exactly as fresh as the
+        bound config read beside it — and no fresher than the secret scope, which is memoized per
+        home for the life of the process.
+
+        A profile whose policy cannot be read keeps the fail-closed contract: the refusal marker is
+        installed for every entry of this tick, never the ambient launch policy (#68559).
+        """
+        if self.terminal is None:
+            from tools.terminal_scope import TerminalPolicyRefusal, build_profile_terminal_scope
+            try:
+                self.terminal = build_profile_terminal_scope(self.home)
+            except Exception as exc:  # health: allow BLE001 -- mirrors install_profile_terminal_scope
+                logger.warning("terminal policy unavailable: %s", exc)
+                self.terminal = TerminalPolicyRefusal(str(exc))
+        return self.terminal
 
     def load_config(self) -> dict:
         """This tick's config for the profile — read once, inside the profile's own scope.
@@ -900,13 +925,24 @@ _tick_profiles = threading.local()
 def begin_housekeeping_tick() -> None:
     """Open the tick's profile-binding window (``run_housekeeping_chores._run_due_chores``)."""
     _tick_profiles.bindings = None
+    _tick_profiles.profile_ms = {}
     _tick_profiles.open = True
 
 
 def end_housekeeping_tick() -> None:
     """Drop the tick's bound profiles. No bound config may outlive the tick that read it."""
     _tick_profiles.bindings = None
+    _tick_profiles.profile_ms = None
     _tick_profiles.open = False
+
+
+def tick_profile_costs() -> dict:
+    """``{profile: ms}`` this tick spent inside per-profile arms (scope entry included).
+
+    The split names the ARM; on 17 served homes the arm-level figure cannot say whether one profile
+    or all of them are the cost, and the difference decides where a fix goes (PRX-6164). Empty
+    outside a tick."""
+    return dict(getattr(_tick_profiles, "profile_ms", None) or {})
 
 
 def _served_profile_bindings(runner) -> list:
@@ -983,11 +1019,18 @@ def _for_each_served_profile(runner, body) -> None:
         # so one profile's unreadable store or broken .env abandoned every profile after it, on
         # every tick. The launch store failing is reachable (``_init_session_db`` tolerates it and
         # keeps running), and serve defers every served profile's sweep to this loop.
+        started = time.monotonic()
         try:
             with binding.scope():
                 body(binding)
         except Exception as exc:
             logger.debug("Housekeeping for profile %s skipped: %s", binding.label, exc)
+        finally:
+            # Which profile the tick's fan-out cost belongs to (PRX-6164). ``monotonic`` never
+            # blocks, so the measurement cannot itself become the cost it measures.
+            costs = getattr(_tick_profiles, "profile_ms", None)
+            if costs is not None:
+                costs[binding.label] = costs.get(binding.label, 0.0) + (time.monotonic() - started)
 
 
 def profile_scoped_chore(runner, chore):
