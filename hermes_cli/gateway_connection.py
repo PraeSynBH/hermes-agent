@@ -16,12 +16,13 @@ import queue
 import threading
 import time
 
-from hermes_cli.gateway_client import DEFAULT_RPC_TIMEOUT, RESUME_KEY_MISMATCH, GatewayClientError, GatewayRPCError
+from hermes_cli.gateway_client import (DEFAULT_RPC_TIMEOUT, LOST_TURN, RESUME_KEY_MISMATCH, GatewayClientError,
+                                       GatewayRPCError, close_detail)
 
 logger = logging.getLogger(__name__)
 
-DISCONNECTED = ("Gateway disconnected; turn outcome is unknown. Resume the printed session ID to check "
-                "whether it completed or was interrupted; do not resend the work.")
+# One copy, defined beside the transport that has to name the close it died of (``gateway_client``).
+DISCONNECTED = LOST_TURN
 # A request refused before it reached any socket: nothing is in doubt, so never the copy above.
 NOT_SENT = "Gateway disconnected before the request was sent; nothing was sent."
 # ``session.resume`` refusals that mean "this viewer may not open that session": the caller keeps the
@@ -313,7 +314,7 @@ class GatewayConnection:
                 self._error = exc if isinstance(exc, GatewayClientError) else GatewayClientError(
                     f"Gateway connection failed; no local fallback ({type(exc).__name__})")
             else:
-                self._put_loss(GatewayClientError(DISCONNECTED))
+                self._put_loss(GatewayClientError(DISCONNECTED + close_detail(exc)))
         finally:
             self.client = None
             self._live = None
@@ -503,7 +504,7 @@ class GatewayConnection:
             pass
         except Exception as exc:  # health: allow BLE001 -- every transport failure is the caller's error
             if not isinstance(exc, GatewayClientError):
-                exc = GatewayClientError(DISCONNECTED if sent.is_set() else NOT_SENT)
+                exc = GatewayClientError((DISCONNECTED + close_detail(exc)) if sent.is_set() else NOT_SENT)
             answer.set_exception(exc)
         finally:
             wake.set()  # ends the watcher above
