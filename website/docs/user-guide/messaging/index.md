@@ -246,6 +246,14 @@ gateway_admission_timeout: … (budget=120s, owner=4d96afbff73f, owner_loop>2.0s
 `owner_loop>2.0s` means the loop did not answer the probe within 2 s (a floor on
 the stall); no `owner_loop` field means no loop-tick witness was available.
 
+The budget covers the classic CLI's session verbs too: until a CLI owns a
+session, its `runtime.describe` → `session.create`/`session.resume` are served
+from this same deadline, including the seconds an owner that publishes
+`starting`/`restarting` hands back. Before that, those verbs were capped at the
+transport's 30 s per request, so a run dispatched while the owner was still
+booting died with `Hermes couldn't start the model connection: Gateway did not
+answer session.create` — a failure the admission class never saw.
+
 While an update owns the install (`.hermes-update-in-progress`), admission
 **waits** the fence out instead of failing at once, admitting as soon as it
 clears. If the fence outlives the budget the run fails with the fence's owner in
